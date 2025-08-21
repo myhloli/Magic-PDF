@@ -6,7 +6,8 @@ from loguru import logger
 from .model_list import AtomicModel
 from ...model.layout.doclayout_yolo import DocLayoutYOLOModel
 from ...model.mfd.yolo_v8 import YOLOv8MFDModel
-from ...model.mfr.unimernet.Unimernet import UnimernetModel
+# from ...model.mfr.unimernet.Unimernet import UnimernetModel
+from ...model.mfr.unimernet_v2.Unimernet import UnimernetModel
 from ...model.ocr.paddleocr2pytorch.pytorch_paddle import PytorchPaddleOCR
 from ...model.ori_cls.paddle_ori_cls import PaddleOrientationClsModel
 from ...model.table.cls.paddle_table_cls import PaddleTableClsModel
@@ -67,6 +68,7 @@ def mfd_model_init(weight, device='cpu'):
 
 
 def mfr_model_init(weight_dir, device='cpu'):
+    weight_dir = r"C:\Users\zhaoxiaomeng\.cache\huggingface\hub\models--opendatalab--PDF-Extract-Kit-1.0\snapshots\a447acb48da13ba6bf54b53170d614626a147e9b\models\MFR\unimernet_v2_base"
     mfr_model = UnimernetModel(weight_dir, device)
     return mfr_model
 
