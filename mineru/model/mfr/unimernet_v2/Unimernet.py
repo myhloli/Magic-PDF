@@ -33,7 +33,7 @@ class UnimernetModel(object):
             'load_finetuned': True, 
             'load_pretrained': False, 
             'pretrained': 'path/to/pretrained/weight', 
-            'finetuned': os.path.join(weight_dir, "pytorch_model.bin"),
+            'finetuned': os.path.join(weight_dir, "pytorch_model.pth"),
             'tokenizer_name': 'nougat', 
             'tokenizer_config': {
                 'path': os.path.join(weight_dir, "nougat")

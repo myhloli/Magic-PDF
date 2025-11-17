@@ -68,7 +68,7 @@ def mfd_model_init(weight, device='cpu'):
 
 
 def mfr_model_init(weight_dir, device='cpu'):
-    weight_dir = r"C:\Users\zhaoxiaomeng\.cache\huggingface\hub\models--opendatalab--PDF-Extract-Kit-1.0\snapshots\a447acb48da13ba6bf54b53170d614626a147e9b\models\MFR\unimernet_v2_base"
+    weight_dir = r"C:\Users\zhaoxiaomeng\.cache\huggingface\hub\models--opendatalab--PDF-Extract-Kit-1.0\snapshots\280f8a5a8912a91a417ba117c9ff8759cacbf6c0\models\MFR\unimernet_v2_small_2511"
     mfr_model = UnimernetModel(weight_dir, device)
     return mfr_model
 
