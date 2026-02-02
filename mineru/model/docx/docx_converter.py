@@ -972,7 +972,7 @@ class DocxConverter:
             list_block = {
                 "type": BlockType.LIST,
                 "attribute": list_attribute,
-                "list_items": [],
+                "content": [],
                 "ilevel": ilevel,
             }
             self.cur_page.append(list_block)
@@ -989,7 +989,7 @@ class DocxConverter:
                 "content": content_text,
             }
 
-            list_block["list_items"].append(list_item)
+            list_block["content"].append(list_item)
             self.pre_num_id = numid
             self.pre_ilevel = ilevel
         # 情况 2: 增加缩进，打开子列表, 嵌套列表的 num_id 和父列表的 num_id 相同, ilevel (缩进级别) 不同
@@ -1007,13 +1007,13 @@ class DocxConverter:
             list_block = {
                 "type": BlockType.LIST,
                 "attribute": list_attribute,
-                "list_items": [],
+                "content": [],
                 "ilevel": ilevel,
             }
             # 获取栈顶的列表块
             parent_list_block = self.list_block_stack[-1]
             # 将新列表块添加为父列表块的最新列表项的子块
-            newest_list_item = parent_list_block["list_items"][-1]
+            newest_list_item = parent_list_block["content"][-1]
             newest_list_item["type"] = BlockType.LIST  # 修改类型为列表
             if isinstance((newest_list_item["content"]), str):
                 # 如果内容是字符串，则转换为列表
@@ -1037,7 +1037,7 @@ class DocxConverter:
                 "type": BlockType.TEXT,
                 "content": content_text,
             }
-            list_block["list_items"].append(list_item)
+            list_block["content"].append(list_item)
             # 更新目前缩进
             self.pre_ilevel = ilevel
 
@@ -1064,7 +1064,7 @@ class DocxConverter:
                 "type": BlockType.TEXT,
                 "content": content_text,
             }
-            list_block["list_items"].append(list_item)
+            list_block["content"].append(list_item)
             self.pre_ilevel = ilevel
 
         # 情况 4: 同级列表项（相同缩进）
@@ -1081,7 +1081,7 @@ class DocxConverter:
                 "type": BlockType.TEXT,
                 "content": content_text,
             }
-            list_block["list_items"].append(list_item)
+            list_block["content"].append(list_item)
 
     def _find_ilevel_list_block(self, outer_block, ilevel: int):
         """

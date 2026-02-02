@@ -22,6 +22,9 @@ class MagicModel:
         for index, block_info in enumerate(page_blocks):
 
             block_type = block_info["type"]
+            block_content = block_info.get("content", "")
+            if not block_content:
+                continue
             span_type = "unknown"
 
             if block_type in [
@@ -48,14 +51,14 @@ class MagicModel:
                     "type": span_type,
                 }
                 if span_type == ContentType.TABLE:
-                    span["html"] = clean_table_html(block_info.get("content", ""))
+                    span["html"] = clean_table_html(block_content)
                 elif span_type == ContentType.IMAGE:
                     # jpg格式base64
-                    span["image_base64"] = block_info.get("content", "")
+                    span["image_base64"] = block_content
             elif span_type in [ContentType.INTERLINE_EQUATION]:
                 span = {
                     "type": span_type,
-                    "content": block_info.get("content", ""),
+                    "content": block_content,
                 }
             else:
 
