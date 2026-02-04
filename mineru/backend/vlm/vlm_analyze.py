@@ -272,6 +272,13 @@ def doc_analyze(
     if predictor is None:
         predictor = ModelSingleton().get_model(backend, model_path, server_url, **kwargs)
 
+    if "table_image_output_dir" in kwargs:
+        predictor.table_image_output_dir = kwargs["table_image_output_dir"]
+        predictor.helper.table_image_output_dir = kwargs["table_image_output_dir"]
+    if "table_image_rel_base" in kwargs:
+        predictor.table_image_rel_base = kwargs["table_image_rel_base"]
+        predictor.helper.table_image_rel_base = kwargs["table_image_rel_base"]
+
     load_images_start = time.time()
     images_list, pdf_doc = load_images_from_pdf(pdf_bytes, image_type=ImageType.PIL)
     images_pil_list = [image_dict["img_pil"] for image_dict in images_list]
