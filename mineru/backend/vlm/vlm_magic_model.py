@@ -219,6 +219,36 @@ class MagicModel:
         self.image_blocks, not_include_image_blocks = fix_two_layer_blocks(self.image_blocks, BlockType.IMAGE)
         self.table_blocks, not_include_table_blocks = fix_two_layer_blocks(self.table_blocks, BlockType.TABLE)
         self.code_blocks, not_include_code_blocks = fix_two_layer_blocks(self.code_blocks, BlockType.CODE)
+
+        # 过滤掉在表格内部的图片
+        final_image_blocks = []
+        for img_block in self.image_blocks:
+            is_inside_table = False
+            for table_block in self.table_blocks:
+                if calculate_overlap_area_in_bbox1_area_ratio(img_block["bbox"], table_block["bbox"]) > 0.8:
+                    is_inside_table = True
+                    break
+            if is_inside_table:
+                self.discarded_blocks.append(img_block)
+            else:
+                final_image_blocks.append(img_block)
+        self.image_blocks = final_image_blocks
+
+        # 同时过滤all_spans中的相关图片span
+        final_all_spans = []
+        for span in self.all_spans:
+            if span["type"] == ContentType.IMAGE:
+                is_inside_table = False
+                for table_block in self.table_blocks:
+                    if calculate_overlap_area_in_bbox1_area_ratio(span["bbox"], table_block["bbox"]) > 0.8:
+                        is_inside_table = True
+                        break
+                if not is_inside_table:
+                    final_all_spans.append(span)
+            else:
+                final_all_spans.append(span)
+        self.all_spans = final_all_spans
+
         for code_block in self.code_blocks:
             for block in code_block['blocks']:
                 if block['type'] == BlockType.CODE_BODY:
