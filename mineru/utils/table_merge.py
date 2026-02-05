@@ -1,4 +1,6 @@
 # Copyright (c) Opendatalab. All rights reserved.
+import re
+from typing import List, Dict, Tuple, Optional
 from copy import deepcopy
 
 from loguru import logger
@@ -8,6 +10,20 @@ from mineru.backend.vlm.vlm_middle_json_mkcontent import merge_para_with_text
 from mineru.utils.char_utils import full_to_half
 from mineru.utils.enum_class import BlockType, SplitFlag
 
+
+CONTINUATION_MARKERS = [
+    "(续)", "(续表)", "(续上表)", "(接上表)", "(承上)",
+    "（续）", "（续表）", "（续上表）", "（接上表）", "（承上）",
+    "续表", "续", "接上表", "承上",
+
+    "(continued)", "(cont.)", "(cont'd)", "(continuation)",
+    "continued", "cont.", "cont'd",
+    "(Continued)", "(Cont.)", "(Cont'd)", "(Continuation)",
+    "Continued", "Cont.", "Cont'd",
+    
+    "- continued", "- cont.", "...continued",
+    "– continued", "— continued",
+]
 
 CONTINUATION_END_MARKERS = [
     "(续)",
@@ -284,9 +300,158 @@ def _detect_table_headers_visual(soup1, soup2, rows1, rows2, max_header_rows=5):
     return header_rows, headers_match, header_texts
 
 
-def can_merge_tables(current_table_block, previous_table_block):
+def get_neighbor_caption(blocks: List[Dict], table_idx: int) -> str:
+    """获取表格紧邻上方的标题（用于逻辑判定）"""
+    if table_idx <= 0:
+        return ""
+
+    # 获取前一个 block
+    prev_block = blocks[table_idx - 1]
+    b_type = prev_block.get("type", "")
+    content = merge_para_with_text(prev_block).strip()
+
+    # 1. 最确定的类型：table_caption
+    if b_type == BlockType.TABLE_CAPTION:
+        return content
+
+    # 2. 其次：title (很多时候标题被识别为 title)
+    if b_type == "title":
+        return content
+
+    # 3. 兜底：text (需要判断是否像标题)
+    if b_type == BlockType.TEXT and len(content) < 150:
+        # 匹配：Table 1, 表1, Exhibit A, 图2, 1.2 统计表, 三、情况说明
+        pattern = r'^(table|表|exhibit|figure|图)\s*\d+|^\d+(\.\d+)*\s+|^[一二三四五六七八九十]+、'
+        if re.match(pattern, content, re.IGNORECASE):
+            return content
+
+    return ""
+
+
+def check_caption_consistency(page1_blocks: List[Dict], page2_blocks: List[Dict]) -> Tuple[bool, str]:
+    """检查两个表格的标题一致性"""
+    if not page1_blocks or not page2_blocks:
+        return True, "页面Block为空，跳过一致性检查"
+
+    # 1. 定位 Page 1 最后一个表格的索引
+    p1_last_table_idx = -1
+    for i in range(len(page1_blocks) - 1, -1, -1):
+        if page1_blocks[i].get("type") == BlockType.TABLE:
+            p1_last_table_idx = i
+            break
+
+    # 2. 定位 Page 2 第一个表格的索引
+    p2_first_table_idx = -1
+    for i in range(len(page2_blocks)):
+        if page2_blocks[i].get("type") == BlockType.TABLE:
+            p2_first_table_idx = i
+            break
+
+    if p1_last_table_idx == -1 or p2_first_table_idx == -1:
+        return True, "无法在前后页中同时定位到表格，跳过Caption检查"
+
+    # 3. 获取前一个Block作为潜在标题
+    prev_caption = get_neighbor_caption(page1_blocks, p1_last_table_idx)
+    curr_caption = get_neighbor_caption(page2_blocks, p2_first_table_idx)
+
+    # Case 3: 均无标题 -> 一致
+    if not prev_caption and not curr_caption:
+        return True, "均无标题，判定为一致"
+
+    # Case 1: 前表有，后表无 -> 一致 (视为续表)
+    if prev_caption and not curr_caption:
+        return True, f"前表有标题，后表无标题，视为续表"
+
+    # Case 2: 前表无，后表有 -> 不一致 (视为新表)
+    if not prev_caption and curr_caption:
+        return False, f"前表无标题，后表有标题，视为新表"
+
+    # Case 4: 均有标题 -> 详细比对 (编号)
+    patterns = [
+        (r'[Ee]xhibit\s*(\d+)', 'Exhibit'),
+        (r'EXHIBIT\s*(\d+)', 'Exhibit'),
+        (r'[Tt]able\s*([A-Za-z]?\s*-?\s*[\d.]+)', 'Table'),
+        (r'[Tt]ab\.?\s*([A-Za-z]?\s*-?\s*[\d.]+)', 'Table'),
+        (r'TABLE\s*([A-Za-z]?\s*-?\s*[\d.]+)', 'Table'),
+        (r'表\s*([A-Za-z]?\s*-?\s*[\d.]+)', '表'),
+        (r'[Ff]igure\s*(\d+)', 'Figure'),
+        (r'图\s*(\d+)', '图'),
+        (r'^([一二三四五六七八九十]+)、', 'CN_Num'),
+    ]
+
+    def extract_table_number(caption):
+        for pattern, num_type in patterns:
+            match = re.search(pattern, caption)
+            if match:
+                num_str = match.group(1).replace(' ', '').replace('-', '').upper()
+                return num_type, num_str
+        return None
+
+    curr_res = extract_table_number(curr_caption)
+    prev_res = extract_table_number(prev_caption)
+
+    if curr_res and prev_res:
+        prev_type, prev_num = prev_res
+        curr_type, curr_num = curr_res
+        if prev_type != curr_type or prev_num != curr_num:
+            return False, f"表格编号不一致: {prev_type}{prev_num} vs {curr_type}{curr_num}"
+        return True, f"表格编号一致: {prev_type}{prev_num}"
+
+    # 文本比对
+    def clean_caption(text):
+        text = full_to_half(text).lower()
+        for marker in CONTINUATION_MARKERS:
+            if text.endswith(marker.lower()):
+                text = text[: -len(marker)]
+        text = re.sub(r'[^\w\u4e00-\u9fa5]', '', text)
+        return text
+
+    if clean_caption(prev_caption) != clean_caption(curr_caption):
+        return False, "标题文本差异过大"
+
+    return True, "标题一致"
+
+
+def check_text_between_tables(page1_blocks: List[Dict], page2_blocks: List[Dict]) -> bool:
+    """检查两个表格之间是否有正文内容阻断"""
+    if not page1_blocks or not page2_blocks:
+        return True
+
+    # 检查第一页：最后一个表格后是否有 text
+    last_table_idx = -1
+    for i, block in enumerate(page1_blocks):
+        if block.get("type") == BlockType.TABLE:
+            last_table_idx = i
+
+    if last_table_idx >= 0:
+        for block in page1_blocks[last_table_idx + 1:]:
+            if block.get("type") == BlockType.TEXT:
+                return False
+
+    # 检查第二页：第一个表格前是否有 text
+    for block in page2_blocks:
+        if block.get("type") == BlockType.TABLE:
+            break
+        elif block.get("type") == BlockType.TEXT:
+            return False
+
+    return True
+
+
+def can_merge_tables(current_table_block, previous_table_block, page_blocks=None, previous_page_blocks=None):
     """判断两个表格是否可以合并"""
-    # 检查表格是否有caption和footnote
+    # 1. 检查表间正文阻断
+    if page_blocks is not None and previous_page_blocks is not None:
+        if not check_text_between_tables(previous_page_blocks, page_blocks):
+            return False, None, None, None, None
+
+    # 2. 检查标题一致性
+    if page_blocks is not None and previous_page_blocks is not None:
+        is_consistent, _ = check_caption_consistency(previous_page_blocks, page_blocks)
+        if not is_consistent:
+            return False, None, None, None, None
+
+    # 3. 检查表格是否有caption和footnote
     # 计算previous_table_block中的footnote数量
     footnote_count = sum(1 for block in previous_table_block["blocks"] if block["type"] == BlockType.TABLE_FOOTNOTE)
     # 如果有TABLE_CAPTION类型的块,检查是否至少有一个以"(续)"结尾
@@ -586,3 +751,164 @@ def merge_table(page_info_list):
         for block in current_table_block["blocks"]:
             block['lines'] = []
             block[SplitFlag.LINES_DELETED] = True
+
+def perform_semantic_merge_table(soup1: BeautifulSoup, soup2: BeautifulSoup, cell_list: List[int]) -> str:
+    """
+    cell_list:
+        [1,0,0,0] # 第0个单元格需要语义合并, 第1,2,3个单元格直接拼接
+        [0,0,0,0] # 第0,1,2,3 直接拼接
+        [] # 不合并
+
+    output:
+        merged_html 两个表格合并后的结果
+    """
+    header_count, headers_match, header_texts = detect_table_headers(soup1, soup2)
+
+    tbody1 = soup1.find("tbody") or soup1.find("table")
+
+    rows1 = soup1.find_all("tr")
+    rows2 = soup2.find_all("tr")
+
+    skip_first_data_row = False  # 默认不跳过
+
+    if rows1 and rows2 and header_count < len(rows2):
+        visual_last_row_cells = get_visual_last_row_cells(soup1)
+        first_data_row2: Tag = rows2[header_count]
+
+        visual_last_row_cells_with_span_info = [
+            (cell, origin_row_idx, int(cell.get("colspan", 1)), int(cell.get("rowspan", 1)))
+            for cell, origin_row_idx in visual_last_row_cells
+        ]
+        first_data_row2_with_span_info = [
+            (cell, int(cell.get("colspan", 1)), int(cell.get("rowspan", 1)))
+            for cell in first_data_row2.find_all(["td", "th"])
+        ]
+
+        table_cols1 = calculate_table_total_columns(soup1)
+        table_cols2 = calculate_table_total_columns(soup2)
+
+        last_row1: Tag = rows1[-1]
+
+        if table_cols1 >= table_cols2:
+            reference_structure = [
+                int(cell.get("colspan", 1))
+                for cell in last_row1.find_all(["td", "th"])
+            ]
+            reference_visual_cols = calculate_visual_columns(last_row1)
+
+            adjust_table_rows_colspan(
+                rows2, header_count, len(rows2),
+                reference_structure, reference_visual_cols,
+                table_cols1, table_cols2, first_data_row2
+            )
+        else:  # table_cols2 > table_cols1
+            reference_structure = [
+                int(cell.get("colspan", 1))
+                for cell in first_data_row2.find_all(["td", "th"])
+            ]
+            reference_visual_cols = calculate_visual_columns(first_data_row2)
+
+            adjust_table_rows_colspan(
+                rows1, 0, len(rows1),
+                reference_structure, reference_visual_cols,
+                table_cols2, table_cols1, last_row1
+            )
+
+        # 在结构对齐之后，按 cell_list 做语义合并
+        skip_first_data_row = _merge_row_cells_by_cell_list(visual_last_row_cells, first_data_row2, cell_list, len(rows1))
+
+    # 语义合并
+    if tbody1:
+        tbody2 = soup2.find("tbody") or soup2.find("table")
+        if tbody2:
+            # 将第二个表格的行添加到第一个表格中（跳过表头行）
+            # 如果 skip_first_data_row 为 True(所有都为1），还要跳过第一个数据行
+            start_idx = header_count + 1 if skip_first_data_row else header_count
+            for row in rows2[start_idx:]:
+                row.extract()
+                tbody1.append(row)
+    return str(soup1)
+
+
+def _merge_row_cells_by_cell_list(visual_last_row_cells, first_data_row2, cell_list, total_rows1) -> bool:
+    """
+    [0,0,0,0]
+    [1,0,0,0]
+    ...
+    """
+    cells2 = first_data_row2.find_all(["td", "th"])
+
+    max_idx = min(len(visual_last_row_cells), len(cells2), len(cell_list))
+
+    last_row_idx = total_rows1 - 1
+
+    cells_to_remove = []
+
+    for i in range(max_idx):
+        if cell_list[i] == 0:
+            # cell_list[i] == 0: 直接拼接
+            continue
+
+        if cell_list[i] != 1:
+            continue
+
+        # cell_list[i] == 1: 语义合并
+        c1, origin_row_idx = visual_last_row_cells[i]
+        c2 = cells2[i]
+
+        text1 = c1.get_text(" ", strip=True)
+        text2 = c2.get_text(" ", strip=True)
+
+        merged_text_parts = []
+        if text1:
+            merged_text_parts.append(text1)
+        if text2:
+            merged_text_parts.append(text2)
+
+        merged_text = "".join(merged_text_parts)
+
+        # 清空 c1 原内容
+        for child in list(c1.contents):
+            child.extract()
+        if merged_text:
+            c1.string = merged_text
+
+        # 处理 rowspan：需要考虑 c2 的 rowspan
+        c2_rowspan = int(c2.get("rowspan", 1))
+        if origin_row_idx < last_row_idx:
+           # c1不在最后一行,c1_rowspan+=c2_row_span
+           current_rowspan = int(c1.get("rowspan", 1))
+            c1["rowspan"] = str(current_rowspan + c2_rowspan)
+            cells_to_remove.append(c2)
+        elif c2_rowspan > 1:
+            
+            # c1 在最后一行，但 c2 有 rowspan，需要设置 c1 的 rowspan
+            c1["rowspan"] = str(c2_rowspan)
+            # 同样需要删除 c2，因为 c1 的 rowspan 覆盖了它
+            cells_to_remove.append(c2)
+        else:
+            # c1 在最后一行且 c2 没有 rowspan，只需清空 c2 内容
+            for child in list(c2.contents):
+                child.extract()
+
+    # 删除被 rowspan 覆盖的单元格
+    for cell in cells_to_remove:
+        cell.decompose()
+
+    # 重新获取 cells2（因为可能有单元格被删除）
+    cells2_remaining = first_data_row2.find_all(["td", "th"])
+
+    # 检查 first_data_row2 是否所有单元格都被清空或删除了
+    # 如果没有剩余单元格，或者剩余单元格都为空，应该跳过这一行
+    if len(cells2_remaining) == 0:
+        return True
+
+    all_cells_empty = all(
+        not c.get_text(strip=True)
+        for c in cells2_remaining
+    )
+
+    if all_cells_empty:
+        return True
+
+    return False
