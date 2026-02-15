@@ -13,6 +13,11 @@ import gradio as gr
 from gradio_pdf import PDF
 from loguru import logger
 
+# 检测 Gradio 版本，用于兼容 Gradio 5 和 Gradio 6
+_gradio_major_version = int(gr.__version__.split('.')[0])
+IS_GRADIO_6 = _gradio_major_version >= 6
+
+
 log_level = os.getenv("MINERU_LOG_LEVEL", "INFO").upper()
 logger.remove()  # 移除默认handler
 logger.add(sys.stderr, level=log_level)  # 添加新handler
@@ -257,8 +262,7 @@ def main(ctx,
 ):
 
     # 创建 i18n 实例，支持中英文
-    i18n = gr.I18n(
-        en={
+    _translations_en = {
             "upload_file": "Please upload a PDF or image",
             "max_pages": "Max convert pages",
             "backend": "Backend",
@@ -288,8 +292,8 @@ def main(ctx,
             "backend_info_pipeline": "Traditional Multi-model pipeline parsing, supports multiple languages, hallucination-free.",
             "backend_info_hybrid": "High-precision hybrid parsing, supports multiple languages.",
             "backend_info_default": "Select the backend engine for document parsing.",
-        },
-        zh={
+    }
+    _translations_zh = {
             "upload_file": "请上传 PDF 或图片",
             "max_pages": "最大转换页数",
             "backend": "解析后端",
@@ -319,8 +323,8 @@ def main(ctx,
             "backend_info_pipeline": "传统多模型管道解析，支持多语言，无幻觉。",
             "backend_info_hybrid": "高精度混合解析，支持多语言。",
             "backend_info_default": "选择文档解析的后端引擎。",
-        },
-    )
+    }
+    i18n = gr.I18n(en=_translations_en, zh=_translations_zh)
 
     # 根据后端类型获取公式识别标签（闭包函数以支持 i18n）
     def get_formula_label(backend_choice):
@@ -426,7 +430,8 @@ def main(ctx,
                 with gr.Row():
                     change_bu = gr.Button(i18n("convert"))
                     clear_bu = gr.ClearButton(value=i18n("clear"))
-                pdf_show = PDF(label=i18n("pdf_preview"), interactive=False, visible=True, height=800)
+                _pdf_preview_label = "pdf preview" if IS_GRADIO_6 else i18n("pdf_preview")
+                pdf_show = PDF(label=_pdf_preview_label, interactive=False, visible=True, height=800)
                 if example_enable:
                     example_root = os.path.join(os.getcwd(), 'examples')
                     if os.path.exists(example_root):
@@ -439,66 +444,68 @@ def main(ctx,
 
             with gr.Column(variant='panel', scale=5):
                 output_file = gr.File(label=i18n("convert_result"), interactive=False)
-                with gr.Tabs():
+                with gr.Blocks():
                     with gr.Tab(i18n("md_rendering")):
+                        _md_copy_kwargs = {"buttons": ["copy"]} if IS_GRADIO_6 else {"show_copy_button": True}
                         md = gr.Markdown(
                             label=i18n("md_rendering"),
                             height=1200,
-                            # buttons=["copy"],  # gradio 6 以上版本使用
-                            show_copy_button=True,  # gradio 6 以下版本使用
                             latex_delimiters=latex_delimiters,
-                            line_breaks=True
+                            line_breaks=True,
+                            **_md_copy_kwargs
                         )
                     with gr.Tab(i18n("md_text")):
+                        _textarea_copy_kwargs = {"buttons": ["copy"]} if IS_GRADIO_6 else {"show_copy_button": True}
                         md_text = gr.TextArea(
                             lines=45,
-                            # buttons=["copy"],  # gradio 6 以上版本使用
-                            show_copy_button=True,  # gradio 6 以下版本使用
-                            label=i18n("md_text")
+                            label=i18n("md_text"),
+                            **_textarea_copy_kwargs
                         )
 
         # 添加事件处理
+        _private_api_kwargs = {"api_visibility": "private"} if IS_GRADIO_6 else {"api_name": False}
         backend.change(
             fn=update_interface,
             inputs=[backend],
             outputs=[client_options, ocr_options, formula_enable, backend],
-            # api_visibility="private"  # gradio 6 以上版本使用
-            api_name=False  # gradio 6 以下版本使用
+            **_private_api_kwargs
         )
         # 添加demo.load事件，在页面加载时触发一次界面更新
         demo.load(
             fn=update_interface,
             inputs=[backend],
             outputs=[client_options, ocr_options, formula_enable, backend],
-            # api_visibility="private"  # gradio 6 以上版本使用
-            api_name=False  # gradio 6 以下版本使用
+            **_private_api_kwargs
         )
         clear_bu.add([input_file, md, pdf_show, md_text, output_file, is_ocr])
 
+        _to_pdf_api_kwargs = {"api_visibility": "public" if api_enable else "private"} if IS_GRADIO_6 else {"api_name": "to_pdf" if api_enable else False}
         input_file.change(
             fn=to_pdf,
             inputs=input_file,
             outputs=pdf_show,
-            api_name="to_pdf" if api_enable else False,  # gradio 6 以下版本使用
-            # api_visibility="public" if api_enable else "private"  # gradio 6 以上版本使用
+            **_to_pdf_api_kwargs
         )
+        _to_md_api_kwargs = {"api_visibility": "public" if api_enable else "private"} if IS_GRADIO_6 else {"api_name": "to_markdown" if api_enable else False}
         change_bu.click(
             fn=to_markdown,
             inputs=[input_file, max_pages, is_ocr, formula_enable, table_enable, language, backend, url],
             outputs=[md, md_text, output_file, pdf_show],
-            api_name="to_markdown" if api_enable else False,  # gradio 6 以下版本使用
-            # api_visibility="public" if api_enable else "private"  # gradio 6 以上版本使用
+            **_to_md_api_kwargs
         )
 
-    footer_links = ["gradio", "settings"]
-    if api_enable:
-        footer_links.append("api")
+    if IS_GRADIO_6:
+        footer_links = ["gradio", "settings"]
+        if api_enable:
+            footer_links.append("api")
+        _launch_kwargs = {"footer_links": footer_links}
+    else:
+        _launch_kwargs = {"show_api": api_enable}
     demo.launch(
         server_name=server_name,
         server_port=server_port,
-        # footer_links=footer_links,  # gradio 6 以上版本使用
-        show_api=api_enable,  # gradio 6 以下版本使用
-        i18n=i18n
+        i18n=i18n,
+        **_launch_kwargs
     )
 
 
