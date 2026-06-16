@@ -365,25 +365,18 @@ def finalize_mfr_batch_groups(
     if not batch_groups:
         return []
 
-    if len(batch_groups) == 1:
-        if total_count <= 1 or requested_batch_size <= total_count:
-            return batch_groups
-
+    if requested_batch_size > total_count > 1:
+        # 当外部 batch size 大于总公式数时，仍拆成两组，避免小批量场景只跑单个大包。
+        source_group = [index for group in batch_groups for index in group]
         first_group_size = largest_power_of_two_leq(total_count - 1)
-        if first_group_size < 1:
-            return batch_groups
-
-        source_group = batch_groups[0]
         first_group = source_group[:first_group_size]
         second_group = source_group[first_group_size:]
-        if not first_group or not second_group:
-            return batch_groups
-        return [first_group, second_group]
+        if first_group and second_group:
+            return [first_group, second_group]
+        return batch_groups
 
-    while (
-        len(batch_groups) >= 3
-        and len(batch_groups[-1]) < len(batch_groups[-2])
-    ):
+    # 尾包只按调用方 batch size 判断，避免继续使用固定 16 作为合并阈值。
+    if len(batch_groups) >= 2 and len(batch_groups[-1]) < requested_batch_size:
         tail_group = batch_groups.pop()
         batch_groups[-1].extend(tail_group)
 
@@ -405,7 +398,10 @@ def build_mfr_batch_groups(sorted_areas: list[int], requested_batch_size: int) -
     min_dynamic_batch_size = get_mfr_min_dynamic_batch_size(requested_batch_size)
     batch_groups = []
     if total_count < min_dynamic_batch_size:
-        batch_groups.append(list(range(total_count)))
+        for cursor in range(0, total_count, effective_batch_size):
+            batch_groups.append(
+                list(range(cursor, min(cursor + effective_batch_size, total_count)))
+            )
         return finalize_mfr_batch_groups(
             batch_groups,
             total_count,
@@ -418,7 +414,10 @@ def build_mfr_batch_groups(sorted_areas: list[int], requested_batch_size: int) -
     while cursor < total_count:
         remaining_count = total_count - cursor
         if remaining_count < min_dynamic_batch_size:
-            batch_groups.append(list(range(cursor, total_count)))
+            while cursor < total_count:
+                next_cursor = min(cursor + effective_batch_size, total_count)
+                batch_groups.append(list(range(cursor, next_cursor)))
+                cursor = next_cursor
             break
 
         probe_size = min(effective_batch_size, remaining_count)

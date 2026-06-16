@@ -16,6 +16,7 @@ from .processing_pp_formulanet import PPFormulaNetProcessor
 
 class FormulaRecognizerPlusL:
     dtype_env_var = "MINERU_FORMULA_PLUS_L_DTYPE"
+    max_new_tokens = 512
 
     def __init__(
         self,
@@ -125,7 +126,10 @@ class FormulaRecognizerPlusL:
                     batch_images = [sorted_images[i] for i in batch_group]
                     inputs = self.processor(images=batch_images, return_tensors="pt")
                     inputs = self._move_inputs_to_device(inputs)
-                    generated_outputs = self.model.generate(**inputs)
+                    generated_outputs = self.model.generate(
+                        **inputs,
+                        max_new_tokens=self.max_new_tokens,
+                    )
                     rec_formula.extend(self.processor.post_process(generated_outputs))
                     pbar.update(len(batch_group))
         return rec_formula
