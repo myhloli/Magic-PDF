@@ -115,8 +115,11 @@ Here are the environment variables and their descriptions:
     * defaults to `true`, can be set to `false` through environment variables to disable formula parsing.
   
 - `MINERU_FORMULA_CH_SUPPORT`:
-    * Used to enable Chinese formula parsing optimization (experimental feature)
-    * Default is `false`, can be set to `true` via environment variable to enable Chinese formula parsing optimization.
+    * Used to enable PP-FormulaNet_plus-L Chinese formula parsing optimization (experimental feature).
+    * Default is `false`, which uses the default `unimernet_small` formula recognition model; set it to `true` to use `PP-FormulaNet_plus-L_safetensors`.
+    * When using Hugging Face or ModelScope as the model source, the plus-L model is downloaded from the `models/MFR/pp_formulanet_plus_l/` relative path in the pipeline model repository.
+    * When using `MINERU_MODEL_SOURCE=local`, place the plus-L model files under `<pipeline model root>/models/MFR/pp_formulanet_plus_l/`, for example with `config.json`, `generation_config.json`, `model.safetensors`, `processor_config.json`, and `tokenizer.json` in that directory.
+    * plus-L uses `bf16` inference by default to reduce GPU memory usage; set `MINERU_FORMULA_PLUS_L_DTYPE=fp32` to switch back to `fp32`, or `auto` to select by device capability.
     * Only effective for `pipeline` backend.
   
 - `MINERU_TABLE_ENABLE`:

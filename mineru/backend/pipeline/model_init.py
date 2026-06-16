@@ -8,6 +8,7 @@ from loguru import logger
 from .model_list import AtomicModel
 from ...model.layout.pp_doclayoutv2 import PPDocLayoutV2LayoutModel
 from ...model.mfr.unimernet.Unimernet import UnimernetModel
+from ...model.mfr.pp_formulanet_plus_l.predict_formula import FormulaRecognizerPlusL
 from ...model.mfr.pp_formulanet_plus_m.predict_formula import FormulaRecognizer
 from mineru.model.ocr.pytorch_paddle import PytorchPaddleOCR
 from ...model.table.cls.paddle_table_cls import PaddleTableClsModel
@@ -58,14 +59,36 @@ def run_ocr_inference(inference_callable, *args, **kwargs):
         PIPELINE_OCR_INFERENCE_LOCK, inference_callable, *args, **kwargs
     )
 
-MFR_MODEL = os.getenv('MINERU_FORMULA_CH_SUPPORT', 'False')
-if MFR_MODEL.lower() in ['true', '1', 'yes']:
-    MFR_MODEL = "pp_formulanet_plus_m"
-elif MFR_MODEL.lower() in ['false', '0', 'no']:
-    MFR_MODEL = "unimernet_small"
-else:
-    logger.warning(f"Invalid MINERU_FORMULA_CH_SUPPORT value: {MFR_MODEL}, set to default 'False'")
-    MFR_MODEL = "unimernet_small"
+def get_mfr_model_name() -> str:
+    """根据中文公式开关返回当前启用的 MFR 模型名。"""
+    formula_ch_support = os.getenv('MINERU_FORMULA_CH_SUPPORT', 'False')
+    if formula_ch_support.lower() in ['true', '1', 'yes']:
+        return "pp_formulanet_plus_l"
+    if formula_ch_support.lower() in ['false', '0', 'no']:
+        return "unimernet_small"
+    logger.warning(f"Invalid MINERU_FORMULA_CH_SUPPORT value: {formula_ch_support}, set to default 'False'")
+    return "unimernet_small"
+
+
+MFR_MODEL = get_mfr_model_name()
+
+
+def get_mfr_model_path() -> str:
+    """把当前 MFR 模型名映射到模型目录相对路径。"""
+    if MFR_MODEL == "unimernet_small":
+        return ModelPath.unimernet_small
+    if MFR_MODEL == "pp_formulanet_plus_m":
+        return ModelPath.pp_formulanet_plus_m
+    if MFR_MODEL == "pp_formulanet_plus_l":
+        return ModelPath.pp_formulanet_plus_l
+    logger.error('MFR model name not allow')
+    exit(1)
+
+
+def get_pipeline_model_weight_dir(model_path: str) -> str:
+    """解析 pipeline 模型真实权重目录，统一按 pipeline 根目录加相对路径加载。"""
+    model_root = auto_download_and_get_model_root_path(model_path)
+    return str(os.path.join(model_root, model_path))
 
 
 def table_orientation_cls_model_init():
@@ -116,6 +139,8 @@ def mfr_model_init(weight_dir, device='cpu'):
         mfr_model = UnimernetModel(weight_dir, device)
     elif MFR_MODEL == "pp_formulanet_plus_m":
         mfr_model = FormulaRecognizer(weight_dir, device)
+    elif MFR_MODEL == "pp_formulanet_plus_l":
+        mfr_model = FormulaRecognizerPlusL(weight_dir, device)
     else:
         logger.error('MFR model name not allow')
         exit(1)
@@ -189,6 +214,7 @@ class AtomModelSingleton:
         elif atom_model_name in [AtomicModel.Layout, AtomicModel.MFR]:
             key = (
                 atom_model_name,
+                MFR_MODEL if atom_model_name == AtomicModel.MFR else None,
                 kwargs.get('device'),
             )
         else:
@@ -256,17 +282,11 @@ class MineruPipelineModel:
 
         if self.apply_formula:
             # 初始化公式解析模型
-            if MFR_MODEL == "unimernet_small":
-                mfr_model_path = ModelPath.unimernet_small
-            elif MFR_MODEL == "pp_formulanet_plus_m":
-                mfr_model_path = ModelPath.pp_formulanet_plus_m
-            else:
-                logger.error('MFR model name not allow')
-                exit(1)
+            mfr_model_path = get_mfr_model_path()
 
             self.mfr_model = atom_model_manager.get_atom_model(
                 atom_model_name=AtomicModel.MFR,
-                mfr_weight_dir=str(os.path.join(auto_download_and_get_model_root_path(mfr_model_path), mfr_model_path)),
+                mfr_weight_dir=get_pipeline_model_weight_dir(mfr_model_path),
                 device=self.device,
             )
 
@@ -391,16 +411,10 @@ class MineruHybridModel:
 
         if formula_enable:
             # 初始化公式解析模型
-            if MFR_MODEL == "unimernet_small":
-                mfr_model_path = ModelPath.unimernet_small
-            elif MFR_MODEL == "pp_formulanet_plus_m":
-                mfr_model_path = ModelPath.pp_formulanet_plus_m
-            else:
-                logger.error('MFR model name not allow')
-                exit(1)
+            mfr_model_path = get_mfr_model_path()
 
             self.mfr_model = self.atom_model_manager.get_atom_model(
                 atom_model_name=AtomicModel.MFR,
-                mfr_weight_dir=str(os.path.join(auto_download_and_get_model_root_path(mfr_model_path), mfr_model_path)),
+                mfr_weight_dir=get_pipeline_model_weight_dir(mfr_model_path),
                 device=self.device,
             )

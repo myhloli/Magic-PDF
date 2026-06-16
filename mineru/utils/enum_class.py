@@ -101,6 +101,7 @@ class ModelPath:
     pp_doclayout_v2 = "models/Layout/PP-DocLayoutV2"
     unimernet_small = "models/MFR/unimernet_hf_small_2503"
     pp_formulanet_plus_m = "models/MFR/pp_formulanet_plus_m"
+    pp_formulanet_plus_l = "models/MFR/pp_formulanet_plus_l"
     pytorch_paddle = "models/OCR/paddleocr_torch"
     slanet_plus = "models/TabRec/SlanetPlus/slanet-plus.onnx"
     unet_structure = "models/TabRec/UnetStructure/unet.onnx"
