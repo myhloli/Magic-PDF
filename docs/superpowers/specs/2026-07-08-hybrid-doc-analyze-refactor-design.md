@@ -11,7 +11,8 @@
 - `doc_analyze` 的核心控制维度只保留 `effort` 和规范化后的 `parse_mode`。
 - `parse_method="auto"` 在进入主流程前归一为 `parse_mode="ocr"` 或 `parse_mode="txt"`。
 - 三档 effort 都在每个窗口先运行小模型 layout。
-- 三档 effort 都使用 OCR 小模型 det 生成文本行 sidecar，并用小模型 layout 的行内公式 bbox 辅助切割。
+- 三档 effort 都使用 OCR 小模型 det 生成文本行 sidecar，但候选范围必须由 plan 控制，不能把 `high/extra_high + ocr` 扩大到所有文本类块。
+- 小模型 layout 的行内公式 bbox 可以作为公式位置提示或 OCR-det mask 输入，但 `high/extra_high + ocr` 不对行内公式跑 MFR 或 OCR-rec。
 - `medium` 完全不加载 VLM runtime。
 - `high` 使用 `predictor.batch_extract_with_layout`。
 - `extra_high` 使用 `predictor.batch_two_step_extract`。
@@ -36,11 +37,11 @@
 
 ## 决策表
 
-| effort | 主结构来源 | `parse_mode=ocr` 文本来源 | `parse_mode=txt` 文本来源 | 强制 VLM 解析块 | inline formula MFR | OCR det | OCR rec |
+| effort | 主结构来源 | `parse_mode=ocr` 文本来源 | `parse_mode=txt` 文本来源 | 强制 VLM 解析块 | inline formula MFR | OCR det 候选范围 | OCR rec |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `medium` | 小模型 layout | 小模型 OCR det + rec | PDF native text | 无 VLM | `ocr/txt` 都需要 | 需要 | 仅 `ocr` |
-| `high` | 小模型 layout 约束 VLM | VLM block OCR | PDF native text + VLM 结构块 | `index` / `code` / 行间公式 / `table` | 仅 `txt` | 需要 | 不需要 |
-| `extra_high` | VLM two-step 原生结果 | VLM block OCR | PDF native text + VLM 结构块 | `index` / `code` / 行间公式 / `table` | 仅 `txt` | 需要 | 不需要 |
+| `medium` | 小模型 layout | 小模型 OCR det + rec | PDF native text | 无 VLM | `ocr/txt` 都需要 | medium 本地回填候选 | 仅 `ocr` |
+| `high` | 小模型 layout 约束 VLM | VLM block OCR | PDF native text + VLM 结构块 | `index` / `code` / 行间公式 / `table` | 仅 `txt` | `ocr`: 仅 `*_title` / `text`; `txt`: native-text 候选 | 不需要 |
+| `extra_high` | VLM two-step 原生结果 | VLM block OCR | PDF native text + VLM 结构块 | `index` / `code` / 行间公式 / `table` | 仅 `txt` | `ocr`: 仅 `*_title` / `text`; `txt`: native-text 候选 | 不需要 |
 
 由表可得：
 
@@ -49,6 +50,7 @@
 - `needs_ocr_rec = parse_mode == "ocr" and effort == "medium"`
 - `parse_mode == "txt"` 不等于所有内容都走 PDF native text；只有可由 PDF native 回填的文本类块应被 VLM 跳过，强制 VLM 解析块必须继续交给 VLM。
 - `high` 和 `extra_high` 共用同一个 `forced_vlm_block_types`，包含 `index` / `code` / 行间公式 / `table`；`extra_high` 的 two-step extract 通常不会单独产出 `index`，但统一集合可以避免两套策略漂移。
+- `high/extra_high + ocr` 的 OCR det 候选只允许 `text`、`title`、`doc_title`、`paragraph_title`，其中 title 类用于计算标题块行高，text 类用于后续段落跨栏/跨页合并的坐标标识。
 
 ## 内部策略对象
 
@@ -67,6 +69,7 @@ class _HybridAnalyzePlan:
     extractor: Literal["medium_local", "high_with_layout", "extra_high_two_step"]
     forced_vlm_block_types: frozenset[str]
     vlm_not_extract_list: tuple[str, ...] | None
+    ocr_det_candidate_profile: Literal["medium_local", "native_text", "vlm_text_title_only"]
 ```
 
 该对象只在 `hybrid_analyze.py` 内部使用，不作为公开 API。
@@ -87,6 +90,7 @@ class _HybridAnalyzePlan:
 - 先调用 `validate_effort(effort)`。
 - 按决策表返回 `_HybridAnalyzePlan`。
 - `vlm_not_extract_list` 不能无条件等同于未来可能扩展的 `NOT_EXTRACT_TYPES`；它必须排除当前 plan 的 `forced_vlm_block_types`，避免误把 `index` / `code` / 行间公式 / `table` 交给 PDF native 或空内容回填。
+- `ocr_det_candidate_profile` 必须显式区分 VLM OCR 路径；`high/extra_high + ocr` 只能使用 `vlm_text_title_only`，不能复用 medium 或 native-text 的宽候选集合。
 
 ### 2. Runtime 初始化
 
@@ -137,7 +141,13 @@ class _HybridAnalyzePlan:
 
 ### 5. Sidecar 增强
 
-OCR det 三档都执行，用于文本行 sidecar 和后续段落合并提示。
+OCR det 三档都执行，但候选范围不同：
+
+- `medium_local`: 使用 medium 本地 layout 回填候选，服务 OCR 文本回填、空 `index/code/algorithm` 回填和行提示。
+- `native_text`: 用于 `parse_mode=txt` 的 PDF native text 路径，服务 native 文本回填、行内公式匹配和段落合并提示。
+- `vlm_text_title_only`: 仅用于 `high/extra_high + ocr`，候选只能是 `text`、`title`、`doc_title`、`paragraph_title`。
+
+`vlm_text_title_only` 的结果必须是空文本 sidecar，不能覆盖 VLM content。title 类 det 行只用于 `_line_avg_height` / title leveling，text 类 det 行只用于段落跨栏/跨页合并所需的坐标标识。
 
 MFR 只在 `plan.needs_mfr=True` 时执行：
 
@@ -151,7 +161,7 @@ OCR rec 只在 `plan.needs_ocr_rec=True` 时执行：
 - `high/extra_high + ocr` 不执行，因为 VLM 已提供 block 文本。
 - 所有 `txt` 模式不执行 OCR rec。
 
-`high/extra_high + ocr` 的 OCR det sidecar 只保留空文本行提示，不能覆盖 VLM content。
+`high/extra_high + ocr` 的 OCR det sidecar 只保留 `*_title/text` 空文本行提示，不能覆盖 VLM content，也不能额外扫描 `index`、`code`、行间公式、`table`、caption、footnote、aside、list 等非目标块。
 
 `high/extra_high + txt` 的 inline formula MFR 只为 PDF native 文本类块补行内公式；已经强制 VLM 解析的 `index`、`code`、行间公式、`table` 内容仍以 VLM 输出为准。
 
@@ -189,6 +199,7 @@ OCR rec 只在 `plan.needs_ocr_rec=True` 时执行：
 - `high + txt`: `use_vlm_text_content=False`, `needs_mfr=True`, `needs_ocr_rec=False`
 - `extra_high + ocr`: `use_vlm_text_content=True`, `needs_mfr=False`, `needs_ocr_rec=False`
 - `extra_high + txt`: `use_vlm_text_content=False`, `needs_mfr=True`, `needs_ocr_rec=False`
+- `high/extra_high + ocr`: `ocr_det_candidate_profile="vlm_text_title_only"`
 
 ### Runtime 路由单测
 
@@ -196,8 +207,10 @@ OCR rec 只在 `plan.needs_ocr_rec=True` 时执行：
 
 - `medium` 不加载 VLM runtime。
 - `high + ocr` 调 `batch_extract_with_layout`，不跑 MFR/rec，`use_vlm_text_content=True`。
+- `high + ocr` 的 OCR det 候选只接受 `text` / `title` / `doc_title` / `paragraph_title`，拒绝 `index` / `code` / 行间公式 / `table` / caption / footnote / aside / list。
 - `high + txt` 调 `batch_extract_with_layout`，传 `not_extract_list`，跑 MFR，不跑 rec，并断言 `index` / `code` / 行间公式 / `table` 不在跳过列表中。
 - `extra_high + ocr` 调 `batch_two_step_extract`，不跑 MFR/rec，`use_vlm_text_content=True`。
+- `extra_high + ocr` 的 OCR det 候选只接受 `text` / `title` / `doc_title` / `paragraph_title`，拒绝 `index` / `code` / 行间公式 / `table` / caption / footnote / aside / list。
 - `extra_high + txt` 调 `batch_two_step_extract`，传 `not_extract_list`，跑 MFR，不跑 rec，并断言 `index` / `code` / 行间公式 / `table` 不在跳过列表中。
 - `medium + ocr` 跑 OCR det + OCR rec + MFR。
 
@@ -236,6 +249,7 @@ git diff --check
 - `use_vlm_text_content` 的语义必须保持为“文本内容是否来自 VLM”，不能重新被解释为 OCR 开关。
 - `medium` 的低资源边界不能被破坏，任何 VLM import 都不能进入 medium 路径。
 - `high/extra_high + ocr` 不应触发 MFR 或 OCR-rec。
+- `high/extra_high + ocr` 的 OCR det 不能复用宽文本候选，只允许 `text`、`title`、`doc_title`、`paragraph_title`。
 - `high/extra_high + txt` 必须保留 inline formula MFR，否则 PDF native text 路径会丢失行内公式补偿。
 - `high + txt` 必须强制 VLM 解析 `index`、`code`、行间公式和 `table`，不能因 `not_extract_list` 扩展而退化为 PDF native 回填。
 - `extra_high + txt` 必须强制 VLM 解析 `index`、`code`、行间公式和 `table`，不能因 `not_extract_list` 扩展而退化为 PDF native 回填；`index` 在 two-step 输出中通常不存在，但必须和 `high` 使用同一强制集合。
