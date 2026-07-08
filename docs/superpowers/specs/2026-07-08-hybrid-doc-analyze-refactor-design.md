@@ -40,7 +40,7 @@
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `medium` | 小模型 layout | 小模型 OCR det + rec | PDF native text | 无 VLM | `ocr/txt` 都需要 | 需要 | 仅 `ocr` |
 | `high` | 小模型 layout 约束 VLM | VLM block OCR | PDF native text + VLM 结构块 | `index` / `code` / 行间公式 / `table` | 仅 `txt` | 需要 | 不需要 |
-| `extra_high` | VLM two-step 原生结果 | VLM block OCR | PDF native text + VLM 结构块 | `code` / 行间公式 / `table` | 仅 `txt` | 需要 | 不需要 |
+| `extra_high` | VLM two-step 原生结果 | VLM block OCR | PDF native text + VLM 结构块 | `index` / `code` / 行间公式 / `table` | 仅 `txt` | 需要 | 不需要 |
 
 由表可得：
 
@@ -48,6 +48,7 @@
 - `needs_mfr = parse_mode == "txt" or effort == "medium"`
 - `needs_ocr_rec = parse_mode == "ocr" and effort == "medium"`
 - `parse_mode == "txt"` 不等于所有内容都走 PDF native text；只有可由 PDF native 回填的文本类块应被 VLM 跳过，强制 VLM 解析块必须继续交给 VLM。
+- `high` 和 `extra_high` 共用同一个 `forced_vlm_block_types`，包含 `index` / `code` / 行间公式 / `table`；`extra_high` 的 two-step extract 通常不会单独产出 `index`，但统一集合可以避免两套策略漂移。
 
 ## 内部策略对象
 
@@ -130,7 +131,7 @@ class _HybridAnalyzePlan:
 
 - 调用 `predictor.batch_two_step_extract(...)`。
 - `parse_mode=ocr` 时不传 `not_extract_list`，由 VLM 完成 block OCR。
-- `parse_mode=txt` 时只跳过可由 PDF native 回填的文本类块；`code`、行间公式、`table` 必须留给 VLM 解析。
+- `parse_mode=txt` 时只跳过可由 PDF native 回填的文本类块；`index`、`code`、行间公式、`table` 必须留给 VLM 解析。
 
 `image_analysis` 继续只在 `extra_high` 中生效，`medium` 和 `high` 强制关闭，避免低/中资源路径隐式触发更重的 VLM 图像分析。
 
@@ -152,7 +153,7 @@ OCR rec 只在 `plan.needs_ocr_rec=True` 时执行：
 
 `high/extra_high + ocr` 的 OCR det sidecar 只保留空文本行提示，不能覆盖 VLM content。
 
-`high/extra_high + txt` 的 inline formula MFR 只为 PDF native 文本类块补行内公式；已经强制 VLM 解析的 `code`、行间公式、`table` 内容仍以 VLM 输出为准。
+`high/extra_high + txt` 的 inline formula MFR 只为 PDF native 文本类块补行内公式；已经强制 VLM 解析的 `index`、`code`、行间公式、`table` 内容仍以 VLM 输出为准。
 
 ### 6. Append 与 finalize
 
@@ -197,7 +198,7 @@ OCR rec 只在 `plan.needs_ocr_rec=True` 时执行：
 - `high + ocr` 调 `batch_extract_with_layout`，不跑 MFR/rec，`use_vlm_text_content=True`。
 - `high + txt` 调 `batch_extract_with_layout`，传 `not_extract_list`，跑 MFR，不跑 rec，并断言 `index` / `code` / 行间公式 / `table` 不在跳过列表中。
 - `extra_high + ocr` 调 `batch_two_step_extract`，不跑 MFR/rec，`use_vlm_text_content=True`。
-- `extra_high + txt` 调 `batch_two_step_extract`，传 `not_extract_list`，跑 MFR，不跑 rec，并断言 `code` / 行间公式 / `table` 不在跳过列表中。
+- `extra_high + txt` 调 `batch_two_step_extract`，传 `not_extract_list`，跑 MFR，不跑 rec，并断言 `index` / `code` / 行间公式 / `table` 不在跳过列表中。
 - `medium + ocr` 跑 OCR det + OCR rec + MFR。
 
 ### 回归测试
@@ -237,6 +238,6 @@ git diff --check
 - `high/extra_high + ocr` 不应触发 MFR 或 OCR-rec。
 - `high/extra_high + txt` 必须保留 inline formula MFR，否则 PDF native text 路径会丢失行内公式补偿。
 - `high + txt` 必须强制 VLM 解析 `index`、`code`、行间公式和 `table`，不能因 `not_extract_list` 扩展而退化为 PDF native 回填。
-- `extra_high + txt` 必须强制 VLM 解析 `code`、行间公式和 `table`，不能因 `not_extract_list` 扩展而退化为 PDF native 回填。
+- `extra_high + txt` 必须强制 VLM 解析 `index`、`code`、行间公式和 `table`，不能因 `not_extract_list` 扩展而退化为 PDF native 回填；`index` 在 two-step 输出中通常不存在，但必须和 `high` 使用同一强制集合。
 - `INDEX -> TEXT` 的归一仍应留在 `MagicModel` 内容构造完成之后，不能提前转换。
 - 新增函数和方法必须包含中文注释，方便 review。
