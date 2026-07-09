@@ -13,7 +13,7 @@
 - 三档 effort 都在每个窗口先运行小模型 layout。
 - 三档 effort 都使用 OCR 小模型 det 生成文本行 sidecar，但候选范围必须由 plan 控制，不能把 `high/extra_high + ocr` 扩大到所有文本类块。
 - 小模型 layout 的行内公式 bbox 可以作为公式位置提示或 OCR-det mask 输入，但 `high/extra_high + ocr` 不对行内公式跑 MFR 或 OCR-rec。
-- 小模型 layout 的 `doc_title` / `paragraph_title` 在 Hybrid 内部和共享 utils 中作为一等 title subtype 传递，`high` 不再先归一为 `title` 再用 layout bbox 反向拆分。
+- 先在 `mineru_vl_utils` 中支持 `doc_title` / `paragraph_title` block type，再让小模型 layout 的 split title subtype 在 Hybrid 内部和 VLM 外部 layout 调用中作为一等类型传递；`high` 不再先归一为 `title` 再用 layout bbox 反向拆分。
 - `medium` 完全不加载 VLM runtime。
 - `high` 使用 `predictor.batch_extract_with_layout`。
 - `extra_high` 使用 `predictor.batch_two_step_extract`。
@@ -27,6 +27,7 @@
 - 不重写 `HybridMagicModel`、`model_output_to_middle_json.py` 或最终渲染/export 逻辑。
 - 不改变 VLM predictor 的接口。
 - 不改变最终公开输出中的 title schema；`DOC_TITLE` / `PARAGRAPH_TITLE` 仍只作为内部类型，最终继续归一为 `TITLE + level`。
+- 不要求 `extra_high` 的 VLM two-step layout 原生产出 `doc_title` / `paragraph_title`；two-step 能产出的类型仍由 VLM 模型决定。本次只保证这些类型一旦来自外部 layout 或 post-process，就不会被 `mineru_vl_utils` 拒绝或丢弃。
 
 ## 术语
 
@@ -129,7 +130,7 @@ class _HybridAnalyzePlan:
 `high_with_layout`：
 
 - 使用 `images_layout_res` 构造 `blocks_list`。
-- `HYBRID_VLM_LAYOUT_LABEL_MAP` 直接把 `doc_title` 映射为 `DOC_TITLE`，把 `paragraph_title` 映射为 `PARAGRAPH_TITLE`；不再为了 VLM 调用先退化为 `TITLE`。
+- 在 `mineru_vl_utils` 支持 split title 类型之后，`HYBRID_VLM_LAYOUT_LABEL_MAP` 直接把 `doc_title` 映射为 `DOC_TITLE`，把 `paragraph_title` 映射为 `PARAGRAPH_TITLE`；不再为了 VLM 调用先退化为 `TITLE`。
 - 调用 `predictor.batch_extract_with_layout(...)`。
 - `parse_mode=ocr` 时不传 `not_extract_list`，由 VLM 完成 block OCR。
 - `parse_mode=txt` 时只跳过可由 PDF native 回填的文本类块；`index`、`code`、行间公式、`table` 必须留给 VLM 解析。
@@ -143,6 +144,16 @@ class _HybridAnalyzePlan:
 `image_analysis` 继续只在 `extra_high` 中生效，`medium` 和 `high` 强制关闭，避免低/中资源路径隐式触发更重的 VLM 图像分析。
 
 ### 5. Title subtype 贯通
+
+`mineru_vl_utils` 是 VLM 外部 layout schema 的拥有者。Magic-PDF 不能只在本地把 layout label 改成 `DOC_TITLE` / `PARAGRAPH_TITLE`，否则 `mineru_vl_utils.structs.ContentBlock` 的类型断言、`parse_layout_output(...)` 的 unknown type 过滤、`prepare_for_extract(...)` 的 `not_extract_list` 校验都会把新类型拒绝或忽略。
+
+因此需要先在 `/Users/myhloli/projects/20251028mineru_vl_utils/mineru-vl-utils` 做一层兼容扩展：
+
+- `mineru_vl_utils.structs.BlockType` 增加 `DOC_TITLE = "doc_title"` 和 `PARAGRAPH_TITLE = "paragraph_title"`。
+- `BLOCK_TYPES` 增加这两个类型，保证 `ContentBlock(...)`、`ContentBlock.type` setter、外部 layout dict 归一化、layout output parser 都接受 split title。
+- `mineru_client.prepare_for_extract(...)` 不需要为这两个类型新增专用 prompt；它们默认走 `[default]` 文本识别 prompt，语义上和 `title` 一致。
+- `not_extract_list` 校验应自然支持这两个类型，便于 `parse_mode=txt` 时把 split title 作为可跳过的 native-text title 类块处理。
+- `post_process(...)` 不应把这两个类型归一成 `title`；输出归一仍留给 Magic-PDF 的 `model_output_to_middle_json._normalize_split_title_blocks(...)`。
 
 Hybrid 内部统一把 `{TITLE, DOC_TITLE, PARAGRAPH_TITLE}` 视为 title-like block：
 
@@ -242,6 +253,8 @@ OCR rec 只在 `plan.needs_ocr_rec=True` 时执行：
 
 新增 title subtype focused tests：
 
+- 在 `mineru_vl_utils` 中新增测试，覆盖 `ContentBlock(BlockType.DOC_TITLE, ...)` / `ContentBlock(BlockType.PARAGRAPH_TITLE, ...)` 可构造、`parse_layout_output(...)` 可解析 `<|ref_start|>doc_title<|ref_end|>` / `<|ref_start|>paragraph_title<|ref_end|>`、`batch_extract_with_layout(...)` 可接收外部 layout dict 并使用 `[default]` prompt。
+- 在 `mineru_vl_utils` 中新增测试，覆盖 `not_extract_list=["doc_title", "paragraph_title"]` 会跳过对应 block，但不会影响 `index` / `code` / 行间公式 / `table`。
 - `HYBRID_VLM_LAYOUT_LABEL_MAP` 和 `_layout_item_to_content_block(...)` 对 `doc_title` / `paragraph_title` 保留内部 split title 类型。
 - layout/visual debug utils 将 `DOC_TITLE` / `PARAGRAPH_TITLE` 与 `TITLE` 归入同一 title bucket，不把它们误画成普通文本或漏画。
 - `finalize_middle_json_from_preproc(...)` 后，内部 `DOC_TITLE` / `PARAGRAPH_TITLE` 仍归一为公开 `TITLE`，并分别得到默认 level 1 / 2。
@@ -265,6 +278,18 @@ git diff --check
 
 如果实现触碰 `model_output_to_middle_json.py` 或 `hybrid_magic_model.py`，还需要补跑相关 focused tests，并明确说明触碰原因。
 
+跨 repo 实现时还需要在 `mineru_vl_utils` 工作区运行：
+
+```bash
+cd /Users/myhloli/projects/20251028mineru_vl_utils/mineru-vl-utils
+/Users/myhloli/projects/20240809magic_pdf/Magic-PDF/.venv1/bin/python -m pytest -q \
+  tests/test_formula_number_layout.py \
+  tests/test_external_layout_progress.py \
+  tests/test_title_block_types.py
+```
+
+`mineru_vl_utils` 发布或本地依赖更新后，Magic-PDF 的 `pyproject.toml` 需要把 `mineru-vl-utils>=...` 的下限提升到包含 split title 支持的版本；在本地 editable 环境验证时可以先不改依赖下限。
+
 ## 风险与约束
 
 - `use_vlm_text_content` 的语义必须保持为“文本内容是否来自 VLM”，不能重新被解释为 OCR 开关。
@@ -275,4 +300,5 @@ git diff --check
 - `high + txt` 必须强制 VLM 解析 `index`、`code`、行间公式和 `table`，不能因 `not_extract_list` 扩展而退化为 PDF native 回填。
 - `extra_high + txt` 必须强制 VLM 解析 `index`、`code`、行间公式和 `table`，不能因 `not_extract_list` 扩展而退化为 PDF native 回填；`index` 在 two-step 输出中通常不存在，但必须和 `high` 使用同一强制集合。
 - `INDEX -> TEXT` 的归一仍应留在 `MagicModel` 内容构造完成之后，不能提前转换。
+- Magic-PDF 不能在 `mineru_vl_utils` 尚未支持 split title 类型时直接把 high 外部 layout 传成 `doc_title` / `paragraph_title`，否则 `ContentBlock` 断言或 layout parser 会拒绝新类型。
 - 新增函数和方法必须包含中文注释，方便 review。
