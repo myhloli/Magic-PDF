@@ -27,7 +27,7 @@
 - 不重写 `HybridMagicModel`、`model_output_to_middle_json.py` 或最终渲染/export 逻辑。
 - 不改变 VLM predictor 的接口。
 - 不改变最终公开输出中的 title schema；`DOC_TITLE` / `PARAGRAPH_TITLE` 仍只作为内部类型，最终继续归一为 `TITLE + level`。
-- 不要求 `extra_high` 的 VLM two-step layout 原生产出 `doc_title` / `paragraph_title`；two-step 能产出的类型仍由 VLM 模型决定。本次只保证这些类型一旦来自外部 layout 或 post-process，就不会被 `mineru_vl_utils` 拒绝或丢弃。
+- 不要求 `extra_high` 的 VLM two-step layout 原生产出 `doc_title` / `paragraph_title`；two-step 能产出的类型仍由 VLM 模型决定。`extra_high` 需要继续用本地 layout 结果对 two-step 返回的泛化 `title` 做 `doc_title` / `paragraph_title` 拆分。
 
 ## 术语
 
@@ -138,6 +138,8 @@ class _HybridAnalyzePlan:
 `extra_high_two_step`：
 
 - 调用 `predictor.batch_two_step_extract(...)`。
+- `batch_two_step_extract(...)` 的 VLM 原生 layout 不支持稳定区分 `doc_title` / `paragraph_title`，返回的 title 仍按泛化 `TITLE` 处理。
+- two-step 返回后继续执行 `_apply_layout_title_split(...)`，用同窗口的小模型 layout `doc_title` bbox 把 VLM `TITLE` 拆分为 `DOC_TITLE` / `PARAGRAPH_TITLE`。
 - `parse_mode=ocr` 时不传 `not_extract_list`，由 VLM 完成 block OCR。
 - `parse_mode=txt` 时只跳过可由 PDF native 回填的文本类块；`index`、`code`、行间公式、`table` 必须留给 VLM 解析。
 
@@ -158,11 +160,11 @@ class _HybridAnalyzePlan:
 Hybrid 内部统一把 `{TITLE, DOC_TITLE, PARAGRAPH_TITLE}` 视为 title-like block：
 
 - `high` 的 `blocks_list` 保留 layout subtype，不再依赖 `_apply_layout_title_split(...)` 对 VLM 返回的 `TITLE` 做二次拆分。
-- `extra_high` 仍使用 two-step 原生结果；如果 two-step 输出或本地 layout sidecar 中出现 split title subtype，下游 utils 必须能识别它们。
+- `extra_high` 仍使用 two-step 原生结果；由于 two-step 不稳定产出 split title，必须保留 `_apply_layout_title_split(...)`，在 VLM 抽取后用本地 layout `doc_title` bbox 对泛化 `TITLE` 做拆分。
 - `para_block_utils`、title leveling、layout/visual debug 等共享 utils 需要使用统一的 title-like 判断，避免只识别 `TITLE` 导致 merge barrier、行高、绘制或调试输出丢失 title subtype。
 - `model_output_to_middle_json._normalize_split_title_blocks(...)` 仍是输出边界，负责把内部 `DOC_TITLE` / `PARAGRAPH_TITLE` 归一为公开 `TITLE` 并补默认 level。
 
-因此，旧的 `_apply_layout_title_split(...)` 不再属于 high 主路径。实现时应优先删除它或收窄成兼容 helper，避免未来维护者误以为 high 仍需要“先丢 subtype，再根据 bbox 补回 subtype”。
+因此，`_apply_layout_title_split(...)` 不再属于 high 主路径，但仍是 extra_high 主路径的一部分。实现时应把它的调用点收窄到 `extra_high_two_step`，避免未来维护者误以为 high 仍需要“先丢 subtype，再根据 bbox 补回 subtype”。
 
 ### 6. Sidecar 增强
 
@@ -236,6 +238,7 @@ OCR rec 只在 `plan.needs_ocr_rec=True` 时执行：
 - `high + ocr` 的 OCR det 候选只接受 `text` / `title` / `doc_title` / `paragraph_title`，拒绝 `index` / `code` / 行间公式 / `table` / caption / footnote / aside / list。
 - `high + txt` 调 `batch_extract_with_layout`，传 `not_extract_list`，跑 MFR，不跑 rec，并断言 `index` / `code` / 行间公式 / `table` 不在跳过列表中。
 - `extra_high + ocr` 调 `batch_two_step_extract`，不跑 MFR/rec，`use_vlm_text_content=True`。
+- `extra_high` fake predictor 返回泛化 `TITLE` 时，流程仍调用 `_apply_layout_title_split(...)`，并能基于本地 layout `doc_title` bbox 产出 `DOC_TITLE` / `PARAGRAPH_TITLE`。
 - `extra_high + ocr` 的 OCR det 候选只接受 `text` / `title` / `doc_title` / `paragraph_title`，拒绝 `index` / `code` / 行间公式 / `table` / caption / footnote / aside / list。
 - `extra_high + txt` 调 `batch_two_step_extract`，传 `not_extract_list`，跑 MFR，不跑 rec，并断言 `index` / `code` / 行间公式 / `table` 不在跳过列表中。
 - `medium + ocr` 跑 OCR det + OCR rec + MFR。
@@ -255,7 +258,8 @@ OCR rec 只在 `plan.needs_ocr_rec=True` 时执行：
 
 - 在 `mineru_vl_utils` 中新增测试，覆盖 `ContentBlock(BlockType.DOC_TITLE, ...)` / `ContentBlock(BlockType.PARAGRAPH_TITLE, ...)` 可构造、`parse_layout_output(...)` 可解析 `<|ref_start|>doc_title<|ref_end|>` / `<|ref_start|>paragraph_title<|ref_end|>`、`batch_extract_with_layout(...)` 可接收外部 layout dict 并使用 `[default]` prompt。
 - 在 `mineru_vl_utils` 中新增测试，覆盖 `not_extract_list=["doc_title", "paragraph_title"]` 会跳过对应 block，但不会影响 `index` / `code` / 行间公式 / `table`。
-- `HYBRID_VLM_LAYOUT_LABEL_MAP` 和 `_layout_item_to_content_block(...)` 对 `doc_title` / `paragraph_title` 保留内部 split title 类型。
+- `HYBRID_VLM_LAYOUT_LABEL_MAP` 和 `_layout_item_to_content_block(...)` 在 high 外部 layout 路径对 `doc_title` / `paragraph_title` 保留内部 split title 类型。
+- `_apply_layout_title_split(...)` 在 extra_high two-step 路径继续覆盖 VLM 泛化 `TITLE` 到 `DOC_TITLE` / `PARAGRAPH_TITLE`。
 - layout/visual debug utils 将 `DOC_TITLE` / `PARAGRAPH_TITLE` 与 `TITLE` 归入同一 title bucket，不把它们误画成普通文本或漏画。
 - `finalize_middle_json_from_preproc(...)` 后，内部 `DOC_TITLE` / `PARAGRAPH_TITLE` 仍归一为公开 `TITLE`，并分别得到默认 level 1 / 2。
 
@@ -301,4 +305,5 @@ cd /Users/myhloli/projects/20251028mineru_vl_utils/mineru-vl-utils
 - `extra_high + txt` 必须强制 VLM 解析 `index`、`code`、行间公式和 `table`，不能因 `not_extract_list` 扩展而退化为 PDF native 回填；`index` 在 two-step 输出中通常不存在，但必须和 `high` 使用同一强制集合。
 - `INDEX -> TEXT` 的归一仍应留在 `MagicModel` 内容构造完成之后，不能提前转换。
 - Magic-PDF 不能在 `mineru_vl_utils` 尚未支持 split title 类型时直接把 high 外部 layout 传成 `doc_title` / `paragraph_title`，否则 `ContentBlock` 断言或 layout parser 会拒绝新类型。
+- 不能删除 `_apply_layout_title_split(...)`；它不再服务 high，但仍服务 extra_high 的 two-step title subtype 补偿。
 - 新增函数和方法必须包含中文注释，方便 review。
