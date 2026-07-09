@@ -1,7 +1,7 @@
 # Copyright (c) Opendatalab. All rights reserved.
 import json
 import os
-from typing import Any
+from typing import Any, Literal
 
 from loguru import logger
 from packaging import version
@@ -91,18 +91,19 @@ def set_lmdeploy_backend(device_type: str) -> str:
     return lmdeploy_backend
 
 
-def set_default_gpu_memory_utilization() -> float:
-    from vllm import __version__ as vllm_version  # type: ignore
-
+def set_default_gpu_memory_utilization(backend: Literal["vllm", "lmdeploy"] = "vllm") -> float:
     device = get_device()
     gpu_memory = get_vram(device)
-    default_gpu_memory_utilization = 0.5
-    if version.parse(vllm_version) >= version.parse("0.11.0") and gpu_memory <= 8:
-        default_gpu_memory_utilization = 0.7
+    min_memory = 4
+    if backend == "vllm":
+        from vllm import __version__ as vllm_version  # type: ignore
+        if version.parse(vllm_version) >= version.parse("0.11.0"):
+            min_memory = 6
+    default_gpu_memory_utilization = round(min_memory / gpu_memory, 2)
 
     logger.debug(
-        f"vllm_version: {vllm_version}, gpu_memory: {gpu_memory} GB,"
-        f" default_gpu_memory_utilization: {default_gpu_memory_utilization}"
+        f"gpu_memory: {gpu_memory} GB, "
+        f"default_gpu_memory_utilization: {default_gpu_memory_utilization}"
     )
     return default_gpu_memory_utilization
 

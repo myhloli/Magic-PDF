@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager, contextmanager
 from typing import Any, AsyncIterator, Generator, Iterator, Literal
 
 from loguru import logger
+from mineru.utils.model_utils import get_vram
 from mineru_vl_utils import MinerUClient
 from packaging import version
 
@@ -185,7 +186,7 @@ class ModelSingleton:
                         except ImportError:
                             raise ImportError("Please install lmdeploy to use the lmdeploy-engine backend.")
                         if "cache_max_entry_count" not in kwargs:
-                            kwargs["cache_max_entry_count"] = 0.5
+                            kwargs["cache_max_entry_count"] = set_default_gpu_memory_utilization(backend="lmdeploy")
 
                         device_type = os.getenv("MINERU_LMDEPLOY_DEVICE", "")
                         if device_type == "":
