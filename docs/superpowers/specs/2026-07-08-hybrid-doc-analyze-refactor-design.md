@@ -13,6 +13,7 @@
 - 三档 effort 都在每个窗口先运行小模型 layout。
 - 三档 effort 都使用 OCR 小模型 det 生成文本行 sidecar，但候选范围必须由 plan 控制，不能把 `high/extra_high + ocr` 扩大到所有文本类块。
 - 小模型 layout 的行内公式 bbox 可以作为公式位置提示或 OCR-det mask 输入，但 `high/extra_high + ocr` 不对行内公式跑 MFR 或 OCR-rec。
+- 小模型 layout 的 `doc_title` / `paragraph_title` 在 Hybrid 内部和共享 utils 中作为一等 title subtype 传递，`high` 不再先归一为 `title` 再用 layout bbox 反向拆分。
 - `medium` 完全不加载 VLM runtime。
 - `high` 使用 `predictor.batch_extract_with_layout`。
 - `extra_high` 使用 `predictor.batch_two_step_extract`。
@@ -25,6 +26,7 @@
 - 不新增 formula/table 公开开关。
 - 不重写 `HybridMagicModel`、`model_output_to_middle_json.py` 或最终渲染/export 逻辑。
 - 不改变 VLM predictor 的接口。
+- 不改变最终公开输出中的 title schema；`DOC_TITLE` / `PARAGRAPH_TITLE` 仍只作为内部类型，最终继续归一为 `TITLE + level`。
 
 ## 术语
 
@@ -127,6 +129,7 @@ class _HybridAnalyzePlan:
 `high_with_layout`：
 
 - 使用 `images_layout_res` 构造 `blocks_list`。
+- `HYBRID_VLM_LAYOUT_LABEL_MAP` 直接把 `doc_title` 映射为 `DOC_TITLE`，把 `paragraph_title` 映射为 `PARAGRAPH_TITLE`；不再为了 VLM 调用先退化为 `TITLE`。
 - 调用 `predictor.batch_extract_with_layout(...)`。
 - `parse_mode=ocr` 时不传 `not_extract_list`，由 VLM 完成 block OCR。
 - `parse_mode=txt` 时只跳过可由 PDF native 回填的文本类块；`index`、`code`、行间公式、`table` 必须留给 VLM 解析。
@@ -139,7 +142,18 @@ class _HybridAnalyzePlan:
 
 `image_analysis` 继续只在 `extra_high` 中生效，`medium` 和 `high` 强制关闭，避免低/中资源路径隐式触发更重的 VLM 图像分析。
 
-### 5. Sidecar 增强
+### 5. Title subtype 贯通
+
+Hybrid 内部统一把 `{TITLE, DOC_TITLE, PARAGRAPH_TITLE}` 视为 title-like block：
+
+- `high` 的 `blocks_list` 保留 layout subtype，不再依赖 `_apply_layout_title_split(...)` 对 VLM 返回的 `TITLE` 做二次拆分。
+- `extra_high` 仍使用 two-step 原生结果；如果 two-step 输出或本地 layout sidecar 中出现 split title subtype，下游 utils 必须能识别它们。
+- `para_block_utils`、title leveling、layout/visual debug 等共享 utils 需要使用统一的 title-like 判断，避免只识别 `TITLE` 导致 merge barrier、行高、绘制或调试输出丢失 title subtype。
+- `model_output_to_middle_json._normalize_split_title_blocks(...)` 仍是输出边界，负责把内部 `DOC_TITLE` / `PARAGRAPH_TITLE` 归一为公开 `TITLE` 并补默认 level。
+
+因此，旧的 `_apply_layout_title_split(...)` 不再属于 high 主路径。实现时应优先删除它或收窄成兼容 helper，避免未来维护者误以为 high 仍需要“先丢 subtype，再根据 bbox 补回 subtype”。
+
+### 6. Sidecar 增强
 
 OCR det 三档都执行，但候选范围不同：
 
@@ -165,7 +179,7 @@ OCR rec 只在 `plan.needs_ocr_rec=True` 时执行：
 
 `high/extra_high + txt` 的 inline formula MFR 只为 PDF native 文本类块补行内公式；已经强制 VLM 解析的 `index`、`code`、行间公式、`table` 内容仍以 VLM 输出为准。
 
-### 6. Append 与 finalize
+### 7. Append 与 finalize
 
 `append_pages(...)` 继续调用 `blocks_to_page_info(...)`，但传入的 `_ocr_enable` 可以保持当前兼容形态，对下游语义更清楚的变量是 `use_vlm_text_content`。
 
@@ -207,6 +221,7 @@ OCR rec 只在 `plan.needs_ocr_rec=True` 时执行：
 
 - `medium` 不加载 VLM runtime。
 - `high + ocr` 调 `batch_extract_with_layout`，不跑 MFR/rec，`use_vlm_text_content=True`。
+- `high` 构造 `blocks_list` 时保留 `doc_title` / `paragraph_title` subtype，fake predictor 接收到的 layout block type 应分别是 `DOC_TITLE` / `PARAGRAPH_TITLE`，而不是统一的 `TITLE`。
 - `high + ocr` 的 OCR det 候选只接受 `text` / `title` / `doc_title` / `paragraph_title`，拒绝 `index` / `code` / 行间公式 / `table` / caption / footnote / aside / list。
 - `high + txt` 调 `batch_extract_with_layout`，传 `not_extract_list`，跑 MFR，不跑 rec，并断言 `index` / `code` / 行间公式 / `table` 不在跳过列表中。
 - `extra_high + ocr` 调 `batch_two_step_extract`，不跑 MFR/rec，`use_vlm_text_content=True`。
@@ -224,6 +239,12 @@ OCR rec 只在 `plan.needs_ocr_rec=True` 时执行：
 - `tests/unittest/test_hybrid_medium_local_layout_memory.py`
 - `tests/unittest/test_hybrid_medium_table_inline_objects.py`
 - `tests/unittest/test_hybrid_high_extra_high_ocr_routing.py`
+
+新增 title subtype focused tests：
+
+- `HYBRID_VLM_LAYOUT_LABEL_MAP` 和 `_layout_item_to_content_block(...)` 对 `doc_title` / `paragraph_title` 保留内部 split title 类型。
+- layout/visual debug utils 将 `DOC_TITLE` / `PARAGRAPH_TITLE` 与 `TITLE` 归入同一 title bucket，不把它们误画成普通文本或漏画。
+- `finalize_middle_json_from_preproc(...)` 后，内部 `DOC_TITLE` / `PARAGRAPH_TITLE` 仍归一为公开 `TITLE`，并分别得到默认 level 1 / 2。
 
 ## 验证命令
 
