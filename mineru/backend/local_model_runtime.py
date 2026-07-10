@@ -253,7 +253,7 @@ def atom_model_init(model_name: str, **kwargs: Any) -> Any:
 
 class HybridLocalModelContextSingleton:
     _instance: HybridLocalModelContextSingleton | None = None
-    _models: dict[object, object] = {}
+    _model: HybridLocalModelContext | None = None
     _lock: threading.RLock = LOCAL_MODEL_INIT_LOCK
 
     def __new__(cls, *args: Any, **kwargs: Any) -> HybridLocalModelContextSingleton:

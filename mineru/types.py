@@ -219,6 +219,8 @@ BLOCK_TYPES = {
 NOT_EXTRACT_TYPES = {
     BlockType.TEXT,
     BlockType.TITLE,
+    BlockType.DOC_TITLE,
+    BlockType.PARAGRAPH_TITLE,
     BlockType.HEADER,
     BlockType.FOOTER,
     BlockType.PAGE_NUMBER,
@@ -226,42 +228,13 @@ NOT_EXTRACT_TYPES = {
     BlockType.REF_TEXT,
     BlockType.TABLE_CAPTION,
     BlockType.IMAGE_CAPTION,
+    BlockType.CAPTION,
     BlockType.TABLE_FOOTNOTE,
     BlockType.IMAGE_FOOTNOTE,
+    BlockType.FOOTNOTE,
     BlockType.CODE_CAPTION,
     BlockType.PHONETIC,
 }
-
-# NOT_EXTRACT_TYPES = {
-#     BlockType.TEXT,
-#     BlockType.HEADER,
-#     BlockType.FOOTER,
-#     BlockType.PAGE_NUMBER,
-#     BlockType.PAGE_FOOTNOTE,
-#     BlockType.REF_TEXT,
-#     BlockType.PHONETIC,
-#     # Titles
-#     BlockType.TITLE,
-#     BlockType.DOC_TITLE,
-#     BlockType.PARAGRAPH_TITLE,
-#     # Captions
-#     BlockType.CAPTION,
-#     BlockType.IMAGE_CAPTION,
-#     BlockType.TABLE_CAPTION,
-#     BlockType.CHART_CAPTION,
-#     BlockType.CODE_CAPTION,
-#     # Footnotes
-#     BlockType.FOOTNOTE,
-#     BlockType.IMAGE_FOOTNOTE,
-#     BlockType.TABLE_FOOTNOTE,
-#     BlockType.CHART_FOOTNOTE,
-#     BlockType.CODE_FOOTNOTE,
-#     # Others
-#     BlockType.LIST,
-#     BlockType.INDEX,
-#     BlockType.ABSTRACT,
-#     BlockType.ASIDE_TEXT,
-# }
 
 
 # 文本类 block 共用 text bbox 样式，避免新增文本形态时遗漏多个绘制入口。
