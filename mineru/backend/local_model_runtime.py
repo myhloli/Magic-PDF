@@ -333,7 +333,7 @@ class HybridLocalModelContext:
         return self.atom_model_manager.get_atom_model(
             atom_model_name=AtomicModel.OCR,
             det_db_box_thresh=det_db_box_thresh,
-            lang=self.lang if lang is None else lang,
+            lang="ch",
             det_db_unclip_ratio=det_db_unclip_ratio,
             enable_merge_det_boxes=enable_merge_det_boxes,
         )
