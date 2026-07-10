@@ -95,6 +95,38 @@ class _OcrDetCrop:
     useful_list: list[Any]
     adjusted_mfdetrec_res: list[Any]
     page_ocr_res_list: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class _HybridAnalyzePlan:
+    """记录 Hybrid 单次解析的规范化策略，避免 effort/parse_method 判断散落在流程中。"""
+
+    effort: str
+    parse_mode: Literal["ocr", "txt"]
+    use_vlm_text_content: bool
+    needs_mfr: bool
+    needs_ocr_rec: bool
+    extractor: Literal["medium_local", "high_with_layout", "extra_high_two_step"]
+    forced_vlm_block_types: frozenset[str]
+    vlm_not_extract_list: tuple[str, ...] | None
+    ocr_det_candidate_profile: Literal["medium_local", "native_text", "vlm_text_title_only"]
+
+
+HYBRID_FORCED_VLM_BLOCK_TYPES = frozenset(
+    {
+        MineruBlockType.INDEX,
+        MineruBlockType.CODE,
+        MineruBlockType.EQUATION,
+        MineruBlockType.TABLE,
+    }
+)
+HYBRID_NATIVE_TEXT_NOT_EXTRACT_TYPES = frozenset(
+    {
+        *NOT_EXTRACT_TYPES,
+        MineruBlockType.DOC_TITLE,
+        MineruBlockType.PARAGRAPH_TITLE,
+    }
+)
 HYBRID_VLM_LAYOUT_LABEL_MAP = {
     "abstract": MineruBlockType.TEXT,
     "algorithm": MineruBlockType.CODE,
@@ -102,7 +134,7 @@ HYBRID_VLM_LAYOUT_LABEL_MAP = {
     "chart": MineruBlockType.CHART,
     "content": MineruBlockType.INDEX,
     "display_formula": MineruBlockType.EQUATION,
-    "doc_title": MineruBlockType.TITLE,
+    "doc_title": MineruBlockType.DOC_TITLE,
     "figure_title": MineruBlockType.IMAGE_CAPTION,
     "footer": MineruBlockType.FOOTER,
     "footer_image": MineruBlockType.FOOTER,
@@ -112,7 +144,7 @@ HYBRID_VLM_LAYOUT_LABEL_MAP = {
     "header_image": MineruBlockType.HEADER,
     "image": MineruBlockType.IMAGE,
     "number": MineruBlockType.PAGE_NUMBER,
-    "paragraph_title": MineruBlockType.TITLE,
+    "paragraph_title": MineruBlockType.PARAGRAPH_TITLE,
     "reference_content": MineruBlockType.REF_TEXT,
     "seal": MineruBlockType.IMAGE,
     "table": MineruBlockType.TABLE,
@@ -133,7 +165,6 @@ HYBRID_VLM_OCR_DET_TEXT_TYPES = {
     MineruBlockType.DOC_TITLE,
     MineruBlockType.PARAGRAPH_TITLE,
 }
-
 
 def _load_vlm_content_block() -> Any:
     """按需加载 VLM ContentBlock，避免 Hybrid medium 导入阶段依赖 mineru_vl_utils。"""
@@ -167,9 +198,67 @@ def _discard_legacy_formula_table_kwargs(kwargs: dict[str, object]) -> None:
         kwargs.pop(key, None)
 
 
+def _resolve_parse_mode(pdf_doc: PDFDocument, parse_method: str) -> Literal["ocr", "txt"]:
+    """将公开 parse_method 归一为 Hybrid 内部 parse_mode，避免主流程重复判断 auto。"""
+    if parse_method == "auto":
+        classified = pdf_doc.classify()
+        if classified in {"ocr", "txt"}:
+            return classified  # type: ignore[return-value]
+        raise ValueError(f"Unsupported PDF classify result: {classified}")
+    if parse_method in {"ocr", "txt"}:
+        return parse_method  # type: ignore[return-value]
+    raise ValueError(f"Unsupported parse_method: {parse_method}")
+
+
+def _build_vlm_not_extract_list(forced_vlm_block_types: frozenset[str]) -> tuple[str, ...]:
+    """构造 VLM txt 路径跳过列表，同时排除必须由 VLM 解析的结构块。"""
+    return tuple(sorted(HYBRID_NATIVE_TEXT_NOT_EXTRACT_TYPES - forced_vlm_block_types))
+
+
+def _build_hybrid_analyze_plan(effort: str, parse_mode: str) -> _HybridAnalyzePlan:
+    """按 effort 与 parse_mode 生成单次解析计划，集中维护 Hybrid 路由决策表。"""
+    normalized_effort = validate_effort(effort)
+    if parse_mode not in {"ocr", "txt"}:
+        raise ValueError(f"Unsupported parse_mode: {parse_mode}")
+    normalized_parse_mode = parse_mode  # type: ignore[assignment]
+
+    if normalized_effort == LOCAL_HYBRID_EFFORT:
+        return _HybridAnalyzePlan(
+            effort=normalized_effort,
+            parse_mode=normalized_parse_mode,
+            use_vlm_text_content=False,
+            needs_mfr=True,
+            needs_ocr_rec=normalized_parse_mode == "ocr",
+            extractor="medium_local",
+            forced_vlm_block_types=frozenset(),
+            vlm_not_extract_list=None,
+            ocr_det_candidate_profile="medium_local",
+        )
+
+    forced_vlm_block_types = HYBRID_FORCED_VLM_BLOCK_TYPES
+    return _HybridAnalyzePlan(
+        effort=normalized_effort,
+        parse_mode=normalized_parse_mode,
+        use_vlm_text_content=normalized_parse_mode == "ocr",
+        needs_mfr=normalized_parse_mode == "txt",
+        needs_ocr_rec=False,
+        extractor="high_with_layout" if normalized_effort == LAYOUT_HYBRID_EFFORT else "extra_high_two_step",
+        forced_vlm_block_types=forced_vlm_block_types,
+        vlm_not_extract_list=None
+        if normalized_parse_mode == "ocr"
+        else _build_vlm_not_extract_list(forced_vlm_block_types),
+        ocr_det_candidate_profile="vlm_text_title_only" if normalized_parse_mode == "ocr" else "native_text",
+    )
+
+
 def _is_hybrid_ocr_det_candidate(block: dict[str, Any]) -> bool:
     """判断 Hybrid 文本类块是否需要 OCR det 生成行级视觉信息。"""
     return (block.get("type") or block.get("label")) in NOT_EXTRACT_TYPES
+
+
+def _is_hybrid_native_text_ocr_det_candidate(block: dict[str, Any]) -> bool:
+    """判断 PDF native text 路径哪些块需要 OCR det 行级 sidecar。"""
+    return (block.get("type") or block.get("label")) in HYBRID_NATIVE_TEXT_NOT_EXTRACT_TYPES
 
 
 def _is_hybrid_medium_ocr_det_candidate(block: dict[str, Any]) -> bool:
@@ -192,15 +281,24 @@ def _is_hybrid_vlm_text_ocr_det_candidate(block: dict[str, Any]) -> bool:
     return (block.get("type") or block.get("label")) in HYBRID_VLM_OCR_DET_TEXT_TYPES
 
 
+HYBRID_OCR_DET_CANDIDATE_PROFILES = {
+    "medium_local": _is_hybrid_medium_ocr_det_candidate,
+    "native_text": _is_hybrid_native_text_ocr_det_candidate,
+    "vlm_text_title_only": _is_hybrid_vlm_text_ocr_det_candidate,
+}
+
+
+def _get_ocr_det_candidate_fn(profile: str) -> Any:
+    """按 plan profile 获取 OCR-det 候选函数，避免调用点硬编码候选集合。"""
+    try:
+        return HYBRID_OCR_DET_CANDIDATE_PROFILES[profile]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported OCR-det candidate profile: {profile}") from exc
+
+
 def ocr_classify(pdf_doc: PDFDocument, parse_method: str = "auto") -> bool:
     # 确定OCR设置
-    _ocr_enable = False
-    if parse_method == "auto":
-        if pdf_doc.classify() == "ocr":
-            _ocr_enable = True
-    elif parse_method == "ocr":
-        _ocr_enable = True
-    return _ocr_enable
+    return _resolve_parse_mode(pdf_doc, parse_method=parse_method) == "ocr"
 
 
 def _build_processing_windows(page_count: int, configured_window_size: int) -> list[_ProcessingWindow]:
@@ -632,6 +730,12 @@ def _layout_item_to_content_block(layout_item: dict[str, Any], page_size: tuple[
     try:
         return ContentBlock(type=block_type, bbox=bbox, angle=layout_item.get("angle", 0) or 0)
     except AssertionError:
+        if block_type in {MineruBlockType.DOC_TITLE, MineruBlockType.PARAGRAPH_TITLE}:
+            # 兼容旧 mineru_vl_utils：运行环境尚未支持 split title 时退回 title，升级后会保留 subtype。
+            try:
+                return ContentBlock(type=MineruBlockType.TITLE, bbox=bbox, angle=layout_item.get("angle", 0) or 0)
+            except AssertionError:
+                pass
         logger.debug(f"Skip invalid Hybrid high layout block: {layout_item}")
         return None
 
@@ -1604,6 +1708,8 @@ def _process_ocr_and_formulas(
     *,
     local_context: HybridLocalModelContext | None = None,
     images_layout_res: list[list[dict[str, Any]]] | None = None,
+    apply_title_split: bool = True,
+    candidate_fn: Any = _is_hybrid_ocr_det_candidate,
 ) -> tuple[list[list[dict[str, Any]]], HybridLocalModelContext]:
     """处理OCR和公式识别"""
 
@@ -1654,17 +1760,19 @@ def _process_ocr_and_formulas(
         mfd_res,
         _ocr_enable,
         batch_ratio=batch_ratio,
+        candidate_fn=candidate_fn,
     )
 
     # 如果需要ocr则做ocr_rec
     if _ocr_enable:
         _apply_ocr_rec_results(local_context, ocr_res_list)
 
-    _apply_layout_title_split(
-        model_list,
-        images_layout_res,
-        [_normalize_page_size(image) for image in images_pil_list],
-    )
+    if apply_title_split:
+        _apply_layout_title_split(
+            model_list,
+            images_layout_res,
+            [_normalize_page_size(image) for image in images_pil_list],
+        )
 
     _normalize_bbox(inline_formula_list, ocr_res_list, images_pil_list)
     merged_model_list = _merge_page_sidecar_items(
@@ -1679,15 +1787,15 @@ def _extract_high_with_local_layout(
     predictor: Any,
     images_pil_list: list[Image.Image],
     language: str | None,
-    _ocr_enable: bool,
+    plan: _HybridAnalyzePlan,
     batch_ratio: int,
 ) -> tuple[list[list[dict[str, Any]]], HybridLocalModelContext]:
     """Hybrid high 路径：用本地 layout 小模型约束 VLM 抽取，再补 OCR/formula sidecar。"""
     local_context_singleton = HybridLocalModelContextSingleton()
     local_context = local_context_singleton.get_model(
         lang=language,
-        # VLM 文本路径只需要本地 layout 与 OCR det，不需要加载 MFR。
-        formula_enable=not _ocr_enable,
+        # plan 统一决定是否加载 MFR，避免 high OCR 路径占用额外资源。
+        formula_enable=plan.needs_mfr,
     )
     np_images = [np.asarray(pil_image).copy() for pil_image in images_pil_list]
     images_layout_res = _predict_layout_for_title_split(local_context, np_images, batch_ratio)
@@ -1695,10 +1803,10 @@ def _extract_high_with_local_layout(
     window_model_list = predictor.batch_extract_with_layout(
         images=images_pil_list,
         blocks_list=layout_blocks,
-        not_extract_list=None if _ocr_enable else list(NOT_EXTRACT_TYPES),
+        not_extract_list=plan.vlm_not_extract_list,
         image_analysis=False,
     )
-    if _ocr_enable:
+    if plan.use_vlm_text_content:
         local_context = _apply_vlm_text_det_sidecars_for_window(
             images_pil_list,
             window_model_list,
@@ -1706,6 +1814,7 @@ def _extract_high_with_local_layout(
             batch_ratio,
             images_layout_res=images_layout_res,
             local_context=local_context,
+            apply_title_split=False,
         )
     else:
         window_model_list, local_context = _process_ocr_and_formulas(
@@ -1716,6 +1825,8 @@ def _extract_high_with_local_layout(
             batch_ratio=batch_ratio,
             local_context=local_context,
             images_layout_res=images_layout_res,
+            apply_title_split=False,
+            candidate_fn=_get_ocr_det_candidate_fn(plan.ocr_det_candidate_profile),
         )
     return window_model_list, local_context
 
@@ -1724,14 +1835,14 @@ async def _aio_extract_high_with_local_layout(
     predictor: Any,
     images_pil_list: list[Image.Image],
     language: str | None,
-    _ocr_enable: bool,
+    plan: _HybridAnalyzePlan,
     batch_ratio: int,
 ) -> tuple[list[list[dict[str, Any]]], HybridLocalModelContext]:
     """Hybrid high 异步路径：异步调用 VLM 的本地 layout 约束抽取，其余本地步骤放线程执行。"""
     local_context_singleton = HybridLocalModelContextSingleton()
     local_context = local_context_singleton.get_model(
         lang=language,
-        formula_enable=not _ocr_enable,
+        formula_enable=plan.needs_mfr,
     )
     np_images = [np.asarray(pil_image).copy() for pil_image in images_pil_list]
     images_layout_res = await asyncio.to_thread(
@@ -1744,10 +1855,10 @@ async def _aio_extract_high_with_local_layout(
     window_model_list = await predictor.aio_batch_extract_with_layout(
         images=images_pil_list,
         blocks_list=layout_blocks,
-        not_extract_list=None if _ocr_enable else list(NOT_EXTRACT_TYPES),
+        not_extract_list=plan.vlm_not_extract_list,
         image_analysis=False,
     )
-    if _ocr_enable:
+    if plan.use_vlm_text_content:
         local_context = await asyncio.to_thread(
             _apply_vlm_text_det_sidecars_for_window,
             images_pil_list,
@@ -1756,6 +1867,7 @@ async def _aio_extract_high_with_local_layout(
             batch_ratio,
             images_layout_res=images_layout_res,
             local_context=local_context,
+            apply_title_split=False,
         )
     else:
         window_model_list, local_context = await asyncio.to_thread(
@@ -1767,6 +1879,108 @@ async def _aio_extract_high_with_local_layout(
             batch_ratio,
             local_context=local_context,
             images_layout_res=images_layout_res,
+            apply_title_split=False,
+            candidate_fn=_get_ocr_det_candidate_fn(plan.ocr_det_candidate_profile),
+        )
+    return window_model_list, local_context
+
+
+def _extract_extra_high_two_step(
+    predictor: Any,
+    images_pil_list: list[Image.Image],
+    language: str | None,
+    plan: _HybridAnalyzePlan,
+    batch_ratio: int,
+    image_analysis: bool,
+) -> tuple[list[list[dict[str, Any]]], HybridLocalModelContext]:
+    """Hybrid extra_high 路径：先跑本地 layout，再执行 two-step 并补齐 sidecar。"""
+    local_context_singleton = HybridLocalModelContextSingleton()
+    local_context = local_context_singleton.get_model(
+        lang=language,
+        # extra_high OCR 只需要 layout 和 OCR-det，txt 才需要加载 MFR。
+        formula_enable=plan.needs_mfr,
+    )
+    np_images = [np.asarray(pil_image).copy() for pil_image in images_pil_list]
+    images_layout_res = _predict_layout_for_title_split(local_context, np_images, batch_ratio)
+    window_model_list = predictor.batch_two_step_extract(
+        images=images_pil_list,
+        not_extract_list=plan.vlm_not_extract_list,
+        image_analysis=image_analysis,
+    )
+    if plan.use_vlm_text_content:
+        local_context = _apply_vlm_text_det_sidecars_for_window(
+            images_pil_list,
+            window_model_list,
+            language,
+            batch_ratio,
+            images_layout_res=images_layout_res,
+            local_context=local_context,
+            apply_title_split=True,
+        )
+    else:
+        window_model_list, local_context = _process_ocr_and_formulas(
+            images_pil_list,
+            window_model_list,
+            language,
+            False,
+            batch_ratio=batch_ratio,
+            local_context=local_context,
+            images_layout_res=images_layout_res,
+            apply_title_split=True,
+            candidate_fn=_get_ocr_det_candidate_fn(plan.ocr_det_candidate_profile),
+        )
+    return window_model_list, local_context
+
+
+async def _aio_extract_extra_high_two_step(
+    predictor: Any,
+    images_pil_list: list[Image.Image],
+    language: str | None,
+    plan: _HybridAnalyzePlan,
+    batch_ratio: int,
+    image_analysis: bool,
+) -> tuple[list[list[dict[str, Any]]], HybridLocalModelContext]:
+    """Hybrid extra_high 异步路径：复用同步策略，仅把耗时本地步骤放到线程中执行。"""
+    local_context_singleton = HybridLocalModelContextSingleton()
+    local_context = local_context_singleton.get_model(
+        lang=language,
+        formula_enable=plan.needs_mfr,
+    )
+    np_images = [np.asarray(pil_image).copy() for pil_image in images_pil_list]
+    images_layout_res = await asyncio.to_thread(
+        _predict_layout_for_title_split,
+        local_context,
+        np_images,
+        batch_ratio,
+    )
+    window_model_list = await predictor.aio_batch_two_step_extract(
+        images=images_pil_list,
+        not_extract_list=plan.vlm_not_extract_list,
+        image_analysis=image_analysis,
+    )
+    if plan.use_vlm_text_content:
+        local_context = await asyncio.to_thread(
+            _apply_vlm_text_det_sidecars_for_window,
+            images_pil_list,
+            window_model_list,
+            language,
+            batch_ratio,
+            images_layout_res=images_layout_res,
+            local_context=local_context,
+            apply_title_split=True,
+        )
+    else:
+        window_model_list, local_context = await asyncio.to_thread(
+            _process_ocr_and_formulas,
+            images_pil_list,
+            window_model_list,
+            language,
+            False,
+            batch_ratio,
+            local_context=local_context,
+            images_layout_res=images_layout_res,
+            apply_title_split=True,
+            candidate_fn=_get_ocr_det_candidate_fn(plan.ocr_det_candidate_profile),
         )
     return window_model_list, local_context
 
@@ -1779,6 +1993,7 @@ def _apply_vlm_text_det_sidecars_for_window(
     *,
     images_layout_res: list[list[dict[str, Any]]] | None = None,
     local_context: HybridLocalModelContext | None = None,
+    apply_title_split: bool = True,
 ) -> HybridLocalModelContext:
     """为使用 VLM 文本内容的路径追加小模型 OCR det 空文本行提示。"""
     if local_context is None:
@@ -1794,7 +2009,7 @@ def _apply_vlm_text_det_sidecars_for_window(
             batch_ratio,
         )
     np_images = [np.asarray(pil_image).copy() for pil_image in images_pil_list]
-    inline_formula_list = _build_inline_formula_det_inputs(images_layout_res)
+    inline_formula_list = [[] for _ in images_pil_list]
     ocr_res_list = _ocr_det(
         local_context,
         np_images,
@@ -1812,11 +2027,12 @@ def _apply_vlm_text_det_sidecars_for_window(
         ocr_res_list,
         keep_ocr_text=False,
     )
-    _apply_layout_title_split(
-        model_list,
-        images_layout_res,
-        [_normalize_page_size(image) for image in images_pil_list],
-    )
+    if apply_title_split:
+        _apply_layout_title_split(
+            model_list,
+            images_layout_res,
+            [_normalize_page_size(image) for image in images_pil_list],
+        )
     return local_context
 
 
@@ -1971,21 +2187,26 @@ def doc_analyze(
 ) -> tuple[list[PageInfo], list[list[dict[str, Any]]], bool]:
     client_side_output_generation = bool(kwargs.pop("client_side_output_generation", False))
     _discard_legacy_formula_table_kwargs(kwargs)
-    effort = validate_effort(effort)
-    image_analysis = image_analysis if effort == MAX_HYBRID_EFFORT else False
-    if effort == LOCAL_HYBRID_EFFORT:
-        predictor = None
-    else:
-        vlm_runtime = _load_vlm_runtime()
-        if predictor is None:
-            predictor = vlm_runtime["ModelSingleton"]().get_model(backend, model_path, server_url, **kwargs)
-        predictor = vlm_runtime["_maybe_enable_serial_execution"](predictor, backend)
-
     device = get_device()
 
     pdf_doc = PDFDocument(pdf_bytes)
-    _ocr_enable = ocr_classify(pdf_doc, parse_method=parse_method)
-    use_vlm_text_content = effort in {LAYOUT_HYBRID_EFFORT, MAX_HYBRID_EFFORT} and _ocr_enable
+    try:
+        parse_mode = _resolve_parse_mode(pdf_doc, parse_method=parse_method)
+        plan = _build_hybrid_analyze_plan(effort, parse_mode)
+        _ocr_enable = plan.parse_mode == "ocr"
+        image_analysis = image_analysis if plan.effort == MAX_HYBRID_EFFORT else False
+        if plan.effort == LOCAL_HYBRID_EFFORT:
+            predictor = None
+        else:
+            vlm_runtime = _load_vlm_runtime()
+            if predictor is None:
+                predictor = vlm_runtime["ModelSingleton"]().get_model(backend, model_path, server_url, **kwargs)
+            predictor = vlm_runtime["_maybe_enable_serial_execution"](predictor, backend)
+    except Exception:
+        pdf_doc.close()
+        raise
+
+    use_vlm_text_content = plan.use_vlm_text_content
 
     middle_json: list[PageInfo] = []
     model_list: list[list[dict[str, Any]]] = []
@@ -1997,7 +2218,7 @@ def doc_analyze(
         windows = _build_processing_windows(page_count, configured_window_size)
         _log_processing_window_plan(page_count, configured_window_size, len(windows))
 
-        batch_ratio = 1 if use_vlm_text_content else get_batch_ratio(device)
+        batch_ratio = 1 if plan.use_vlm_text_content else get_batch_ratio(device)
 
         infer_start = time.time()
         progress_bar = None
@@ -2013,51 +2234,34 @@ def doc_analyze(
                 try:
                     images_pil_list = [image_dict["img_pil"] for image_dict in images_list]
                     _log_processing_window(window, page_count, len(images_pil_list))
-                    if effort == LOCAL_HYBRID_EFFORT:
+                    if plan.extractor == "medium_local":
                         window_model_list, local_context = _extract_with_local_layout(
                             images_pil_list,
                             language,
                             _ocr_enable,
                             batch_ratio,
                         )
-                    elif effort == LAYOUT_HYBRID_EFFORT:
+                    elif plan.extractor == "high_with_layout":
                         with vlm_runtime["predictor_execution_guard"](predictor):
                             window_model_list, local_context = _extract_high_with_local_layout(
                                 predictor,
                                 images_pil_list,
                                 language,
-                                _ocr_enable,
+                                plan,
                                 batch_ratio,
                             )
-                    elif effort == MAX_HYBRID_EFFORT:
-                        if _ocr_enable:
-                            with vlm_runtime["predictor_execution_guard"](predictor):
-                                window_model_list = predictor.batch_two_step_extract(
-                                    images=images_pil_list,
-                                    image_analysis=image_analysis,
-                                )
-                            local_context = _apply_vlm_text_det_sidecars_for_window(
+                    elif plan.extractor == "extra_high_two_step":
+                        with vlm_runtime["predictor_execution_guard"](predictor):
+                            window_model_list, local_context = _extract_extra_high_two_step(
+                                predictor,
                                 images_pil_list,
-                                window_model_list,
                                 language,
+                                plan,
                                 batch_ratio,
-                            )
-                        else:
-                            with vlm_runtime["predictor_execution_guard"](predictor):
-                                window_model_list = predictor.batch_two_step_extract(
-                                    images=images_pil_list,
-                                    not_extract_list=list(NOT_EXTRACT_TYPES),
-                                    image_analysis=image_analysis,
-                                )
-                            window_model_list, local_context = _process_ocr_and_formulas(
-                                images_pil_list,
-                                window_model_list,
-                                language,
-                                False,
-                                batch_ratio=batch_ratio,
+                                image_analysis,
                             )
                     else:
-                        raise ValueError(f"Unsupported hybrid effort: {effort}")
+                        raise ValueError(f"Unsupported hybrid extractor: {plan.extractor}")
 
                     model_list.extend(window_model_list)
                     if progress_bar is None:
@@ -2099,7 +2303,7 @@ def doc_analyze(
             local_context,
             _ocr_enable,
             use_vlm_text_content,
-            effort=effort,
+            effort=plan.effort,
             client_side_output_generation=client_side_output_generation,
         )
         pdf_doc.close()
@@ -2134,21 +2338,26 @@ async def aio_doc_analyze(
 ) -> tuple[list[PageInfo], list[list[dict[str, Any]]], bool]:
     client_side_output_generation = bool(kwargs.pop("client_side_output_generation", False))
     _discard_legacy_formula_table_kwargs(kwargs)
-    effort = validate_effort(effort)
-    image_analysis = image_analysis if effort == MAX_HYBRID_EFFORT else False
-    if effort == LOCAL_HYBRID_EFFORT:
-        predictor = None
-    else:
-        vlm_runtime = _load_vlm_runtime()
-        if predictor is None:
-            predictor = await vlm_runtime["_get_model_async"](backend, model_path, server_url, **kwargs)
-        predictor = vlm_runtime["_maybe_enable_serial_execution"](predictor, backend)
-
     device = get_device()
 
     pdf_doc = PDFDocument(pdf_bytes)
-    _ocr_enable = ocr_classify(pdf_doc, parse_method=parse_method)
-    use_vlm_text_content = effort in {LAYOUT_HYBRID_EFFORT, MAX_HYBRID_EFFORT} and _ocr_enable
+    try:
+        parse_mode = _resolve_parse_mode(pdf_doc, parse_method=parse_method)
+        plan = _build_hybrid_analyze_plan(effort, parse_mode)
+        _ocr_enable = plan.parse_mode == "ocr"
+        image_analysis = image_analysis if plan.effort == MAX_HYBRID_EFFORT else False
+        if plan.effort == LOCAL_HYBRID_EFFORT:
+            predictor = None
+        else:
+            vlm_runtime = _load_vlm_runtime()
+            if predictor is None:
+                predictor = await vlm_runtime["_get_model_async"](backend, model_path, server_url, **kwargs)
+            predictor = vlm_runtime["_maybe_enable_serial_execution"](predictor, backend)
+    except Exception:
+        pdf_doc.close()
+        raise
+
+    use_vlm_text_content = plan.use_vlm_text_content
 
     middle_json: list[PageInfo] = []
     model_list = []
@@ -2160,7 +2369,7 @@ async def aio_doc_analyze(
         windows = _build_processing_windows(page_count, configured_window_size)
         _log_processing_window_plan(page_count, configured_window_size, len(windows))
 
-        batch_ratio = 1 if use_vlm_text_content else get_batch_ratio(device)
+        batch_ratio = 1 if plan.use_vlm_text_content else get_batch_ratio(device)
 
         infer_start = time.time()
         progress_bar = None
@@ -2176,7 +2385,7 @@ async def aio_doc_analyze(
                 try:
                     images_pil_list = [image_dict["img_pil"] for image_dict in images_list]
                     _log_processing_window(window, page_count, len(images_pil_list))
-                    if effort == LOCAL_HYBRID_EFFORT:
+                    if plan.extractor == "medium_local":
                         window_model_list, local_context = await asyncio.to_thread(
                             _extract_with_local_layout,
                             images_pil_list,
@@ -2184,46 +2393,27 @@ async def aio_doc_analyze(
                             _ocr_enable,
                             batch_ratio,
                         )
-                    elif effort == LAYOUT_HYBRID_EFFORT:
+                    elif plan.extractor == "high_with_layout":
                         async with vlm_runtime["aio_predictor_execution_guard"](predictor):
                             window_model_list, local_context = await _aio_extract_high_with_local_layout(
                                 predictor,
                                 images_pil_list,
                                 language,
-                                _ocr_enable,
+                                plan,
                                 batch_ratio,
                             )
-                    elif effort == MAX_HYBRID_EFFORT:
-                        if _ocr_enable:
-                            async with vlm_runtime["aio_predictor_execution_guard"](predictor):
-                                window_model_list = await predictor.aio_batch_two_step_extract(
-                                    images=images_pil_list,
-                                    image_analysis=image_analysis,
-                                )
-                            local_context = await asyncio.to_thread(
-                                _apply_vlm_text_det_sidecars_for_window,
+                    elif plan.extractor == "extra_high_two_step":
+                        async with vlm_runtime["aio_predictor_execution_guard"](predictor):
+                            window_model_list, local_context = await _aio_extract_extra_high_two_step(
+                                predictor,
                                 images_pil_list,
-                                window_model_list,
                                 language,
+                                plan,
                                 batch_ratio,
-                            )
-                        else:
-                            async with vlm_runtime["aio_predictor_execution_guard"](predictor):
-                                window_model_list = await predictor.aio_batch_two_step_extract(
-                                    images=images_pil_list,
-                                    not_extract_list=list(NOT_EXTRACT_TYPES),
-                                    image_analysis=image_analysis,
-                                )
-                            window_model_list, local_context = await asyncio.to_thread(
-                                _process_ocr_and_formulas,
-                                images_pil_list,
-                                window_model_list,
-                                language,
-                                False,
-                                batch_ratio=batch_ratio,
+                                image_analysis,
                             )
                     else:
-                        raise ValueError(f"Unsupported hybrid effort: {effort}")
+                        raise ValueError(f"Unsupported hybrid extractor: {plan.extractor}")
 
                     model_list.extend(window_model_list)
                     if progress_bar is None:
@@ -2266,7 +2456,7 @@ async def aio_doc_analyze(
             local_context,
             _ocr_enable,
             use_vlm_text_content,
-            effort=effort,
+            effort=plan.effort,
             client_side_output_generation=client_side_output_generation,
         )
         pdf_doc.close()
