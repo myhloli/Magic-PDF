@@ -29,7 +29,6 @@ class AtomicModel:
     """本地原子模型名称集合，供 Hybrid medium 和共享模型单例统一索引。"""
 
     Layout = "layout"
-    MFD = "mfd"
     MFR = "mfr"
     OCR = "ocr"
     WirelessTable = "wireless_table"
@@ -321,10 +320,23 @@ class HybridLocalModelContext:
         # 初始化公式解析模型
         self.mfr_model = self.get_mfr_model()
 
+        # 初始化无线表格识别模型
+        self.wireless_table_model = self.get_wireless_table_model()
+
+        # 初始化有线表格识别模型
+        self.wired_table_model = self.get_wired_table_model()
+
+        # 初始化表格类型分类模型
+        self.table_cls_model = self.get_table_cls_model()
+
+        # 初始化表格方向分类模型
+        self.table_orientation_cls_model = self.get_table_orientation_cls_model()
+
+        # 初始化印章识别模型
+        self.seal_model = self.get_seal_model()
+
     def get_ocr_model(
         self,
-        *,
-        lang: str | None = None,
         det_db_box_thresh: float = 0.5,
         det_db_unclip_ratio: float = 1.5,
         enable_merge_det_boxes: bool = True,
@@ -358,4 +370,37 @@ class HybridLocalModelContext:
             atom_model_name=AtomicModel.MFR,
             mfr_weight_dir=str(os.path.join(auto_download_and_get_model_root_path(mfr_model_path), mfr_model_path)),
             device=self.device,
+        )
+
+    def get_wireless_table_model(self) -> PaddleTableModel:
+        """获取无线表格识别原子模型。"""
+        return self.atom_model_manager.get_atom_model(
+            atom_model_name=AtomicModel.WirelessTable,
+            lang="ch",
+        )
+
+    def get_wired_table_model(self) -> UnetTableModel:
+        """获取有线表格识别原子模型。"""
+        return self.atom_model_manager.get_atom_model(
+            atom_model_name=AtomicModel.WiredTable,
+            lang="ch",
+        )
+
+    def get_table_cls_model(self) -> PaddleTableClsModel:
+        """获取表格分类原子模型。"""
+        return self.atom_model_manager.get_atom_model(
+            atom_model_name=AtomicModel.TableCls,
+        )
+
+    def get_table_orientation_cls_model(self) -> MineruTableOrientationClsModel:
+        """获取表格方向分类原子模型。"""
+        return self.atom_model_manager.get_atom_model(
+            atom_model_name=AtomicModel.TableOrientationCls,
+        )
+
+    def get_seal_ocr_model(self) -> PytorchPaddleOCR:
+        """获取印章识别 OCR 原子模型"""
+        return self.atom_model_manager.get_atom_model(
+            atom_model_name=AtomicModel.OCR,
+            lang="seal",
         )
