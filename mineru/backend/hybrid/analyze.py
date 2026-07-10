@@ -7,11 +7,13 @@ from typing import Any, Literal
 import numpy as np
 from PIL import Image
 from loguru import logger
+
 from mineru.backend.local_model_runtime import AtomModelSingleton, HybridLocalModelContextSingleton
 from mineru.backend.utils.runtime_utils import exclude_progress_bar_idle_time
+from mineru.utils.bbox_utils import normalize_to_int_bbox
 from mineru.utils.engine_utils import get_vlm_engine
 from mineru.utils.model_utils import clean_memory
-from mineru.utils.pdf_image_tools import load_images_from_pdf_bytes_range
+from mineru.utils.pdf_image_tools import load_images_from_pdf_bytes_range, get_crop_np_img
 from tqdm import tqdm
 
 from ...utils.image_payload import ImagePayloadCache
@@ -227,14 +229,44 @@ def _layout_item_to_content_block(layout_item: dict[str, Any], page_size: tuple[
     return content_block
 
 
+def _get_crop_table_img(
+        np_img: np.ndarray,
+        table_res_bbox: BBox,
+        scale: float= 1,
+) -> np.ndarray:
+    """按指定缩放裁剪表格图，保持 medium 表格处理只使用当前文件窗口图像。"""
+    bbox = normalize_to_int_bbox([float(v) / float(scale) for v in table_res_bbox])
+    if bbox is None:
+        return np_img[0:0, 0:0]
+    return get_crop_np_img(bbox, np_img, scale=scale)
+
+
+def _collect_table_items(
+    images_layout_res: list[list[dict[str, Any]]],
+    np_images: list[np.ndarray],
+) -> list[dict[str, Any]]:
+    table_items = []
+    for layout_res, np_img in zip(images_layout_res, np_images):
+        for table_res in layout_res:
+            if table_res.get("label") != "table":
+                continue
+            table_img = _get_crop_table_img(np_img=np_img, table_res_bbox=table_res["bbox"])
+            if table_img.size == 0:
+                continue
+            table_items.append(
+                {
+                    "table_img": table_img,
+                }
+            )
+    return table_items
+
 def _build_vl_style_layout_blocks(
     images_layout_res: list[list[dict[str, Any]]],
-    images_pil_list: list[Image.Image],
-    effort: Literal["medium", "high", "xhigh"] = "high",
+    np_images: list[np.ndarray],
 ) -> list[list[Any]]:
     """按页构造 Hybrid high 模式传给 VLM 的外部 layout blocks。"""
     blocks_list: list[list[Any]] = []
-    for layout_res, image in zip(images_layout_res, images_pil_list):
+    for layout_res, image in zip(images_layout_res, np_images):
         page_size = _normalize_page_size(image)
         page_blocks = []
         for layout_item in layout_res:
@@ -300,7 +332,16 @@ def doc_analyze(
                         batch_size=min(8, batch_ratio * LAYOUT_BASE_BATCH_SIZE)
                     )
 
-                    vl_style_layout_blocks = _build_vl_style_layout_blocks(images_layout_res, images_pil_list, effort)
+                    # effort不为xhigh时对layout的表格做旋转检测
+                    if effort != "xhigh":
+                        table_items = _collect_table_items(images_layout_res, np_images)
+                        if table_items:
+                            rotate_labels = hybrid_model.table_orientation_cls_model.batch_predict(
+                                table_items,
+                                det_batch_size=batch_ratio * OCR_DET_BASE_BATCH_SIZE,
+                            )
+
+                    vl_style_layout_blocks = _build_vl_style_layout_blocks(images_layout_res, np_images, hybrid_model, effort)
 
                     if effort == "medium":
                         pass
