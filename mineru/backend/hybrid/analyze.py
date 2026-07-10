@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from ...utils.image_payload import ImagePayloadCache
 from ...utils.pdf_document import PDFDocument
-from ...types import PageInfo, BlockType, BBox
+from ...types import PageInfo, BlockType, BBox, NOT_EXTRACT_TYPES
 from ...utils.config_reader import get_processing_window_size
 
 
@@ -50,6 +50,31 @@ VLM_LAYOUT_LABEL_MAP = {
     "table": BlockType.TABLE,
     "text": BlockType.TEXT,
     "vertical_text": BlockType.TEXT,
+    "vision_footnote": BlockType.FOOTNOTE,
+}
+
+PIPELINE_DET_TYPE = {
+    BlockType.TEXT,
+    BlockType.CODE,
+    BlockType.ASIDE_TEXT,
+    BlockType.INDEX,
+    BlockType.DOC_TITLE,
+    BlockType.CAPTION,
+    BlockType.FOOTER,
+    BlockType.PAGE_FOOTNOTE,
+    BlockType.FORMULA_NUMBER,
+    BlockType.HEADER,
+    BlockType.PAGE_NUMBER,
+    BlockType.PARAGRAPH_TITLE,
+    BlockType.REF_TEXT,
+    BlockType.FOOTNOTE,
+}
+VLM_TXT_DET_TYPE = NOT_EXTRACT_TYPES
+VLM_OCR_DET_TYPE = {
+    BlockType.TEXT,
+    BlockType.TITLE,
+    BlockType.DOC_TITLE,
+    BlockType.PARAGRAPH_TITLE,
 }
 
 
@@ -168,10 +193,10 @@ def _normalize_layout_bbox_to_unit(bbox: BBox | None, page_size: tuple[int, int]
 
     x0, y0, x1, y1 = pixel_bbox
     unit_bbox = [
-        max(0.0, min(1.0, float(x0) / page_width)),
-        max(0.0, min(1.0, float(y0) / page_height)),
-        max(0.0, min(1.0, float(x1) / page_width)),
-        max(0.0, min(1.0, float(y1) / page_height)),
+        round(max(0.0, min(1.0, float(x0) / page_width)), 3),
+        round(max(0.0, min(1.0, float(y0) / page_height)), 3),
+        round(max(0.0, min(1.0, float(x1) / page_width)), 3),
+        round(max(0.0, min(1.0, float(y1) / page_height)), 3),
     ]
     if unit_bbox[2] <= unit_bbox[0] or unit_bbox[3] <= unit_bbox[1]:
         return None
@@ -196,15 +221,16 @@ def _layout_item_to_content_block(layout_item: dict[str, Any], page_size: tuple[
         "angle": layout_item.get("angle", 0),
     }
 
-    if label == "seal":
+    if block_type == BlockType.IMAGE and label == "seal":
         content_block["sub_type"] = "seal"
 
     return content_block
 
 
-def _build_layout_blocks(
+def _build_vl_style_layout_blocks(
     images_layout_res: list[list[dict[str, Any]]],
     images_pil_list: list[Image.Image],
+    effort: Literal["medium", "high", "xhigh"] = "high",
 ) -> list[list[Any]]:
     """按页构造 Hybrid high 模式传给 VLM 的外部 layout blocks。"""
     blocks_list: list[list[Any]] = []
@@ -273,6 +299,8 @@ def doc_analyze(
                         images_pil_list,
                         batch_size=min(8, batch_ratio * LAYOUT_BASE_BATCH_SIZE)
                     )
+
+                    vl_style_layout_blocks = _build_vl_style_layout_blocks(images_layout_res, images_pil_list, effort)
 
                     if effort == "medium":
                         pass
