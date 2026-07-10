@@ -256,9 +256,23 @@ def _collect_table_items(
             table_items.append(
                 {
                     "table_img": table_img,
+                    "layout_item": table_res,
                 }
             )
     return table_items
+
+
+def _apply_table_rotate_labels(
+    table_items: list[dict[str, Any]],
+    rotate_labels: list[str],
+) -> None:
+    """按分类输入顺序将表格旋转角写回原始 layout 检测项。"""
+    if len(rotate_labels) != len(table_items):
+        raise ValueError("Hybrid table orientation result count mismatch")
+
+    for table_item, rotate_label in zip(table_items, rotate_labels):
+        table_item["layout_item"]["angle"] = int(rotate_label or "0")
+
 
 def _build_vl_style_layout_blocks(
     images_layout_res: list[list[dict[str, Any]]],
@@ -340,6 +354,7 @@ def doc_analyze(
                                 table_items,
                                 det_batch_size=batch_ratio * OCR_DET_BASE_BATCH_SIZE,
                             )
+                            _apply_table_rotate_labels(table_items, rotate_labels)
 
                     vl_style_layout_blocks = _build_vl_style_layout_blocks(images_layout_res, np_images, hybrid_model, effort)
 
