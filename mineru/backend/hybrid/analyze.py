@@ -354,6 +354,7 @@ def doc_analyze(
                             rotate_labels = hybrid_model.table_orientation_cls_model.batch_predict(
                                 table_items,
                                 det_batch_size=batch_ratio * OCR_DET_BASE_BATCH_SIZE,
+                                tqdm_enable=True,
                             )
                             _apply_table_rotate_labels(table_items, rotate_labels)
 
