@@ -10,6 +10,7 @@ from loguru import logger
 
 from mineru.backend.local_model_runtime import AtomModelSingleton, HybridLocalModelContextSingleton
 from mineru.backend.utils.runtime_utils import exclude_progress_bar_idle_time
+from mineru.cli_old.common import read_fn
 from mineru.utils.bbox_utils import normalize_to_int_bbox
 from mineru.utils.engine_utils import get_vlm_engine
 from mineru.utils.model_utils import clean_memory
@@ -276,11 +277,11 @@ def _apply_table_rotate_labels(
 
 def _build_vl_style_layout_blocks(
     images_layout_res: list[list[dict[str, Any]]],
-    np_images: list[np.ndarray],
+    images_pil_list: list[Image.Image],
 ) -> list[list[Any]]:
     """按页构造 Hybrid high 模式传给 VLM 的外部 layout blocks。"""
     blocks_list: list[list[Any]] = []
-    for layout_res, image in zip(images_layout_res, np_images):
+    for layout_res, image in zip(images_layout_res, images_pil_list):
         page_size = _normalize_page_size(image)
         page_blocks = []
         for layout_item in layout_res:
@@ -356,8 +357,8 @@ def doc_analyze(
                             )
                             _apply_table_rotate_labels(table_items, rotate_labels)
 
-                    vl_style_layout_blocks = _build_vl_style_layout_blocks(images_layout_res, np_images, hybrid_model, effort)
-
+                    vl_style_layout_blocks = _build_vl_style_layout_blocks(images_layout_res, images_pil_list)
+                    pass
                     if effort == "medium":
                         pass
                     elif effort == "high":
@@ -411,9 +412,9 @@ def doc_analyze(
 
 
 if __name__ == '__main__':
-    pdf_path = "/Users/myhloli/pdf/截断合并/demo1-2.pdf"
-    with open(pdf_path, "rb") as f:
-        pdf_bytes = f.read()
+    # pdf_path = "/Users/myhloli/pdf/截断合并/demo1-2.pdf"
+    pdf_path = "/Users/myhloli/pdf/png/shubiao.png"
+    pdf_bytes = read_fn(pdf_path)
     middle_json, model_list = doc_analyze(pdf_bytes, effort="medium", image_analysis=True)
     logger.info(f"middle_json: {middle_json}")
     logger.info(f"model_list: {model_list}")

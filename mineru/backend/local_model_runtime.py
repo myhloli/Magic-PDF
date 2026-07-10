@@ -333,7 +333,7 @@ class HybridLocalModelContext:
         self.table_orientation_cls_model = self.get_table_orientation_cls_model()
 
         # 初始化印章识别模型
-        self.seal_model = self.get_seal_model()
+        self.seal_model = self.get_seal_ocr_model()
 
     def get_ocr_model(
         self,
