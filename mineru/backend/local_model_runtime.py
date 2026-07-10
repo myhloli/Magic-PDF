@@ -264,17 +264,11 @@ class HybridLocalModelContextSingleton:
 
     def get_model(
         self,
-        lang: str | None = None,
-        formula_enable: bool | None = None,
     ) -> HybridLocalModelContext:
-        key = (lang, formula_enable)
         with self._lock:
-            if key not in self._models:
-                self._models[key] = HybridLocalModelContext(
-                    lang=lang,
-                    formula_enable=formula_enable,
-                )
-        return self._models[key]
+            if self._model is None:
+                self._model = HybridLocalModelContext()
+        return self._model
 
 
 def ocr_det_batch_setting() -> bool:
@@ -296,15 +290,11 @@ class HybridLocalModelContext:
     def __init__(
         self,
         device: str | None = None,
-        lang: str | None = None,
-        formula_enable: bool = True,
     ) -> None:
         if device is not None:
             self.device: str = device
         else:
             self.device: str = get_device()
-
-        self.lang: str | None = lang
 
         self.enable_ocr_det_batch: bool = ocr_det_batch_setting()
 
@@ -328,9 +318,8 @@ class HybridLocalModelContext:
         # 初始化layout模型，用于提供行内公式检测框和Hybrid标题拆分
         self.layout_model = self.get_layout_model()
 
-        if formula_enable:
-            # 初始化公式解析模型
-            self.mfr_model = self.get_mfr_model()
+        # 初始化公式解析模型
+        self.mfr_model = self.get_mfr_model()
 
     def get_ocr_model(
         self,
