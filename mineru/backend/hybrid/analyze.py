@@ -18,7 +18,7 @@ from mineru.utils.pdf_image_tools import load_images_from_pdf_bytes_range, get_c
 from tqdm import tqdm
 
 from ...utils.image_payload import ImagePayloadCache
-from ...utils.pdf_document import PDFDocument
+from ...utils.pdf_document import PDFDocument, PDFPage
 from ...types import PageInfo, BlockType, BBox, NOT_EXTRACT_TYPES
 from ...utils.config_reader import get_processing_window_size
 
@@ -125,6 +125,11 @@ def _build_processing_windows(page_count: int, configured_window_size: int) -> l
         )
         for window_index, window_start in enumerate(range(0, page_count, effective_window_size))
     ]
+
+
+def _get_window_pdf_pages(pdf_doc: PDFDocument, window: _ProcessingWindow) -> list[PDFPage]:
+    """按窗口闭区间获取对应的 PDFPage 对象，供窗口内后续处理复用。"""
+    return [pdf_doc[page_idx] for page_idx in range(window.start, window.end + 1)]
 
 
 def _log_processing_window_plan(page_count: int, configured_window_size: int, total_windows: int) -> None:
@@ -331,12 +336,15 @@ def doc_analyze(
 
         try:
             for window in windows:
+                pdf_pages = _get_window_pdf_pages(pdf_doc, window)
                 images_list = load_images_from_pdf_bytes_range(
                     pdf_bytes=pdf_bytes,
                     start_page_id=window.start,
                     end_page_id=window.end,
                     image_type="pil_img",
                 )
+                if len(pdf_pages) != len(images_list):
+                    raise ValueError("Hybrid processing window PDF page count does not match image count")
                 try:
                     images_pil_list = [image_dict["img_pil"] for image_dict in images_list]
                     _log_processing_window(window, page_count, len(images_pil_list))
