@@ -320,29 +320,80 @@ def _build_vl_style_layout_blocks(
     return blocks_list
 
 
-def _build_inline_formula_inputs(images_layout_res: list[list[dict[str, Any]]]) -> list[list[dict[str, Any]]]:
-    inline_formula_inputs = []
+def _build_formula_inputs(images_layout_res: list[list[dict[str, Any]]]) -> list[list[dict[str, Any]]]:
+    """构造完整 MFD/MFR 输入，保留全部行内和行间公式框。"""
+    formula_inputs = []
     for layout_res in images_layout_res:
-        page_inline_formula_inputs = []
+        page_formula_inputs = []
         for res in layout_res:
-            if res.get("label") not in ["inline_formula", "display_formula"]:
+            label = res.get("label")
+            if label not in ["inline_formula", "display_formula"]:
                 continue
             bbox = res.get("bbox")
             if bbox is None or len(bbox) != 4:
                 continue
-            page_inline_formula_inputs.append(
+            page_formula_inputs.append(
                 {
-                    "label": "inline_formula",
+                    "label": label,
                     "bbox": list(bbox),
                     "score": float(res.get("score", 0.0)),
-                    "latex": res.get("latex", ""),
+                    # layout 只提供公式位置；未运行 MFR 的 high/xhigh OCR 必须保留空 LaTeX。
+                    "latex": "",
                 }
             )
-        inline_formula_inputs.append(page_inline_formula_inputs)
-    return inline_formula_inputs
+        formula_inputs.append(page_formula_inputs)
+    return formula_inputs
 
 
-def _build_ocr_det_type_and_inline_formula(
+def _split_formula_results(
+    images_formula_list: list[list[dict[str, Any]]],
+) -> tuple[list[list[dict[str, Any]]], list[list[dict[str, Any]]]]:
+    """按原始标签拆分 MFR 结果，避免行间公式进入 inline sidecar。"""
+    inline_formula_list = []
+    display_formula_list = []
+    for page_formula_list in images_formula_list:
+        inline_formula_list.append(
+            [formula for formula in page_formula_list if formula.get("label") == "inline_formula"]
+        )
+        display_formula_list.append(
+            [formula for formula in page_formula_list if formula.get("label") == "display_formula"]
+        )
+    return inline_formula_list, display_formula_list
+
+
+def _apply_medium_display_formula_results(
+    model_list: list[list[dict[str, Any]]],
+    display_formula_list: list[list[dict[str, Any]]],
+    images_pil_list: list[Image.Image],
+) -> None:
+    """将 medium 行间公式 LaTeX 按页和 bbox 回填到对应 equation 块。"""
+    for page_idx, (page_model_list, page_display_formula_list, page_image) in enumerate(
+        zip(model_list, display_formula_list, images_pil_list)
+    ):
+        page_size = _normalize_page_size(page_image)
+        equation_blocks_by_bbox: dict[tuple[float, ...], list[dict[str, Any]]] = {}
+        for block in page_model_list:
+            if block.get("type") != BlockType.EQUATION:
+                continue
+            block_bbox = block.get("bbox")
+            if block_bbox is None or len(block_bbox) != 4:
+                continue
+            equation_blocks_by_bbox.setdefault(tuple(float(value) for value in block_bbox), []).append(block)
+
+        for formula in page_display_formula_list:
+            normalized_bbox = _normalize_layout_bbox_to_unit(formula.get("bbox"), page_size)
+            if normalized_bbox is None:
+                continue
+            matched_blocks = equation_blocks_by_bbox.get(tuple(normalized_bbox), [])
+            if len(matched_blocks) != 1:
+                raise ValueError(
+                    "Hybrid medium display formula must match exactly one equation block: "
+                    f"page_idx={page_idx}, bbox={normalized_bbox}, matches={len(matched_blocks)}"
+                )
+            matched_blocks[0]["content"] = formula.get("latex", "")
+
+
+def _build_ocr_det_type_and_mfr_enable(
     parse_mode: Literal["txt", "ocr"],
     effort: Literal["medium", "high", "xhigh"],
 ) -> tuple[set[str], bool]:
@@ -664,7 +715,7 @@ def _process_text_and_formulas(
 
     # 遍历model_list,对文本块截图交由OCR识别
     # 根据 parse_mode 和 effort 决定需要ocr的文本块的类型以及只开det还是det+rec
-    ocr_det_type, inline_formula_enable = _build_ocr_det_type_and_inline_formula(
+    ocr_det_type, mfr_enable = _build_ocr_det_type_and_mfr_enable(
         parse_mode=parse_mode,
         effort=effort,
     )
@@ -672,28 +723,26 @@ def _process_text_and_formulas(
     # 将PIL图片转换为numpy数组
     np_images = [np.asarray(pil_image).copy() for pil_image in images_pil_list]
 
-    images_mfd_res = _build_inline_formula_inputs(images_layout_res)
+    mfd_res = _build_formula_inputs(images_layout_res)
+    images_formula_list = mfd_res
+    interline_enable = effort == "medium"
 
-    # 行内公式rec
-    if inline_formula_enable:
-        # 公式识别
-        images_mfd_res = local_model_context.mfr_model.batch_predict(
-            images_mfd_res,
+    # medium 识别行内和行间公式；high/xhigh 的 txt 路径只识别行内公式。
+    if mfr_enable:
+        images_formula_list = local_model_context.mfr_model.batch_predict(
+            mfd_res,
             np_images,
             batch_size=BATCH_RATIO * MFR_BASE_BATCH_SIZE,
-            interline_enable=True
+            interline_enable=interline_enable,
         )
 
-    # 提取行内公式bbox用于det裁剪
-    mfd_res = []
-    for page_inline_formula_list in images_mfd_res:
-        page_mfd_res = []
-        for formula in page_inline_formula_list:
-            bbox = _formula_item_to_pixel_bbox(formula)
-            if bbox is None:
-                continue
-            page_mfd_res.append({"bbox": bbox})
-        mfd_res.append(page_mfd_res)
+    inline_formula_list, display_formula_list = _split_formula_results(images_formula_list)
+    if effort == "medium":
+        _apply_medium_display_formula_results(
+            model_list,
+            display_formula_list,
+            images_pil_list,
+        )
 
     need_rec_img = parse_mode == "ocr" and effort == "medium"
     # vlm没有执行ocr，需要ocr_det
@@ -710,10 +759,10 @@ def _process_text_and_formulas(
     if need_rec_img:
         _apply_ocr_rec_results(local_model_context, ocr_res_list)
 
-    _normalize_bbox(images_mfd_res, ocr_res_list, images_pil_list)
+    _normalize_bbox(inline_formula_list, ocr_res_list, images_pil_list)
     merged_model_list = _merge_page_sidecar_items(
         model_list,
-        images_mfd_res,
+        inline_formula_list,
         ocr_res_list,
     )
     return merged_model_list
