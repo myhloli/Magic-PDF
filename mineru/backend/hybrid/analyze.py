@@ -435,7 +435,6 @@ def _normalize_batch_ocr_det_boxes(dt_boxes: Any, adjusted_mfdetrec_res: list[An
 
 
 def _append_ocr_det_result(
-    local_context: Any,
     crop: _OcrDetCrop,
     ocr_res: Any,
     need_rec_img: bool,
@@ -448,7 +447,6 @@ def _append_ocr_det_result(
         crop.useful_list,
         need_rec_img,
         crop.bgr_image,
-        local_context.lang,
     )
     crop.page_ocr_res_list.extend(ocr_result_list)
 
@@ -478,7 +476,7 @@ def _ocr_det(
             dt_boxes_final = _normalize_batch_ocr_det_boxes(dt_boxes, crop.adjusted_mfdetrec_res)
             if dt_boxes_final:
                 ocr_res = [box.tolist() if hasattr(box, "tolist") else box for box in dt_boxes_final]
-                _append_ocr_det_result(local_model_context, crop, ocr_res, need_rec_img)
+                _append_ocr_det_result(crop, ocr_res, need_rec_img)
     return ocr_res_list
 
 
@@ -878,7 +876,7 @@ def doc_analyze(
                     else:
                         raise ValueError(f"Unsupported parse mode: {parse_mode}")
 
-                    _process_text_and_formulas(
+                    window_model_list = _process_text_and_formulas(
                         images_pil_list,
                         window_model_list,
                         parse_mode,

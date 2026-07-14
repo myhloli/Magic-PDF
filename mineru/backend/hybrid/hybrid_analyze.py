@@ -40,7 +40,7 @@ from ...utils.ocr_utils import (
     sorted_boxes,
     update_det_boxes,
 )
-from ...utils.pdf_document import PDFDocument
+from ...utils.pdf_document import PDFDocument, PDFPage
 from ...utils.pdf_image_tools import aio_load_images_from_pdf_bytes_range, load_images_from_pdf_bytes_range
 from ...utils.bbox_utils import normalize_to_int_bbox
 from ...utils.pdf_image_tools import get_crop_np_img
@@ -317,6 +317,11 @@ def _build_processing_windows(page_count: int, configured_window_size: int) -> l
         )
         for window_index, window_start in enumerate(range(0, page_count, effective_window_size))
     ]
+
+
+def _get_window_pdf_pages(pdf_doc: PDFDocument, window: _ProcessingWindow) -> list[PDFPage]:
+    """按窗口闭区间获取轻量 PDFPage 代理列表，供窗口内后续处理复用。"""
+    return [pdf_doc[page_idx] for page_idx in range(window.start, window.end + 1)]
 
 
 def _log_processing_window_plan(page_count: int, configured_window_size: int, total_windows: int) -> None:
@@ -2225,6 +2230,7 @@ def doc_analyze(
         last_append_end_time = None
         try:
             for window in windows:
+                pdf_pages = _get_window_pdf_pages(pdf_doc, window)
                 images_list = load_images_from_pdf_bytes_range(
                     pdf_bytes=pdf_bytes,
                     start_page_id=window.start,
@@ -2233,6 +2239,8 @@ def doc_analyze(
                 )
                 try:
                     images_pil_list = [image_dict["img_pil"] for image_dict in images_list]
+                    if len(pdf_pages) != len(images_pil_list):
+                        raise ValueError("Hybrid processing window PDF page count does not match image count")
                     _log_processing_window(window, page_count, len(images_pil_list))
                     if plan.extractor == "medium_local":
                         window_model_list, local_context = _extract_with_local_layout(
@@ -2376,6 +2384,7 @@ async def aio_doc_analyze(
         last_append_end_time = None
         try:
             for window in windows:
+                pdf_pages = _get_window_pdf_pages(pdf_doc, window)
                 images_list = await aio_load_images_from_pdf_bytes_range(
                     pdf_bytes,
                     start_page_id=window.start,
@@ -2384,6 +2393,8 @@ async def aio_doc_analyze(
                 )
                 try:
                     images_pil_list = [image_dict["img_pil"] for image_dict in images_list]
+                    if len(pdf_pages) != len(images_pil_list):
+                        raise ValueError("Hybrid processing window PDF page count does not match image count")
                     _log_processing_window(window, page_count, len(images_pil_list))
                     if plan.extractor == "medium_local":
                         window_model_list, local_context = await asyncio.to_thread(
