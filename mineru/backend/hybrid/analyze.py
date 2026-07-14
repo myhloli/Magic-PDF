@@ -4,16 +4,27 @@ import time
 from dataclasses import dataclass
 from typing import Any, Literal
 
+import cv2
 import numpy as np
 from PIL import Image
 from loguru import logger
 
-from mineru.backend.local_model_runtime import AtomModelSingleton, HybridLocalModelContextSingleton
+from mineru.backend.local_model_runtime import HybridLocalModelContextSingleton, HybridLocalModelContext
+from mineru.backend.utils.boxbase import calculate_overlap_area_2_minbox_area_ratio
 from mineru.backend.utils.runtime_utils import exclude_progress_bar_idle_time
 from mineru.cli_old.common import read_fn
 from mineru.utils.bbox_utils import normalize_to_int_bbox
 from mineru.utils.engine_utils import get_vlm_engine
-from mineru.utils.model_utils import clean_memory
+from mineru.utils.model_utils import clean_memory, crop_img
+from mineru.utils.ocr_utils import (
+    get_adjusted_mfdetrec_res,
+    mask_formula_regions_for_ocr_det,
+    sorted_boxes,
+    merge_det_boxes,
+    update_det_boxes,
+    get_ocr_result_list,
+    OcrConfidence,
+)
 from mineru.utils.pdf_image_tools import load_images_from_pdf_bytes_range, get_crop_np_img
 from tqdm import tqdm
 
@@ -29,6 +40,7 @@ LAYOUT_BASE_BATCH_SIZE = 1
 MFR_BASE_BATCH_SIZE = 16
 OCR_DET_BASE_BATCH_SIZE = 8
 LAYOUT_TITLE_SPLIT_OVERLAP_THRESHOLD = 0.8
+BATCH_RATIO = 2
 
 VLM_LAYOUT_LABEL_MAP = {
     "abstract": BlockType.TEXT,
@@ -79,6 +91,17 @@ VLM_OCR_DET_TYPE = {
     BlockType.DOC_TITLE,
     BlockType.PARAGRAPH_TITLE,
 }
+
+
+@dataclass
+class _OcrDetCrop:
+    """保存一次 OCR det 裁剪的中间数据，避免用裸 tuple 传递阶段状态。"""
+
+    bgr_image: Any
+    useful_list: list[Any]
+    adjusted_mfdetrec_res: list[Any]
+    page_ocr_res_list: list[dict[str, Any]]
+
 
 
 def _load_vlm_runtime() -> dict[str, Any]:
@@ -297,6 +320,448 @@ def _build_vl_style_layout_blocks(
     return blocks_list
 
 
+def _build_inline_formula_inputs(images_layout_res: list[list[dict[str, Any]]]) -> list[list[dict[str, Any]]]:
+    inline_formula_inputs = []
+    for layout_res in images_layout_res:
+        page_inline_formula_inputs = []
+        for res in layout_res:
+            if res.get("label") not in ["inline_formula", "display_formula"]:
+                continue
+            bbox = res.get("bbox")
+            if bbox is None or len(bbox) != 4:
+                continue
+            page_inline_formula_inputs.append(
+                {
+                    "label": "inline_formula",
+                    "bbox": list(bbox),
+                    "score": float(res.get("score", 0.0)),
+                    "latex": res.get("latex", ""),
+                }
+            )
+        inline_formula_inputs.append(page_inline_formula_inputs)
+    return inline_formula_inputs
+
+
+def _build_ocr_det_type_and_inline_formula(
+    parse_mode: Literal["txt", "ocr"],
+    effort: Literal["medium", "high", "xhigh"],
+) -> tuple[set[str], bool]:
+    """返回 OCR 检测块类型，以及是否需要执行小模型公式识别。"""
+    if parse_mode not in ("txt", "ocr"):
+        raise ValueError(f"Unsupported parse mode: {parse_mode}")
+    if effort not in ("medium", "high", "xhigh"):
+        raise ValueError(f"Unsupported analyze effort: {effort}")
+
+    if effort == "medium":
+        return PIPELINE_DET_TYPE, True
+    if parse_mode == "txt":
+        return VLM_TXT_DET_TYPE, True
+    return VLM_OCR_DET_TYPE, False
+
+
+def _formula_item_to_pixel_bbox(item: dict[str, Any]) -> list[int] | None:
+    bbox = item.get("bbox")
+    if bbox is not None and len(bbox) == 4:
+        return [int(float(v)) for v in bbox]
+    return None
+
+
+def _set_temp_pixel_bbox(res: dict[str, Any], pixel_bbox: list[int]) -> None:
+    """临时切换为像素 bbox，便于复用已有裁剪逻辑。"""
+    res["_normalized_bbox"] = list(res["bbox"])
+    res["bbox"] = pixel_bbox
+
+
+def _restore_normalized_bbox(res: dict[str, Any]) -> None:
+    """恢复归一化 bbox，避免 OCR det 过程污染 Hybrid 输出。"""
+    normalized_bbox = res.pop("_normalized_bbox", None)
+    if normalized_bbox is not None:
+        res["bbox"] = normalized_bbox
+
+
+def _collect_ocr_det_crops(
+    np_images: list[Any],
+    model_list: list[list[dict[str, Any]]],
+    mfd_res: list[Any],
+    ocr_det_type: set[str],
+) -> tuple[list[list[dict[str, Any]]], list[_OcrDetCrop]]:
+    """收集 OCR det 需要处理的裁剪图，并为每页预建 sidecar 结果列表。"""
+    ocr_res_list: list[list[dict[str, Any]]] = []
+    crops: list[_OcrDetCrop] = []
+
+    for np_image, page_mfd_res, page_results in zip(np_images, mfd_res, model_list):
+        page_ocr_res_list: list[dict[str, Any]] = []
+        ocr_res_list.append(page_ocr_res_list)
+        img_height, img_width = np_image.shape[:2]
+        for res in page_results:
+            if res["type"] not in ocr_det_type:
+                continue
+            x0 = max(0, int(res["bbox"][0] * img_width))
+            y0 = max(0, int(res["bbox"][1] * img_height))
+            x1 = min(img_width, int(res["bbox"][2] * img_width))
+            y1 = min(img_height, int(res["bbox"][3] * img_height))
+            if x1 <= x0 or y1 <= y0:
+                continue
+            _set_temp_pixel_bbox(res, [x0, y0, x1, y1])
+            try:
+                new_image, useful_list = crop_img(res, np_image, crop_paste_x=50, crop_paste_y=50)
+            finally:
+                _restore_normalized_bbox(res)
+            adjusted_mfdetrec_res = get_adjusted_mfdetrec_res(page_mfd_res, useful_list)
+            bgr_image = cv2.cvtColor(new_image, cv2.COLOR_RGB2BGR)  # type: ignore
+            bgr_image = mask_formula_regions_for_ocr_det(bgr_image, adjusted_mfdetrec_res)
+            crops.append(
+                _OcrDetCrop(
+                    bgr_image=bgr_image,
+                    useful_list=useful_list,
+                    adjusted_mfdetrec_res=adjusted_mfdetrec_res,
+                    page_ocr_res_list=page_ocr_res_list,
+                )
+            )
+
+    return ocr_res_list, crops
+
+
+def _normalize_batch_ocr_det_boxes(dt_boxes: Any, adjusted_mfdetrec_res: list[Any]) -> list[Any]:
+    """对 batch OCR det 的检测框排序、合并，并按公式位置修正。"""
+    if dt_boxes is None or len(dt_boxes) == 0:
+        return []
+
+    dt_boxes_sorted = sorted_boxes(dt_boxes)
+    dt_boxes_merged = merge_det_boxes(dt_boxes_sorted) if dt_boxes_sorted else []
+    if dt_boxes_merged and adjusted_mfdetrec_res:
+        return update_det_boxes(dt_boxes_merged, adjusted_mfdetrec_res)
+    return dt_boxes_merged
+
+
+def _append_ocr_det_result(
+    local_context: Any,
+    crop: _OcrDetCrop,
+    ocr_res: Any,
+    need_rec_img: bool,
+) -> None:
+    """将 OCR det 原始框转换为 Hybrid ocr_text sidecar 并写回对应页。"""
+    if not ocr_res:
+        return
+    ocr_result_list = get_ocr_result_list(
+        ocr_res,
+        crop.useful_list,
+        need_rec_img,
+        crop.bgr_image,
+        local_context.lang,
+    )
+    crop.page_ocr_res_list.extend(ocr_result_list)
+
+
+def _ocr_det(
+    local_model_context: HybridLocalModelContext,
+    np_images: list[np.ndarray],
+    model_list: list[list[dict[str, Any]]],
+    mfd_res: list[Any],
+    need_rec_img: bool,
+    ocr_det_type: set[str],
+) -> list[list[dict[str, Any]]]:
+    """执行 Hybrid OCR det sidecar 生成，按运行时配置选择单图或 batch 模式。"""
+    ocr_res_list, crops = _collect_ocr_det_crops(np_images, model_list, mfd_res, ocr_det_type)
+
+    if crops:
+        batch_images = [crop.bgr_image for crop in crops]
+        det_batch_size = min(len(batch_images), BATCH_RATIO * OCR_DET_BASE_BATCH_SIZE)
+        batch_results = local_model_context.ocr_model.text_detector.batch_predict(
+            batch_images,
+            det_batch_size,
+            tqdm_enable=True,
+            tqdm_desc="OCR-det",
+        )
+
+        for crop, (dt_boxes, _) in zip(crops, batch_results):
+            dt_boxes_final = _normalize_batch_ocr_det_boxes(dt_boxes, crop.adjusted_mfdetrec_res)
+            if dt_boxes_final:
+                ocr_res = [box.tolist() if hasattr(box, "tolist") else box for box in dt_boxes_final]
+                _append_ocr_det_result(local_model_context, crop, ocr_res, need_rec_img)
+    return ocr_res_list
+
+
+def _collect_ocr_rec_inputs(
+    ocr_res_list: list[list[dict[str, Any]]],
+) -> tuple[list[tuple[list[dict[str, Any]], dict[str, Any]]], list[Any]]:
+    """收集需要 OCR rec 的裁剪图，同时从 sidecar 中移除临时图像对象。"""
+    need_ocr_list = []
+    img_crop_list = []
+    for page_ocr_res_list in ocr_res_list:
+        for ocr_res in page_ocr_res_list:
+            if "np_img" in ocr_res:
+                need_ocr_list.append((page_ocr_res_list, ocr_res))
+                img_crop_list.append(ocr_res.pop("np_img"))
+    return need_ocr_list, img_crop_list
+
+
+def _should_remove_low_confidence_ocr_text(ocr_text: str, ocr_score: float, ocr_res: dict[str, Any]) -> bool:
+    """判断 OCR rec 结果是否应因低置信或竖排噪声被丢弃。"""
+    if ocr_score < OcrConfidence.min_confidence:
+        return True
+
+    layout_res_bbox = ocr_res.get("bbox")
+    if layout_res_bbox is None and ocr_res.get("poly") is not None:
+        layout_res_bbox = [
+            ocr_res["poly"][0],
+            ocr_res["poly"][1],
+            ocr_res["poly"][4],
+            ocr_res["poly"][5],
+        ]
+    if layout_res_bbox is None:
+        return True
+
+    layout_res_width = layout_res_bbox[2] - layout_res_bbox[0]
+    layout_res_height = layout_res_bbox[3] - layout_res_bbox[1]
+    return (
+        ocr_text
+        in [
+            "（204号",
+            "（20",
+            "（2",
+            "（2号",
+            "（20号",
+            "号",
+            "（204",
+            "(cid:)",
+            "(ci:)",
+            "(cd:1)",
+            "cd:)",
+            "c)",
+            "(cd:)",
+            "c",
+            "id:)",
+            ":)",
+            "√:)",
+            "√i:)",
+            "−i:)",
+            "−:",
+            "i:)",
+        ]
+        and ocr_score < 0.8
+        and layout_res_width < layout_res_height
+    )
+
+def _apply_ocr_rec_results(
+    local_model_context: HybridLocalModelContext,
+    ocr_res_list: list[list[dict[str, Any]]],
+) -> None:
+    """执行 OCR rec 并把文本写回 sidecar，结果数量异常时显式报错。"""
+    need_ocr_list, img_crop_list = _collect_ocr_rec_inputs(ocr_res_list)
+    if not img_crop_list:
+        return
+
+    ocr_result_list = local_model_context.ocr_model.ocr(
+        img_crop_list,
+        det=False,
+        tqdm_enable=True,
+    )[0]
+
+    if len(ocr_result_list) != len(need_ocr_list):
+        raise ValueError(
+            "Hybrid OCR rec result count mismatch: "
+            f"ocr_result_list={len(ocr_result_list)}, need_ocr_list={len(need_ocr_list)}"
+        )
+
+    items_to_remove = []
+    for index, (page_ocr_res_list, need_ocr_res) in enumerate(need_ocr_list):
+        ocr_text, ocr_score = ocr_result_list[index]
+        need_ocr_res["text"] = ocr_text
+        need_ocr_res["score"] = float(f"{ocr_score:.3f}")
+        if _should_remove_low_confidence_ocr_text(ocr_text, ocr_score, need_ocr_res):
+            items_to_remove.append((page_ocr_res_list, need_ocr_res))
+
+    for page_ocr_res_list, need_ocr_res in items_to_remove:
+        if need_ocr_res in page_ocr_res_list:
+            page_ocr_res_list.remove(need_ocr_res)
+
+
+def _normalize_bbox_to_unit(item: dict[str, Any], page_width: int, page_height: int) -> bool:
+    """将像素级bbox归一化为[0, 1]区间"""
+    bbox = item.get("bbox")
+    if bbox is None or len(bbox) != 4:
+        return False
+
+    x0, y0, x1, y1 = [float(v) for v in bbox]
+    if 0.0 <= x0 <= 1.0 and 0.0 <= y0 <= 1.0 and 0.0 <= x1 <= 1.0 and 0.0 <= y1 <= 1.0:
+        normalized_bbox = [x0, y0, x1, y1]
+    else:
+        normalized_bbox = [
+            x0 / page_width,
+            y0 / page_height,
+            x1 / page_width,
+            y1 / page_height,
+        ]
+    item["bbox"] = [round(min(max(v, 0), 1), 3) for v in normalized_bbox]
+    return True
+
+
+def _normalize_bbox(
+    inline_formula_list: list[list[dict[str, Any]]],
+    ocr_res_list: list[list[dict[str, Any]]],
+    images_pil_list: list[Image.Image],
+) -> None:
+    """归一化坐标并生成最终结果"""
+    for page_inline_formula_list, page_ocr_res_list, page_pil_image in zip(inline_formula_list, ocr_res_list, images_pil_list):
+        if page_inline_formula_list or page_ocr_res_list:
+            page_width, page_height = page_pil_image.size
+            # 处理公式列表
+            for formula in page_inline_formula_list:
+                _normalize_bbox_to_unit(formula, page_width, page_height)
+            # 处理OCR结果列表
+            for ocr_res in page_ocr_res_list:
+                _normalize_bbox_to_unit(ocr_res, page_width, page_height)
+
+
+def _build_inline_formula_model_item(formula: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "inline_formula",
+        "bbox": list(formula["bbox"]),
+        "latex": formula.get("latex", ""),
+        "score": float(formula.get("score", 0.0)),
+    }
+
+
+def _build_ocr_text_model_item(ocr_res: dict[str, Any], keep_text: bool = True) -> dict[str, Any]:
+    """构造 OCR det sidecar；VLM-OCR 路径可只保留空文本行提示。"""
+    return {
+        "type": "ocr_text",
+        "bbox": list(ocr_res["bbox"]),
+        "text": ocr_res.get("text", "") if keep_text else "",
+        "score": float(ocr_res.get("score", 0.0)),
+    }
+
+
+def _merge_page_sidecar_items(
+    model_list: list[list[dict[str, Any]]],
+    inline_formula_list: list[list[dict[str, Any]]],
+    ocr_res_list: list[list[dict[str, Any]]],
+    keep_ocr_text: bool = True,
+) -> list[list[dict[str, Any]]]:
+    merged_model_list: list[list[dict[str, Any]]] = []
+    for page_model_list, page_inline_formula_list, page_ocr_res_list in zip(model_list, inline_formula_list, ocr_res_list):
+        merged_page_model_list: list[dict[str, Any]] = list(page_model_list)
+        merged_page_model_list.extend(
+            _build_inline_formula_model_item(formula) for formula in page_inline_formula_list if formula.get("bbox") is not None
+        )
+        merged_page_model_list.extend(
+            _build_ocr_text_model_item(ocr_res, keep_text=keep_ocr_text)
+            for ocr_res in page_ocr_res_list
+            if ocr_res.get("bbox") is not None
+        )
+        merged_model_list.append(merged_page_model_list)
+    return merged_model_list
+
+
+def _process_text_and_formulas(
+    images_pil_list: list[Image.Image],
+    model_list: list[list[dict[str, Any]]],
+    parse_mode: Literal["txt", "ocr"],
+    effort: Literal["medium", "high", "xhigh"],
+    local_model_context: HybridLocalModelContext,
+    images_layout_res: list[list[dict[str, Any]]],
+) -> list[list[dict[str, Any]]]:
+    """处理OCR和公式识别"""
+
+    # 遍历model_list,对文本块截图交由OCR识别
+    # 根据 parse_mode 和 effort 决定需要ocr的文本块的类型以及只开det还是det+rec
+    ocr_det_type, inline_formula_enable = _build_ocr_det_type_and_inline_formula(
+        parse_mode=parse_mode,
+        effort=effort,
+    )
+
+    # 将PIL图片转换为numpy数组
+    np_images = [np.asarray(pil_image).copy() for pil_image in images_pil_list]
+
+    images_mfd_res = _build_inline_formula_inputs(images_layout_res)
+
+    # 行内公式rec
+    if inline_formula_enable:
+        # 公式识别
+        images_mfd_res = local_model_context.mfr_model.batch_predict(
+            images_mfd_res,
+            np_images,
+            batch_size=BATCH_RATIO * MFR_BASE_BATCH_SIZE,
+            interline_enable=True
+        )
+
+    # 提取行内公式bbox用于det裁剪
+    mfd_res = []
+    for page_inline_formula_list in images_mfd_res:
+        page_mfd_res = []
+        for formula in page_inline_formula_list:
+            bbox = _formula_item_to_pixel_bbox(formula)
+            if bbox is None:
+                continue
+            page_mfd_res.append({"bbox": bbox})
+        mfd_res.append(page_mfd_res)
+
+    need_rec_img = parse_mode == "ocr" and effort == "medium"
+    # vlm没有执行ocr，需要ocr_det
+    ocr_res_list = _ocr_det(
+        local_model_context,
+        np_images,
+        model_list,
+        mfd_res,
+        need_rec_img,
+        ocr_det_type,
+    )
+
+    # 如果有rec_img则做ocr_rec
+    if need_rec_img:
+        _apply_ocr_rec_results(local_model_context, ocr_res_list)
+
+    _normalize_bbox(images_mfd_res, ocr_res_list, images_pil_list)
+    merged_model_list = _merge_page_sidecar_items(
+        model_list,
+        images_mfd_res,
+        ocr_res_list,
+    )
+    return merged_model_list
+
+
+def _collect_layout_doc_title_bboxes(layout_res: list[dict[str, Any]], page_size: tuple[int, int]) -> list[BBox]:
+    """只收集layout小模型输出的doc_title框，忽略paragraph_title等其他类型。"""
+    doc_title_bboxes: list[BBox] = []
+    for layout_item in layout_res or []:
+        if layout_item.get("label") != BlockType.DOC_TITLE:
+            continue
+        bbox = _bbox_to_pixel_bbox(layout_item.get("bbox"), page_size)
+        if bbox is not None:
+            doc_title_bboxes.append(bbox)
+    return doc_title_bboxes
+
+
+def _has_doc_title_overlap(title_bbox: BBox, doc_title_bboxes: list[BBox], overlap_threshold: float) -> bool:
+    """判断VLM标题框是否与任一layout doc_title框达到最小框重叠阈值。"""
+    return any(
+        calculate_overlap_area_2_minbox_area_ratio(title_bbox, doc_title_bbox) >= overlap_threshold
+        for doc_title_bbox in doc_title_bboxes
+    )
+
+
+def _apply_layout_title_split(
+    model_list: list[list[dict[str, Any]]],
+    images_layout_res: list[list[dict[str, Any]]],
+    page_sizes: list[tuple[int, int]],
+    overlap_threshold: float = LAYOUT_TITLE_SPLIT_OVERLAP_THRESHOLD,
+) -> None:
+    """用layout doc_title框将VLM title拆分为doc_title和paragraph_title。"""
+    for page_model_list, layout_res, page_size in zip(model_list, images_layout_res, page_sizes):
+        doc_title_bboxes = _collect_layout_doc_title_bboxes(layout_res, page_size)
+        for block in page_model_list:
+            if block.get("type") != BlockType.TITLE:
+                continue
+            title_bbox = _bbox_to_pixel_bbox(block.get("bbox"), page_size)
+            if title_bbox is None:
+                continue
+            if _has_doc_title_overlap(title_bbox, doc_title_bboxes, overlap_threshold):
+                block["type"] = BlockType.DOC_TITLE
+            else:
+                block["type"] = BlockType.PARAGRAPH_TITLE
+
+
 def doc_analyze(
     pdf_bytes: bytes,
     effort: Literal["medium", "high", "xhigh"] = "high",
@@ -304,7 +769,6 @@ def doc_analyze(
     page_index_map: list[int] | None = None,
     image_cache: ImagePayloadCache | None = None,
 ) -> tuple[list[PageInfo], list[list[dict[str, Any]]]]:
-    batch_ratio = 2
     pdf_doc = PDFDocument(pdf_bytes)
     parse_mode = pdf_doc.classify()
 
@@ -320,7 +784,6 @@ def doc_analyze(
 
         hybrid_model_singleton = HybridLocalModelContextSingleton()
         hybrid_model = hybrid_model_singleton.get_model()
-        atom_model_manager = AtomModelSingleton()
 
         if effort in ["high", "xhigh"]:
             vlm_runtime = _load_vlm_runtime()
@@ -352,30 +815,77 @@ def doc_analyze(
                     np_images = [np.asarray(pil_image).copy() for pil_image in images_pil_list]
                     images_layout_res = hybrid_model.layout_model.batch_predict(
                         images_pil_list,
-                        batch_size=min(8, batch_ratio * LAYOUT_BASE_BATCH_SIZE)
+                        batch_size=min(8, BATCH_RATIO * LAYOUT_BASE_BATCH_SIZE)
                     )
 
-                    # effort不为xhigh时对layout的表格做旋转检测
-                    if effort != "xhigh":
+                    # 使用小模型layout时对layout的表格做旋转检测
+                    if effort in ["medium", "high"]:
                         table_items = _collect_table_items(images_layout_res, np_images)
                         if table_items:
                             rotate_labels = hybrid_model.table_orientation_cls_model.batch_predict(
                                 table_items,
-                                det_batch_size=batch_ratio * OCR_DET_BASE_BATCH_SIZE,
+                                det_batch_size=BATCH_RATIO * OCR_DET_BASE_BATCH_SIZE,
                                 tqdm_enable=True,
                             )
                             _apply_table_rotate_labels(table_items, rotate_labels)
 
                     vl_style_layout_blocks = _build_vl_style_layout_blocks(images_layout_res, images_pil_list)
-                    pass
-                    if effort == "medium":
-                        pass
-                    elif effort == "high":
-                        pass
-                    elif effort == "xhigh":
-                        pass
+
+                    if parse_mode == "txt":
+                        if effort == "medium":
+                            pass
+                        elif effort == "high":
+                            window_model_list = vlm_predictor.batch_extract_with_layout(
+                                images=images_pil_list,
+                                blocks_list=vl_style_layout_blocks,
+                                not_extract_list=NOT_EXTRACT_TYPES,
+                                image_analysis=False,
+                            )
+                        elif effort == "xhigh":
+                            window_model_list = vlm_predictor.batch_two_step_extract(
+                                images=images_pil_list,
+                                not_extract_list=NOT_EXTRACT_TYPES,
+                                image_analysis=image_analysis,
+                            )
+                            _apply_layout_title_split(
+                                window_model_list,
+                                images_layout_res,
+                                [_normalize_page_size(image) for image in images_pil_list],
+                            )
+                        else:
+                            raise ValueError(f"Unsupported analyze effort: {effort}")
+                    elif parse_mode == "ocr":
+                        if effort == "medium":
+                            pass
+                        elif effort == "high":
+                            window_model_list = vlm_predictor.batch_extract_with_layout(
+                                images=images_pil_list,
+                                blocks_list=vl_style_layout_blocks,
+                                image_analysis=False,
+                            )
+                        elif effort == "xhigh":
+                            window_model_list = vlm_predictor.batch_two_step_extract(
+                                images=images_pil_list,
+                                image_analysis=image_analysis,
+                            )
+                            _apply_layout_title_split(
+                                window_model_list,
+                                images_layout_res,
+                                [_normalize_page_size(image) for image in images_pil_list],
+                            )
+                        else:
+                            raise ValueError(f"Unsupported analyze effort: {effort}")
                     else:
-                        raise ValueError(f"Unsupported analyze effort: {effort}")
+                        raise ValueError(f"Unsupported parse mode: {parse_mode}")
+
+                    _process_text_and_formulas(
+                        images_pil_list,
+                        window_model_list,
+                        parse_mode,
+                        effort,
+                        hybrid_model,
+                        images_layout_res,
+                    )
 
                     model_list.extend(window_model_list)
                     if progress_bar is None:
