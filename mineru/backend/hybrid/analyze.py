@@ -833,7 +833,7 @@ def doc_analyze(
 
                     if parse_mode == "txt":
                         if effort == "medium":
-                            pass
+                            window_model_list = vl_style_layout_blocks
                         elif effort == "high":
                             window_model_list = vlm_predictor.batch_extract_with_layout(
                                 images=images_pil_list,
@@ -856,7 +856,7 @@ def doc_analyze(
                             raise ValueError(f"Unsupported analyze effort: {effort}")
                     elif parse_mode == "ocr":
                         if effort == "medium":
-                            pass
+                            window_model_list = vl_style_layout_blocks
                         elif effort == "high":
                             window_model_list = vlm_predictor.batch_extract_with_layout(
                                 images=images_pil_list,
