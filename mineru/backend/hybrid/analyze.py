@@ -11,6 +11,7 @@ import numpy as np
 from PIL import Image
 from loguru import logger
 
+from mineru.backend.hybrid.table_text import project_ocr_table_text, project_pdf_table_text
 from mineru.backend.local_model_runtime import (
     AtomicModel,
     HybridLocalModelContext,
@@ -1555,6 +1556,138 @@ def _apply_medium_formula_number_ocr(
             block_item["content"] = normalized_text
 
 
+def _fill_low_table_contents(
+    images_list: list[dict[str, Any]],
+    pdf_pages: list[PDFPage],
+    model_list: list[list[dict[str, Any]]],
+    parse_mode: Literal["txt", "ocr"],
+    local_model_context: HybridLocalModelContext,
+) -> None:
+    """为 low 表格回填空间投影纯文本，单表失败时保留空内容并继续。"""
+    table_entries: list[dict[str, Any]] = []
+    for page_idx, page_model_list in enumerate(model_list):
+        table_idx = 0
+        for block in page_model_list:
+            if block.get("type") != BlockType.TABLE:
+                continue
+            block["content"] = ""
+            table_entries.append(
+                {
+                    "page_idx": page_idx,
+                    "table_idx": table_idx,
+                    "block": block,
+                }
+            )
+            table_idx += 1
+
+    if not table_entries:
+        return
+
+    if parse_mode == "txt":
+        page_chars_cache: dict[int, list[Any]] = {}
+        for table_entry in table_entries:
+            page_idx = table_entry["page_idx"]
+            table_idx = table_entry["table_idx"]
+            table_block = table_entry["block"]
+            try:
+                pdf_page = pdf_pages[page_idx]
+                page_width, page_height = pdf_page.size
+                table_bbox = _bbox_to_pixel_bbox(
+                    table_block.get("bbox"),
+                    (int(page_width), int(page_height)),
+                )
+                if table_bbox is None:
+                    raise ValueError("invalid table bbox")
+                if page_idx not in page_chars_cache:
+                    page_chars_cache[page_idx] = pdf_page.get_chars()
+                table_block["content"] = project_pdf_table_text(
+                    page_chars_cache[page_idx],
+                    table_bbox,
+                    table_block.get("angle", 0),
+                )
+                if not table_block["content"]:
+                    logger.warning(
+                        "Hybrid low table text is empty: "
+                        f"parse_mode={parse_mode}, page_idx={page_idx}, "
+                        f"table_idx={table_idx}, bbox={table_block.get('bbox')}"
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Hybrid low table text failed: "
+                    f"parse_mode={parse_mode}, page_idx={page_idx}, "
+                    f"table_idx={table_idx}, bbox={table_block.get('bbox')}, error={exc}"
+                )
+        return
+
+    if parse_mode != "ocr":
+        raise ValueError(f"Unsupported parse mode: {parse_mode}")
+
+    try:
+        table_ocr_model = local_model_context.get_ocr_model(
+            det_db_box_thresh=0.5,
+            det_db_unclip_ratio=1.6,
+            enable_merge_det_boxes=False,
+        )
+    except Exception as exc:
+        for table_entry in table_entries:
+            logger.warning(
+                "Hybrid low table text failed: "
+                f"parse_mode={parse_mode}, page_idx={table_entry['page_idx']}, "
+                f"table_idx={table_entry['table_idx']}, "
+                f"bbox={table_entry['block'].get('bbox')}, "
+                f"error=OCR model initialization failed: {exc}"
+            )
+        return
+
+    page_image_cache: dict[int, np.ndarray] = {}
+    for table_entry in table_entries:
+        page_idx = table_entry["page_idx"]
+        table_idx = table_entry["table_idx"]
+        table_block = table_entry["block"]
+        try:
+            if page_idx not in page_image_cache:
+                page_image_cache[page_idx] = np.asarray(images_list[page_idx]["img_pil"]).copy()
+            np_image = page_image_cache[page_idx]
+            image_height, image_width = np_image.shape[:2]
+            pixel_bbox = _bbox_to_pixel_bbox(
+                table_block.get("bbox"),
+                (image_width, image_height),
+            )
+            table_bbox = normalize_to_int_bbox(
+                pixel_bbox,
+                image_size=(image_height, image_width),
+            )
+            if table_bbox is None:
+                raise ValueError("invalid table bbox")
+            x0, y0, x1, y1 = table_bbox
+            table_crop = np_image[y0:y1, x0:x1].copy()
+            if table_crop.size == 0:
+                raise ValueError("empty table crop")
+
+            angle = _normalize_medium_table_angle(table_block.get("angle", 0))
+            rotated_crop = _rotate_medium_table_image(table_crop, angle)
+            bgr_crop = cv2.cvtColor(rotated_crop, cv2.COLOR_RGB2BGR)
+            page_ocr_results = run_ocr_inference(table_ocr_model.ocr, bgr_crop)
+            raw_ocr_result = page_ocr_results[0] if page_ocr_results else None
+            rotated_height, rotated_width = rotated_crop.shape[:2]
+            table_block["content"] = project_ocr_table_text(
+                raw_ocr_result,
+                (rotated_width, rotated_height),
+            )
+            if not table_block["content"]:
+                logger.warning(
+                    "Hybrid low table text is empty: "
+                    f"parse_mode={parse_mode}, page_idx={page_idx}, "
+                    f"table_idx={table_idx}, bbox={table_block.get('bbox')}"
+                )
+        except Exception as exc:
+            logger.warning(
+                "Hybrid low table text failed: "
+                f"parse_mode={parse_mode}, page_idx={page_idx}, "
+                f"table_idx={table_idx}, bbox={table_block.get('bbox')}, error={exc}"
+            )
+
+
 def _process_low_text(
     images_list: list[dict[str, Any]],
     pdf_pages: list[PDFPage],
@@ -1587,33 +1720,40 @@ def _process_low_text(
                 block_bboxes,
                 page_size,
             )
-        return model_list
-
-    if parse_mode != "ocr":
+    elif parse_mode == "ocr":
+        images_pil_list = [image_dict["img_pil"] for image_dict in images_list]
+        np_images = [np.asarray(pil_image).copy() for pil_image in images_pil_list]
+        empty_formula_list: list[list[dict[str, Any]]] = [[] for _ in model_list]
+        ocr_res_list = _ocr_det(
+            local_model_context,
+            np_images,
+            model_list,
+            empty_formula_list,
+            True,
+            PIPELINE_DET_TYPE,
+        )
+        _apply_ocr_rec_results(local_model_context, ocr_res_list)
+        model_list = _fill_window_block_content_and_lines(
+            images_list,
+            pdf_pages,
+            model_list,
+            empty_formula_list,
+            ocr_res_list,
+            parse_mode,
+            PIPELINE_DET_TYPE,
+            local_model_context,
+        )
+    else:
         raise ValueError(f"Unsupported parse mode: {parse_mode}")
 
-    images_pil_list = [image_dict["img_pil"] for image_dict in images_list]
-    np_images = [np.asarray(pil_image).copy() for pil_image in images_pil_list]
-    empty_formula_list: list[list[dict[str, Any]]] = [[] for _ in model_list]
-    ocr_res_list = _ocr_det(
-        local_model_context,
-        np_images,
-        model_list,
-        empty_formula_list,
-        True,
-        PIPELINE_DET_TYPE,
-    )
-    _apply_ocr_rec_results(local_model_context, ocr_res_list)
-    return _fill_window_block_content_and_lines(
+    _fill_low_table_contents(
         images_list,
         pdf_pages,
         model_list,
-        empty_formula_list,
-        ocr_res_list,
         parse_mode,
-        PIPELINE_DET_TYPE,
         local_model_context,
     )
+    return model_list
 
 
 def _process_text_and_formulas(
@@ -1812,7 +1952,7 @@ def doc_analyze(
                     )
 
                     # 使用小模型layout时对layout的表格做旋转检测
-                    if effort in ["medium", "high"]:
+                    if effort in ["low", "medium", "high"]:
                         table_items = _collect_table_items(images_layout_res, np_images)
                         if table_items:
                             rotate_labels = hybrid_model.table_orientation_cls_model.batch_predict(
@@ -1935,8 +2075,9 @@ def doc_analyze(
 
 
 if __name__ == "__main__":
-    pdf_path = "/Users/myhloli/pdf/截断合并/demo1-3.pdf"
-    # pdf_path = "/Users/myhloli/pdf/png/table_image3.png"  # shubiao.png
+    # pdf_path = "/Users/myhloli/pdf/截断合并/demo1-3.pdf"
+    # pdf_path = "/Users/myhloli/pdf/png/20250911-100102.png"  # shubiao.png
+    pdf_path = "/Users/myhloli/pdf/纵向表格.pdf"
     pdf_bytes = read_fn(pdf_path)
     middle_json, model_list = doc_analyze(pdf_bytes, effort="low", image_analysis=True)
     logger.info(f"middle_json: {middle_json}")
