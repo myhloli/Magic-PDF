@@ -11,6 +11,7 @@ from loguru import logger
 
 from mineru.backend.local_model_runtime import HybridLocalModelContextSingleton, HybridLocalModelContext
 from mineru.backend.utils.boxbase import calculate_overlap_area_2_minbox_area_ratio
+from mineru.backend.utils.formula_number import optimize_hybrid_formula_number_blocks
 from mineru.backend.utils.runtime_utils import exclude_progress_bar_idle_time
 from mineru.cli_old.common import read_fn
 from mineru.utils.bbox_utils import normalize_to_int_bbox
@@ -24,6 +25,7 @@ from mineru.utils.ocr_utils import (
     update_det_boxes,
     get_ocr_result_list,
     OcrConfidence,
+    get_rotate_crop_image_for_text_rec,
 )
 from mineru.utils.pdf_image_tools import load_images_from_pdf_bytes_range, get_crop_np_img
 from tqdm import tqdm
@@ -77,7 +79,6 @@ PIPELINE_DET_TYPE = {
     BlockType.CAPTION,
     BlockType.FOOTER,
     BlockType.PAGE_FOOTNOTE,
-    BlockType.FORMULA_NUMBER,
     BlockType.HEADER,
     BlockType.PAGE_NUMBER,
     BlockType.PARAGRAPH_TITLE,
@@ -703,6 +704,76 @@ def _merge_page_sidecar_items(
     return merged_model_list
 
 
+def _medium_bbox_to_quad(bbox: list[float] | tuple[float, ...]) -> np.ndarray:
+    """将普通 bbox 转为表格模型 OCR token 使用的四点框。"""
+    x0, y0, x1, y1 = [float(v) for v in bbox]
+    return np.asarray([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float32)
+
+
+def _normalize_medium_content(value: Any) -> str:
+    """将 medium 本地模型输出的文本字段规范成 Hybrid block 可消费的字符串。"""
+    if isinstance(value, list):
+        return "\n".join(str(item) for item in value if str(item).strip())
+    if isinstance(value, str):
+        return value.strip()
+    return ""
+
+
+def _apply_medium_formula_number_ocr(
+    local_context: HybridLocalModelContext,
+    model_list: list[list[dict[str, Any]]],
+    np_images: list[np.ndarray],
+) -> None:
+    """对 medium formula_number 裁剪图执行 OCR-rec，并把编号文本回填到原始 layout 项。"""
+    need_rec_items: list[dict[str, Any]] = []
+    formula_number_crops: list[np.ndarray] = []
+    for block_list, np_img in zip(model_list, np_images):
+        image_h, image_w = np_img.shape[:2]
+        bgr_image = cv2.cvtColor(np_img, cv2.COLOR_RGB2BGR)
+        for block_item in block_list:
+            if block_item.get("type") != BlockType.FORMULA_NUMBER:
+                continue
+
+            formula_number_bbox = normalize_to_int_bbox(
+                _bbox_to_pixel_bbox(block_item.get("bbox"), (image_w, image_h)),
+                image_size=(image_h, image_w),
+            )
+            if formula_number_bbox is None:
+                continue
+
+            # 使用 OCR rec 的标准旋转裁剪逻辑，保证 medium 编号裁图与正文 OCR-rec 输入一致。
+            formula_number_crops.append(
+                get_rotate_crop_image_for_text_rec(
+                    bgr_image,
+                    _medium_bbox_to_quad(formula_number_bbox).copy(),
+                )
+            )
+            need_rec_items.append(block_item)
+
+    if not formula_number_crops:
+        return
+
+    ocr_result_list = local_context.ocr_model.ocr(
+        formula_number_crops,
+        det=False,
+        tqdm_enable=True,
+        tqdm_desc="OCR-rec",
+    )[0]
+    if len(ocr_result_list) != len(need_rec_items):
+        raise ValueError(
+            "Hybrid medium formula number OCR rec result count mismatch: "
+            f"ocr_result_list={len(ocr_result_list)}, need_rec_items={len(need_rec_items)}"
+        )
+
+    for block_item, ocr_result in zip(need_rec_items, ocr_result_list):
+        if not ocr_result or len(ocr_result) < 2:
+            continue
+        ocr_text, _ = ocr_result
+        normalized_text = _normalize_medium_content(ocr_text)
+        if normalized_text:
+            block_item["content"] = normalized_text
+
+
 def _process_text_and_formulas(
     images_pil_list: list[Image.Image],
     model_list: list[list[dict[str, Any]]],
@@ -738,11 +809,22 @@ def _process_text_and_formulas(
 
     inline_formula_list, display_formula_list = _split_formula_results(images_formula_list)
     if effort == "medium":
+        # 将行间公式span回填入block
         _apply_medium_display_formula_results(
             model_list,
             display_formula_list,
             images_pil_list,
         )
+        # 使用ocr识别行间公式标号
+        _apply_medium_formula_number_ocr(
+            local_model_context,
+            model_list,
+            np_images,
+        )
+
+    # 行间公式标号回填到block
+    for page_model_list in model_list:
+        optimize_hybrid_formula_number_blocks(page_model_list)
 
     need_rec_img = parse_mode == "ocr" and effort == "medium"
     # vlm没有执行ocr，需要ocr_det
