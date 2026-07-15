@@ -1,4 +1,6 @@
 # Copyright (c) Opendatalab. All rights reserved.
+import base64
+import html
 import os
 import time
 from dataclasses import dataclass
@@ -9,7 +11,12 @@ import numpy as np
 from PIL import Image
 from loguru import logger
 
-from mineru.backend.local_model_runtime import HybridLocalModelContextSingleton, HybridLocalModelContext, run_ocr_inference
+from mineru.backend.local_model_runtime import (
+    AtomicModel,
+    HybridLocalModelContext,
+    HybridLocalModelContextSingleton,
+    run_ocr_inference,
+)
 from mineru.backend.utils.boxbase import calculate_overlap_area_2_minbox_area_ratio
 from mineru.backend.utils.char_utils import is_hyphen_at_line_end
 from mineru.backend.utils.formula_number import optimize_hybrid_formula_number_blocks
@@ -1057,6 +1064,400 @@ def _normalize_medium_content(value: Any) -> str:
     return ""
 
 
+def _medium_table_bbox_center(bbox: BBox) -> tuple[float, float]:
+    """计算 bbox 中心点，用于判断图片或公式应归属哪个表格。"""
+    return (float(bbox[0]) + float(bbox[2])) / 2.0, (float(bbox[1]) + float(bbox[3])) / 2.0
+
+
+def _medium_table_bbox_intersection(bbox1: BBox, bbox2: BBox) -> BBox | None:
+    """计算两个 bbox 的有效交集，无重叠时返回 None。"""
+    x0 = max(float(bbox1[0]), float(bbox2[0]))
+    y0 = max(float(bbox1[1]), float(bbox2[1]))
+    x1 = min(float(bbox1[2]), float(bbox2[2]))
+    y1 = min(float(bbox1[3]), float(bbox2[3]))
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return (x0, y0, x1, y1)
+
+
+def _select_medium_table_owner(
+    item_bbox: BBox,
+    table_entries: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """按中心点包含关系匹配表格，多表命中时选择交叠面积最大的表格。"""
+    center_x, center_y = _medium_table_bbox_center(item_bbox)
+    candidates: list[tuple[float, dict[str, Any]]] = []
+    for table_entry in table_entries:
+        table_bbox = table_entry["table_bbox"]
+        if not (
+            float(table_bbox[0]) <= center_x <= float(table_bbox[2])
+            and float(table_bbox[1]) <= center_y <= float(table_bbox[3])
+        ):
+            continue
+        overlap_bbox = _medium_table_bbox_intersection(item_bbox, table_bbox)
+        if overlap_bbox is None:
+            continue
+        overlap_area = float(overlap_bbox[2] - overlap_bbox[0]) * float(overlap_bbox[3] - overlap_bbox[1])
+        candidates.append((overlap_area, table_entry))
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def _normalize_medium_table_angle(angle: Any) -> int:
+    """规范表格角度为 0/90/180/270，无法识别的角度按 0 处理。"""
+    try:
+        normalized_angle = int(float(angle or 0)) % 360
+    except (TypeError, ValueError):
+        normalized_angle = 0
+    if normalized_angle not in {0, 90, 180, 270}:
+        logger.warning(f"Unsupported Hybrid medium table angle: {angle}, using 0")
+        return 0
+    return normalized_angle
+
+
+def _rotate_medium_table_image(image: np.ndarray, angle: int) -> np.ndarray:
+    """按 layout 表格角度把裁图旋转至正向，角度语义与方向分类模型保持一致。"""
+    if angle == 270:
+        return cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+    if angle == 90:
+        return cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    if angle == 180:
+        return cv2.rotate(image, cv2.ROTATE_180)
+    return image
+
+
+def _rotate_medium_table_bbox(
+    bbox: BBox,
+    image_width: float,
+    image_height: float,
+    angle: int,
+) -> BBox:
+    """把原表格裁图中的 bbox 同步转换到旋转后裁图坐标系。"""
+    x0, y0, x1, y1 = [float(value) for value in bbox]
+    if angle == 270:
+        # 顺时针旋转 90 度后，新 x 轴来自原 y 轴的反方向。
+        return (image_height - y1, x0, image_height - y0, x1)
+    if angle == 90:
+        # 逆时针旋转 90 度后，新 y 轴来自原 x 轴的反方向。
+        return (y0, image_width - x1, y1, image_width - x0)
+    if angle == 180:
+        return (image_width - x1, image_height - y1, image_width - x0, image_height - y0)
+    return (x0, y0, x1, y1)
+
+
+def _get_medium_table_virtual_image_bbox(
+    bbox: BBox,
+    image_size: tuple[int, int],
+    box_size: float = 10.0,
+) -> BBox:
+    """在图片中心生成小 OCR token 框，避免图片大框干扰单元格匹配。"""
+    image_width, image_height = image_size
+    center_x, center_y = _medium_table_bbox_center(bbox)
+    half_size = box_size / 2.0
+    return (
+        max(0.0, center_x - half_size),
+        max(0.0, center_y - half_size),
+        min(float(image_width), center_x + half_size),
+        min(float(image_height), center_y + half_size),
+    )
+
+
+def _encode_medium_table_image(
+    np_image: np.ndarray,
+    page_bbox: BBox,
+    angle: int,
+) -> str:
+    """从页面原图裁剪表内图片，按表格方向旋转后编码为 JPEG data URI。"""
+    image_h, image_w = np_image.shape[:2]
+    image_bbox = normalize_to_int_bbox(page_bbox, image_size=(image_h, image_w))
+    if image_bbox is None:
+        return ""
+    x0, y0, x1, y1 = image_bbox
+    crop_rgb = np_image[y0:y1, x0:x1].copy()
+    if crop_rgb.size == 0:
+        return ""
+
+    crop_rgb = _rotate_medium_table_image(crop_rgb, angle)
+    crop_bgr = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2BGR)
+    success, encoded = cv2.imencode(".jpg", crop_bgr)
+    if not success:
+        return ""
+    return f"data:image/jpeg;base64,{base64.b64encode(encoded.tobytes()).decode('ascii')}"
+
+
+def _collect_medium_table_tasks(
+    model_list: list[list[dict[str, Any]]],
+    inline_formula_list: list[list[dict[str, Any]]],
+    np_images: list[np.ndarray],
+) -> list[dict[str, Any]]:
+    """从当前窗口 model_list 收集表格任务，并提前消费表内图片和行内公式。"""
+    table_tasks: list[dict[str, Any]] = []
+    for page_idx, (page_model_list, page_inline_formulas, np_image) in enumerate(
+        zip(model_list, inline_formula_list, np_images)
+    ):
+        image_h, image_w = np_image.shape[:2]
+        page_size = (image_w, image_h)
+        table_entries: list[dict[str, Any]] = []
+        for block in page_model_list:
+            if block.get("type") != BlockType.TABLE:
+                continue
+            pixel_bbox = _bbox_to_pixel_bbox(block.get("bbox"), page_size)
+            table_bbox = normalize_to_int_bbox(pixel_bbox, image_size=(image_h, image_w))
+            if table_bbox is None:
+                continue
+            x0, y0, x1, y1 = table_bbox
+            table_crop = np_image[y0:y1, x0:x1].copy()
+            if table_crop.size == 0:
+                continue
+            table_entries.append(
+                {
+                    "table_block": block,
+                    "table_bbox": table_bbox,
+                    "table_crop": table_crop,
+                    "angle": _normalize_medium_table_angle(block.get("angle", 0)),
+                    "inline_objects": [],
+                }
+            )
+
+        if not table_entries:
+            continue
+
+        consumed_image_ids: set[int] = set()
+        consumed_formula_ids: set[int] = set()
+        for block in page_model_list:
+            if block.get("type") != BlockType.IMAGE:
+                continue
+            image_bbox = _bbox_to_pixel_bbox(block.get("bbox"), page_size)
+            if image_bbox is None:
+                continue
+            owner = _select_medium_table_owner(image_bbox, table_entries)
+            if owner is None:
+                continue
+            owner["inline_objects"].append(
+                {
+                    "kind": "image",
+                    "page_bbox": image_bbox,
+                    "score": float(block.get("score", 1.0) or 0.0),
+                }
+            )
+            consumed_image_ids.add(id(block))
+
+        for formula in page_inline_formulas:
+            latex = _normalize_medium_content(formula.get("latex", ""))
+            formula_bbox = _bbox_to_pixel_bbox(formula.get("bbox"), page_size)
+            if formula_bbox is None:
+                continue
+            owner = _select_medium_table_owner(formula_bbox, table_entries)
+            if owner is None:
+                continue
+            owner["inline_objects"].append(
+                {
+                    "kind": "formula",
+                    "page_bbox": formula_bbox,
+                    "latex": latex,
+                    "score": float(formula.get("score", 1.0) or 0.0),
+                }
+            )
+            consumed_formula_ids.add(id(formula))
+
+        # 匹配完成后立即删除原始对象；后续 OCR 或结构识别失败均不回滚。
+        page_model_list[:] = [block for block in page_model_list if id(block) not in consumed_image_ids]
+        page_inline_formulas[:] = [formula for formula in page_inline_formulas if id(formula) not in consumed_formula_ids]
+
+        for table_entry in table_entries:
+            table_bbox = table_entry["table_bbox"]
+            table_crop = table_entry["table_crop"]
+            angle = table_entry["angle"]
+            crop_h, crop_w = table_crop.shape[:2]
+            rotated_crop = _rotate_medium_table_image(table_crop, angle)
+            rotated_h, rotated_w = rotated_crop.shape[:2]
+            prepared_objects: list[dict[str, Any]] = []
+            for inline_object in table_entry["inline_objects"]:
+                overlap_bbox = _medium_table_bbox_intersection(inline_object["page_bbox"], table_bbox)
+                if overlap_bbox is None:
+                    continue
+                relative_bbox = (
+                    float(overlap_bbox[0]) - float(table_bbox[0]),
+                    float(overlap_bbox[1]) - float(table_bbox[1]),
+                    float(overlap_bbox[2]) - float(table_bbox[0]),
+                    float(overlap_bbox[3]) - float(table_bbox[1]),
+                )
+                rotated_bbox = _rotate_medium_table_bbox(relative_bbox, crop_w, crop_h, angle)
+                if inline_object["kind"] == "formula":
+                    latex = inline_object["latex"]
+                    content = f"<eq>{html.escape(latex)}</eq>" if latex else ""
+                    token_bbox = rotated_bbox
+                else:
+                    image_src = _encode_medium_table_image(np_image, inline_object["page_bbox"], angle)
+                    content = f'<img src="{image_src}"/>' if image_src else ""
+                    token_bbox = _get_medium_table_virtual_image_bbox(
+                        rotated_bbox,
+                        (rotated_w, rotated_h),
+                    )
+                prepared_objects.append(
+                    {
+                        **inline_object,
+                        "mask_bbox": rotated_bbox,
+                        "token_bbox": token_bbox,
+                        "content": content,
+                    }
+                )
+
+            table_tasks.append(
+                {
+                    "page_idx": page_idx,
+                    "table_block": table_entry["table_block"],
+                    "table_bbox": table_bbox,
+                    "angle": angle,
+                    "table_img": rotated_crop,
+                    "wired_table_img": rotated_crop,
+                    "ocr_result": [],
+                    "table_res": {},
+                    "inline_objects": prepared_objects,
+                }
+            )
+    return table_tasks
+
+
+def _sort_medium_table_ocr_result(ocr_result: list[list[Any]]) -> None:
+    """按 token 顶边和左边坐标排序，保证表格 OCR 输入顺序稳定。"""
+    def sort_key(item: list[Any]) -> tuple[float, float]:
+        """提取四点框的最小 y/x，兼容普通列表和 numpy 数组。"""
+        box = np.asarray(item[0], dtype=np.float32).reshape(-1, 2)
+        return float(np.min(box[:, 1])), float(np.min(box[:, 0]))
+
+    ocr_result.sort(key=sort_key)
+
+
+def _prepare_medium_table_ocr_results(
+    local_model_context: HybridLocalModelContext,
+    table_tasks: list[dict[str, Any]],
+) -> None:
+    """遮盖表内图片和公式后逐表执行 OCR，并合并内联对象 token。"""
+    table_ocr_model = None
+    try:
+        table_ocr_model = local_model_context.get_ocr_model(
+            det_db_box_thresh=0.5,
+            det_db_unclip_ratio=1.6,
+            enable_merge_det_boxes=False,
+        )
+    except Exception as exc:
+        logger.warning(f"Hybrid medium table OCR model initialization failed: {exc}")
+
+    for table_task in table_tasks:
+        ocr_result: list[list[Any]] = []
+        bgr_image = cv2.cvtColor(table_task["table_img"], cv2.COLOR_RGB2BGR)
+        mask_boxes = [{"bbox": item["mask_bbox"]} for item in table_task["inline_objects"]]
+        masked_image = mask_formula_regions_for_ocr_det(bgr_image, mask_boxes)
+
+        if table_ocr_model is not None:
+            try:
+                page_ocr_results = run_ocr_inference(table_ocr_model.ocr, masked_image)
+                raw_ocr_result = page_ocr_results[0] if page_ocr_results else None
+                for raw_item in raw_ocr_result or []:
+                    if not raw_item or len(raw_item) < 2:
+                        continue
+                    box, rec_result = raw_item[0], raw_item[1]
+                    if not rec_result or len(rec_result) < 2:
+                        continue
+                    text, score = rec_result[0], rec_result[1]
+                    normalized_text = _normalize_medium_content(text)
+                    if not normalized_text:
+                        continue
+                    ocr_result.append(
+                        [
+                            np.asarray(box, dtype=np.float32),
+                            html.escape(normalized_text),
+                            float(score or 0.0),
+                        ]
+                    )
+            except Exception as exc:
+                logger.warning(
+                    f"Hybrid medium table OCR failed: page_idx={table_task['page_idx']}, error={exc}"
+                )
+
+        for inline_object in table_task["inline_objects"]:
+            if not inline_object["content"]:
+                continue
+            ocr_result.append(
+                [
+                    _medium_bbox_to_quad(inline_object["token_bbox"]),
+                    inline_object["content"],
+                    inline_object["score"],
+                ]
+            )
+        _sort_medium_table_ocr_result(ocr_result)
+        table_task["ocr_result"] = ocr_result
+
+
+def _trim_medium_table_html(html_code: Any) -> str:
+    """从模型输出中截取核心 table HTML；未带外围标签时保留原字符串。"""
+    if not isinstance(html_code, str):
+        return ""
+    stripped_html = html_code.strip()
+    lower_html = stripped_html.lower()
+    start_index = lower_html.find("<table")
+    end_index = lower_html.rfind("</table>")
+    if start_index >= 0 and end_index >= start_index:
+        return stripped_html[start_index : end_index + len("</table>")]
+    return stripped_html
+
+
+def _apply_medium_table_recognition(
+    local_model_context: HybridLocalModelContext,
+    model_list: list[list[dict[str, Any]]],
+    inline_formula_list: list[list[dict[str, Any]]],
+    np_images: list[np.ndarray],
+) -> None:
+    """基于 model_list 执行 medium 表格解析，采用分类 batch、无线 batch、有线单表调度。"""
+    table_tasks = _collect_medium_table_tasks(model_list, inline_formula_list, np_images)
+    if not table_tasks:
+        return
+
+    _prepare_medium_table_ocr_results(local_model_context, table_tasks)
+
+    try:
+        local_model_context.table_cls_model.batch_predict(table_tasks)
+    except Exception as exc:
+        # 分类失败不阻断无线模型，未获得分类结果的表格按 wireless-only 处理。
+        logger.warning(f"Hybrid medium table classification failed: {exc}")
+
+    try:
+        local_model_context.wireless_table_model.batch_predict(table_tasks)
+    except Exception as exc:
+        logger.warning(f"Hybrid medium wireless table recognition failed: {exc}")
+
+    for table_task in table_tasks:
+        cls_label = table_task["table_res"].get("cls_label")
+        try:
+            cls_score = float(table_task["table_res"].get("cls_score", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            cls_score = 0.0
+        use_wired_model = cls_label == AtomicModel.WiredTable or (
+            cls_label == AtomicModel.WirelessTable and cls_score < 0.9
+        )
+        if use_wired_model:
+            try:
+                wireless_html = table_task["table_res"].get("html", "") or ""
+                wired_html = local_model_context.wired_table_model.predict(
+                    table_task["wired_table_img"],
+                    table_task["ocr_result"],
+                    wireless_html,
+                )
+                if wired_html is not None:
+                    table_task["table_res"]["html"] = wired_html
+            except Exception as exc:
+                logger.warning(
+                    f"Hybrid medium wired table recognition failed: page_idx={table_task['page_idx']}, error={exc}"
+                )
+
+        html_code = _trim_medium_table_html(table_task["table_res"].get("html", ""))
+        if html_code:
+            table_task["table_block"]["content"] = html_code
+
+
 def _apply_medium_formula_number_ocr(
     local_context: HybridLocalModelContext,
     model_list: list[list[dict[str, Any]]],
@@ -1156,6 +1557,13 @@ def _process_text_and_formulas(
 
     inline_formula_list, display_formula_list = _split_formula_results(images_formula_list)
     if effort == "medium":
+        # 表格解析必须早于正文行填充，确保表内图片和行内公式只由表格模型消费一次。
+        _apply_medium_table_recognition(
+            local_model_context,
+            model_list,
+            inline_formula_list,
+            np_images,
+        )
         # 将行间公式span回填入block
         _apply_medium_display_formula_results(
             model_list,
@@ -1415,8 +1823,8 @@ def doc_analyze(
 
 if __name__ == "__main__":
     # pdf_path = "/Users/myhloli/pdf/截断合并/demo1-2.pdf"
-    pdf_path = "/Users/myhloli/pdf/png/2407.00079v4_origi-10.pdf"
+    pdf_path = "/Users/myhloli/pdf/png/table_image3.png"  # shubiao.png
     pdf_bytes = read_fn(pdf_path)
-    middle_json, model_list = doc_analyze(pdf_bytes, effort="high", image_analysis=True)
+    middle_json, model_list = doc_analyze(pdf_bytes, effort="medium", image_analysis=True)
     logger.info(f"middle_json: {middle_json}")
     logger.info(f"model_list: {model_list}")
