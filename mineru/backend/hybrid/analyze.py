@@ -25,7 +25,10 @@ from mineru.backend.utils.span_block_fix import fix_text_block
 from mineru.backend.utils.span_orientation import VERTICAL_SPAN_HEIGHT_TO_WIDTH_RATIO_THRESHOLD
 from mineru.backend.utils.span_pre_proc import (
     SpanBlockMatcher,
+    __replace_ligatures,
+    __replace_unicode,
     _clear_post_ocr_fallback,
+    _is_supported_rotation,
     _restore_post_ocr_fallback,
     txt_spans_extract,
 )
@@ -49,7 +52,7 @@ from mineru.utils.pdf_image_tools import load_images_from_pdf_bytes_range, get_c
 from tqdm import tqdm
 
 from ...utils.image_payload import ImagePayloadCache
-from ...utils.pdf_document import PDFDocument, PDFPage
+from ...utils.pdf_document import PDFDocument, PDFPage, get_lines_from_chars
 from ...types import BBox, Block, BlockType, ContentType, Line, NOT_EXTRACT_TYPES, PageInfo, Span
 from ...utils.config_reader import get_processing_window_size
 
@@ -673,6 +676,45 @@ def _validate_text_formula_window_inputs(
         scale = float(image_dict.get("scale", 0) or 0)
         if scale <= 0:
             raise ValueError(f"Hybrid text/formula window image scale must be positive: page_idx={page_idx}")
+
+
+def _build_pdf_text_line_spans(pdf_page: PDFPage) -> list[Span]:
+    """将标准方向的 pdftext line 转为文本 Span，并复用现有字符清洗规则。"""
+    page_spans: list[Span] = []
+    for pdf_line in get_lines_from_chars(pdf_page.get_chars()):
+        try:
+            rotation = float(pdf_line.get("rotation", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if not _is_supported_rotation(rotation):
+            continue
+
+        raw_bbox = pdf_line.get("bbox")
+        bbox = getattr(raw_bbox, "bbox", raw_bbox)
+        try:
+            if bbox is None or len(bbox) != 4:
+                continue
+            x0, y0, x1, y1 = [float(value) for value in bbox]
+        except (TypeError, ValueError):
+            continue
+        if x1 <= x0 or y1 <= y0:
+            continue
+
+        content = "".join(str(pdf_span.get("text", "") or "") for pdf_span in pdf_line.get("spans", []))
+        content = __replace_unicode(content)
+        content = __replace_ligatures(content).strip()
+        if not content:
+            continue
+
+        page_spans.append(
+            Span(
+                type=ContentType.TEXT,
+                bbox=(x0, y0, x1, y1),
+                content=content,
+                score=1.0,
+            )
+        )
+    return page_spans
 
 
 def _sidecar_bbox_to_page_bbox(
@@ -1513,6 +1555,67 @@ def _apply_medium_formula_number_ocr(
             block_item["content"] = normalized_text
 
 
+def _process_low_text(
+    images_list: list[dict[str, Any]],
+    pdf_pages: list[PDFPage],
+    model_list: list[list[dict[str, Any]]],
+    parse_mode: Literal["txt", "ocr"],
+    local_model_context: HybridLocalModelContext,
+    images_layout_res: list[list[dict[str, Any]]],
+) -> list[list[dict[str, Any]]]:
+    """使用 pdftext line 或本地 OCR 为 low layout block 填充文本内容。"""
+    _validate_text_formula_window_inputs(
+        images_list,
+        pdf_pages,
+        model_list,
+        images_layout_res,
+    )
+
+    if parse_mode == "txt":
+        target_block_types = set(PIPELINE_DET_TYPE) | TITLE_BLOCK_TYPES | {BlockType.TEXT}
+        for pdf_page, page_model_list in zip(pdf_pages, model_list):
+            page_size = tuple(float(value) for value in pdf_page.size)
+            block_lines, block_bboxes = _group_page_spans_by_block(
+                page_model_list,
+                _build_pdf_text_line_spans(pdf_page),
+                page_size,
+                target_block_types,
+            )
+            _apply_block_content_and_line_metadata(
+                page_model_list,
+                block_lines,
+                block_bboxes,
+                page_size,
+            )
+        return model_list
+
+    if parse_mode != "ocr":
+        raise ValueError(f"Unsupported parse mode: {parse_mode}")
+
+    images_pil_list = [image_dict["img_pil"] for image_dict in images_list]
+    np_images = [np.asarray(pil_image).copy() for pil_image in images_pil_list]
+    empty_formula_list: list[list[dict[str, Any]]] = [[] for _ in model_list]
+    ocr_res_list = _ocr_det(
+        local_model_context,
+        np_images,
+        model_list,
+        empty_formula_list,
+        True,
+        PIPELINE_DET_TYPE,
+    )
+    _apply_ocr_rec_results(local_model_context, ocr_res_list)
+    return _fill_window_block_content_and_lines(
+        images_list,
+        pdf_pages,
+        model_list,
+        empty_formula_list,
+        ocr_res_list,
+        parse_mode,
+        PIPELINE_DET_TYPE,
+        local_model_context,
+    )
+
+
 def _process_text_and_formulas(
     images_list: list[dict[str, Any]],
     pdf_pages: list[PDFPage],
@@ -1651,7 +1754,7 @@ def _apply_layout_title_split(
 
 def doc_analyze(
     pdf_bytes: bytes,
-    effort: Literal["medium", "high", "xhigh"] = "high",
+    effort: Literal["low", "medium", "high", "xhigh"] = "high",
     image_analysis: bool = True,
     page_index_map: list[int] | None = None,
     image_cache: ImagePayloadCache | None = None,
@@ -1722,7 +1825,7 @@ def doc_analyze(
                     vl_style_layout_blocks = _build_vl_style_layout_blocks(images_layout_res, images_pil_list)
 
                     if parse_mode == "txt":
-                        if effort == "medium":
+                        if effort in ["low", "medium"]:
                             window_model_list = vl_style_layout_blocks
                         elif effort == "high":
                             window_model_list = vlm_predictor.batch_extract_with_layout(
@@ -1745,7 +1848,7 @@ def doc_analyze(
                         else:
                             raise ValueError(f"Unsupported analyze effort: {effort}")
                     elif parse_mode == "ocr":
-                        if effort == "medium":
+                        if effort in ["low", "medium"]:
                             window_model_list = vl_style_layout_blocks
                         elif effort == "high":
                             window_model_list = vlm_predictor.batch_extract_with_layout(
@@ -1768,15 +1871,25 @@ def doc_analyze(
                     else:
                         raise ValueError(f"Unsupported parse mode: {parse_mode}")
 
-                    window_model_list = _process_text_and_formulas(
-                        images_list,
-                        pdf_pages,
-                        window_model_list,
-                        parse_mode,
-                        effort,
-                        hybrid_model,
-                        images_layout_res,
-                    )
+                    if effort == "low":
+                        window_model_list = _process_low_text(
+                            images_list,
+                            pdf_pages,
+                            window_model_list,
+                            parse_mode,
+                            hybrid_model,
+                            images_layout_res,
+                        )
+                    else:
+                        window_model_list = _process_text_and_formulas(
+                            images_list,
+                            pdf_pages,
+                            window_model_list,
+                            parse_mode,
+                            effort,
+                            hybrid_model,
+                            images_layout_res,
+                        )
 
                     model_list.extend(window_model_list)
                     if progress_bar is None:
@@ -1822,9 +1935,9 @@ def doc_analyze(
 
 
 if __name__ == "__main__":
-    # pdf_path = "/Users/myhloli/pdf/截断合并/demo1-2.pdf"
-    pdf_path = "/Users/myhloli/pdf/png/table_image3.png"  # shubiao.png
+    pdf_path = "/Users/myhloli/pdf/截断合并/demo1-3.pdf"
+    # pdf_path = "/Users/myhloli/pdf/png/table_image3.png"  # shubiao.png
     pdf_bytes = read_fn(pdf_path)
-    middle_json, model_list = doc_analyze(pdf_bytes, effort="medium", image_analysis=True)
+    middle_json, model_list = doc_analyze(pdf_bytes, effort="low", image_analysis=True)
     logger.info(f"middle_json: {middle_json}")
     logger.info(f"model_list: {model_list}")
