@@ -824,7 +824,7 @@ def _process_text_and_formulas(
 
     # 行间公式标号回填到block
     for page_model_list in model_list:
-        optimize_hybrid_formula_number_blocks(page_model_list)
+        page_model_list[:] = optimize_hybrid_formula_number_blocks(page_model_list)
 
     need_rec_img = parse_mode == "ocr" and effort == "medium"
     # vlm没有执行ocr，需要ocr_det
