@@ -9,30 +9,41 @@ import numpy as np
 from PIL import Image
 from loguru import logger
 
-from mineru.backend.local_model_runtime import HybridLocalModelContextSingleton, HybridLocalModelContext
+from mineru.backend.local_model_runtime import HybridLocalModelContextSingleton, HybridLocalModelContext, run_ocr_inference
 from mineru.backend.utils.boxbase import calculate_overlap_area_2_minbox_area_ratio
+from mineru.backend.utils.char_utils import is_hyphen_at_line_end
 from mineru.backend.utils.formula_number import optimize_hybrid_formula_number_blocks
 from mineru.backend.utils.runtime_utils import exclude_progress_bar_idle_time
+from mineru.backend.utils.span_block_fix import fix_text_block
+from mineru.backend.utils.span_orientation import VERTICAL_SPAN_HEIGHT_TO_WIDTH_RATIO_THRESHOLD
+from mineru.backend.utils.span_pre_proc import (
+    SpanBlockMatcher,
+    _clear_post_ocr_fallback,
+    _restore_post_ocr_fallback,
+    txt_spans_extract,
+)
 from mineru.cli_old.common import read_fn
 from mineru.utils.bbox_utils import normalize_to_int_bbox
 from mineru.utils.engine_utils import get_vlm_engine
+from mineru.utils.language import detect_lang
 from mineru.utils.model_utils import clean_memory, crop_img
 from mineru.utils.ocr_utils import (
-    get_adjusted_mfdetrec_res,
-    mask_formula_regions_for_ocr_det,
-    sorted_boxes,
-    merge_det_boxes,
-    update_det_boxes,
-    get_ocr_result_list,
     OcrConfidence,
+    get_adjusted_mfdetrec_res,
+    get_ocr_result_list,
     get_rotate_crop_image_for_text_rec,
+    mask_formula_regions_for_ocr_det,
+    merge_det_boxes,
+    rotate_vertical_crop_if_needed,
+    sorted_boxes,
+    update_det_boxes,
 )
 from mineru.utils.pdf_image_tools import load_images_from_pdf_bytes_range, get_crop_np_img
 from tqdm import tqdm
 
 from ...utils.image_payload import ImagePayloadCache
 from ...utils.pdf_document import PDFDocument, PDFPage
-from ...types import PageInfo, BlockType, BBox, NOT_EXTRACT_TYPES
+from ...types import BBox, Block, BlockType, ContentType, Line, NOT_EXTRACT_TYPES, PageInfo, Span
 from ...utils.config_reader import get_processing_window_size
 
 
@@ -43,6 +54,17 @@ MFR_BASE_BATCH_SIZE = 16
 OCR_DET_BASE_BATCH_SIZE = 8
 LAYOUT_TITLE_SPLIT_OVERLAP_THRESHOLD = 0.8
 BATCH_RATIO = 2
+CJK_LANGS = frozenset({"zh", "ja", "ko"})
+TITLE_BLOCK_TYPES = {
+    BlockType.TITLE,
+    BlockType.DOC_TITLE,
+    BlockType.PARAGRAPH_TITLE,
+}
+CODE_CONTENT_BLOCK_TYPES = {
+    BlockType.CODE,
+    BlockType.CODE_BODY,
+    BlockType.ALGORITHM,
+}
 
 VLM_LAYOUT_LABEL_MAP = {
     "abstract": BlockType.TEXT,
@@ -104,7 +126,6 @@ class _OcrDetCrop:
     page_ocr_res_list: list[dict[str, Any]]
 
 
-
 def _load_vlm_runtime() -> dict[str, Any]:
     """按需加载 VLM runtime 组件，确保只有 high/extra_high 路径触发 VLM 依赖。"""
     from ...model.vlm.runtime import (
@@ -127,6 +148,7 @@ def _load_vlm_runtime() -> dict[str, Any]:
 @dataclass(frozen=True)
 class _ProcessingWindow:
     """记录单个 Hybrid 处理窗口的页码范围，统一同步和异步入口的窗口计算。"""
+
     index: int
     total: int
     start: int
@@ -260,9 +282,9 @@ def _layout_item_to_content_block(layout_item: dict[str, Any], page_size: tuple[
 
 
 def _get_crop_table_img(
-        np_img: np.ndarray,
-        table_res_bbox: BBox,
-        scale: float= 1,
+    np_img: np.ndarray,
+    table_res_bbox: BBox,
+    scale: float = 1,
 ) -> np.ndarray:
     """按指定缩放裁剪表格图，保持 medium 表格处理只使用当前文件窗口图像。"""
     bbox = normalize_to_int_bbox([float(v) / float(scale) for v in table_res_bbox])
@@ -353,12 +375,8 @@ def _split_formula_results(
     inline_formula_list = []
     display_formula_list = []
     for page_formula_list in images_formula_list:
-        inline_formula_list.append(
-            [formula for formula in page_formula_list if formula.get("label") == "inline_formula"]
-        )
-        display_formula_list.append(
-            [formula for formula in page_formula_list if formula.get("label") == "display_formula"]
-        )
+        inline_formula_list.append([formula for formula in page_formula_list if formula.get("label") == "inline_formula"])
+        display_formula_list.append([formula for formula in page_formula_list if formula.get("label") == "display_formula"])
     return inline_formula_list, display_formula_list
 
 
@@ -593,6 +611,7 @@ def _should_remove_low_confidence_ocr_text(ocr_text: str, ocr_score: float, ocr_
         and layout_res_width < layout_res_height
     )
 
+
 def _apply_ocr_rec_results(
     local_model_context: HybridLocalModelContext,
     ocr_res_list: list[list[dict[str, Any]]],
@@ -610,8 +629,7 @@ def _apply_ocr_rec_results(
 
     if len(ocr_result_list) != len(need_ocr_list):
         raise ValueError(
-            "Hybrid OCR rec result count mismatch: "
-            f"ocr_result_list={len(ocr_result_list)}, need_ocr_list={len(need_ocr_list)}"
+            f"Hybrid OCR rec result count mismatch: ocr_result_list={len(ocr_result_list)}, need_ocr_list={len(need_ocr_list)}"
         )
 
     items_to_remove = []
@@ -627,81 +645,402 @@ def _apply_ocr_rec_results(
             page_ocr_res_list.remove(need_ocr_res)
 
 
-def _normalize_bbox_to_unit(item: dict[str, Any], page_width: int, page_height: int) -> bool:
-    """将像素级bbox归一化为[0, 1]区间"""
-    bbox = item.get("bbox")
-    if bbox is None or len(bbox) != 4:
-        return False
-
-    x0, y0, x1, y1 = [float(v) for v in bbox]
-    if 0.0 <= x0 <= 1.0 and 0.0 <= y0 <= 1.0 and 0.0 <= x1 <= 1.0 and 0.0 <= y1 <= 1.0:
-        normalized_bbox = [x0, y0, x1, y1]
-    else:
-        normalized_bbox = [
-            x0 / page_width,
-            y0 / page_height,
-            x1 / page_width,
-            y1 / page_height,
-        ]
-    item["bbox"] = [round(min(max(v, 0), 1), 3) for v in normalized_bbox]
-    return True
-
-
-def _normalize_bbox(
-    inline_formula_list: list[list[dict[str, Any]]],
-    ocr_res_list: list[list[dict[str, Any]]],
-    images_pil_list: list[Image.Image],
+def _validate_text_formula_window_inputs(
+    images_list: list[dict[str, Any]],
+    pdf_pages: list[PDFPage],
+    model_list: list[list[dict[str, Any]]],
+    images_layout_res: list[list[dict[str, Any]]],
 ) -> None:
-    """归一化坐标并生成最终结果"""
-    for page_inline_formula_list, page_ocr_res_list, page_pil_image in zip(inline_formula_list, ocr_res_list, images_pil_list):
-        if page_inline_formula_list or page_ocr_res_list:
-            page_width, page_height = page_pil_image.size
-            # 处理公式列表
-            for formula in page_inline_formula_list:
-                _normalize_bbox_to_unit(formula, page_width, page_height)
-            # 处理OCR结果列表
-            for ocr_res in page_ocr_res_list:
-                _normalize_bbox_to_unit(ocr_res, page_width, page_height)
-
-
-def _build_inline_formula_model_item(formula: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "type": "inline_formula",
-        "bbox": list(formula["bbox"]),
-        "latex": formula.get("latex", ""),
-        "score": float(formula.get("score", 0.0)),
+    """校验文本公式处理所需的窗口分页数据，避免 zip 静默截断。"""
+    page_counts = {
+        "images": len(images_list),
+        "pdf_pages": len(pdf_pages),
+        "model_list": len(model_list),
+        "layout": len(images_layout_res),
     }
+    if len(set(page_counts.values())) != 1:
+        raise ValueError(f"Hybrid text/formula window page count mismatch: {page_counts}")
+
+    for page_idx, image_dict in enumerate(images_list):
+        if image_dict.get("img_pil") is None:
+            raise ValueError(f"Hybrid text/formula window image is missing img_pil: page_idx={page_idx}")
+        scale = float(image_dict.get("scale", 0) or 0)
+        if scale <= 0:
+            raise ValueError(f"Hybrid text/formula window image scale must be positive: page_idx={page_idx}")
 
 
-def _build_ocr_text_model_item(ocr_res: dict[str, Any], keep_text: bool = True) -> dict[str, Any]:
-    """构造 OCR det sidecar；VLM-OCR 路径可只保留空文本行提示。"""
-    return {
-        "type": "ocr_text",
-        "bbox": list(ocr_res["bbox"]),
-        "text": ocr_res.get("text", "") if keep_text else "",
-        "score": float(ocr_res.get("score", 0.0)),
-    }
+def _sidecar_bbox_to_page_bbox(
+    bbox: BBox | None,
+    page_size: tuple[float, float],
+    render_scale: float,
+) -> BBox | None:
+    """将公式或 OCR sidecar bbox 转为 PDF point 坐标，供原生字符匹配和组行。"""
+    if bbox is None or len(bbox) != 4 or render_scale <= 0:
+        return None
+    try:
+        x0, y0, x1, y1 = [float(value) for value in bbox]
+    except (TypeError, ValueError):
+        return None
+
+    page_width, page_height = page_size
+    if page_width <= 0 or page_height <= 0:
+        return None
+    if all(0.0 <= value <= 1.0 for value in [x0, y0, x1, y1]):
+        x0, y0, x1, y1 = x0 * page_width, y0 * page_height, x1 * page_width, y1 * page_height
+    else:
+        x0, y0, x1, y1 = (
+            x0 / render_scale,
+            y0 / render_scale,
+            x1 / render_scale,
+            y1 / render_scale,
+        )
+
+    left, right = sorted([max(0.0, min(page_width, x0)), max(0.0, min(page_width, x1))])
+    top, bottom = sorted([max(0.0, min(page_height, y0)), max(0.0, min(page_height, y1))])
+    if right <= left or bottom <= top:
+        return None
+    return (left, top, right, bottom)
 
 
-def _merge_page_sidecar_items(
+def _page_bbox_to_unit_bbox(bbox: BBox, page_size: tuple[float, float]) -> list[float] | None:
+    """将 PDF point bbox 转为页面级 0-1 坐标，并统一保留三位小数。"""
+    page_width, page_height = page_size
+    if page_width <= 0 or page_height <= 0 or len(bbox) != 4:
+        return None
+    x0, y0, x1, y1 = [float(value) for value in bbox]
+    if x1 <= x0 or y1 <= y0:
+        return None
+    normalized_bbox = [
+        round(max(0.0, min(1.0, x0 / page_width)), 3),
+        round(max(0.0, min(1.0, y0 / page_height)), 3),
+        round(max(0.0, min(1.0, x1 / page_width)), 3),
+        round(max(0.0, min(1.0, y1 / page_height)), 3),
+    ]
+    if normalized_bbox[2] <= normalized_bbox[0] or normalized_bbox[3] <= normalized_bbox[1]:
+        return None
+    return normalized_bbox
+
+
+def _build_page_text_formula_spans(
+    page_inline_formula_list: list[dict[str, Any]],
+    page_ocr_res_list: list[dict[str, Any]],
+    page_size: tuple[float, float],
+    render_scale: float,
+) -> list[Span]:
+    """将当前页行内公式和 OCR 结果转换为统一 Span，正文与公式后续共同组行。"""
+    page_spans: list[Span] = []
+    for formula in page_inline_formula_list:
+        bbox = _sidecar_bbox_to_page_bbox(formula.get("bbox"), page_size, render_scale)
+        if bbox is None:
+            continue
+        page_spans.append(
+            Span(
+                type=ContentType.INLINE_EQUATION,
+                bbox=bbox,
+                content=str(formula.get("latex", "") or "").strip(),
+                score=float(formula.get("score", 0.0) or 0.0),
+            )
+        )
+
+    for ocr_res in page_ocr_res_list:
+        bbox = _sidecar_bbox_to_page_bbox(ocr_res.get("bbox"), page_size, render_scale)
+        if bbox is None:
+            continue
+        page_spans.append(
+            Span(
+                type=ContentType.TEXT,
+                bbox=bbox,
+                content=str(ocr_res.get("text", "") or ""),
+                score=float(ocr_res.get("score", 0.0) or 0.0),
+            )
+        )
+    return page_spans
+
+
+def _fill_native_pdf_text_spans(
+    pdf_page: PDFPage,
+    page_spans: list[Span],
+    page_pil_image: Image.Image,
+    render_scale: float,
+    page_size: tuple[float, float],
+) -> list[Span]:
+    """复用原生 PDF 字符回填逻辑，并为内容不足的 span 准备后置 OCR 裁图。"""
+    page_width, page_height = page_size
+    virtual_block = (0, 0, page_width, page_height, None, None, None, BlockType.TEXT)
+    return txt_spans_extract(
+        pdf_page,
+        page_spans,
+        page_pil_image,
+        render_scale,
+        [virtual_block],
+        [],
+    )
+
+
+def _group_page_spans_by_block(
+    page_model_list: list[dict[str, Any]],
+    page_spans: list[Span],
+    page_size: tuple[float, float],
+    target_block_types: set[str],
+) -> tuple[dict[int, list[Line]], dict[int, BBox]]:
+    """按 block 原始顺序消费 span，并使用现有文本修复逻辑形成真实行。"""
+    span_matcher = SpanBlockMatcher(page_spans)
+    block_lines: dict[int, list[Line]] = {}
+    block_bboxes: dict[int, BBox] = {}
+    for block_idx, block_item in enumerate(page_model_list):
+        block_type = str(block_item.get("type") or block_item.get("label") or "")
+        if block_type not in target_block_types:
+            continue
+        block_bbox = _bbox_to_pixel_bbox(block_item.get("bbox"), page_size)
+        if block_bbox is None:
+            block_lines[block_idx] = []
+            continue
+
+        block_bboxes[block_idx] = block_bbox
+        fix_block = Block(
+            index=block_idx,
+            type=block_type,
+            bbox=block_bbox,
+            _fix_spans=span_matcher.collect_for_block(block_bbox),
+        )
+        block_lines[block_idx] = fix_text_block(fix_block).lines
+    return block_lines, block_bboxes
+
+
+def _apply_window_post_ocr(
+    local_model_context: HybridLocalModelContext,
+    block_lines: dict[int, list[Line]],
+) -> None:
+    """在当前窗口内识别原生字符不足的 span，保持 finalize 后置 OCR 的回退语义。"""
+    need_ocr_spans: list[Span] = []
+    img_crop_list: list[np.ndarray] = []
+    for lines in block_lines.values():
+        for line in lines:
+            for span in line.spans:
+                if span._np_img is None:
+                    continue
+                need_ocr_spans.append(span)
+                img_crop_list.append(rotate_vertical_crop_if_needed(span._np_img))
+                span._np_img = None
+
+    if not img_crop_list:
+        return
+    ocr_res_list = run_ocr_inference(
+        local_model_context.ocr_model.ocr,
+        img_crop_list,
+        det=False,
+        tqdm_enable=True,
+    )[0]
+    if len(ocr_res_list) != len(need_ocr_spans):
+        raise ValueError(
+            f"Hybrid post-OCR result count mismatch: ocr_res_list={len(ocr_res_list)}, need_ocr_spans={len(need_ocr_spans)}"
+        )
+
+    for span, ocr_res in zip(need_ocr_spans, ocr_res_list):
+        ocr_text, ocr_score = ocr_res
+        if ocr_score > OcrConfidence.min_confidence:
+            span.content = ocr_text
+            span.score = float(f"{ocr_score:.3f}")
+            _clear_post_ocr_fallback(span)
+        elif _restore_post_ocr_fallback(span):
+            continue
+        else:
+            span.content = ""
+            span.score = 0.0
+
+
+def _line_content_parts(line: Line) -> list[tuple[str, str]]:
+    """提取一行内可输出的文本与行内公式，公式统一包装为反斜杠圆括号格式。"""
+    parts: list[tuple[str, str]] = []
+    for span in line.spans:
+        if span.type == ContentType.TEXT:
+            content = str(span.content or "").strip()
+        elif span.type == ContentType.INLINE_EQUATION:
+            latex = str(span.content or "").strip()
+            content = f"\\({latex}\\)" if latex else ""
+        else:
+            continue
+        if content:
+            parts.append((span.type, content))
+    return parts
+
+
+def _should_join_hyphenated_lines(
+    previous_parts: list[tuple[str, str]],
+    current_parts: list[tuple[str, str]],
+) -> bool:
+    """判断相邻西文行是否属于行末断词，需要删除连字符后直接拼接。"""
+    if not previous_parts or not current_parts:
+        return False
+    previous_type, previous_content = previous_parts[-1]
+    current_type, current_content = current_parts[0]
+    return (
+        previous_type == ContentType.TEXT
+        and current_type == ContentType.TEXT
+        and is_hyphen_at_line_end(previous_content)
+        and bool(current_content)
+        and current_content[0].islower()
+    )
+
+
+def _lines_to_block_content(lines: list[Line], block_type: str) -> str:
+    """将真实行折叠为统一 block content，保留代码换行并处理自然语言跨行连接。"""
+    content_lines = [parts for line in lines if (parts := _line_content_parts(line))]
+    if not content_lines:
+        return ""
+
+    rendered_lines = [" ".join(content for _, content in parts) for parts in content_lines]
+    if block_type in CODE_CONTENT_BLOCK_TYPES:
+        return "\n".join(rendered_lines).strip()
+
+    text_for_language = "".join(
+        content for parts in content_lines for span_type, content in parts if span_type == ContentType.TEXT
+    )
+    block_language = detect_lang(text_for_language)
+    content_parts = [rendered_lines[0]]
+    for line_idx in range(1, len(rendered_lines)):
+        if block_language in CJK_LANGS:
+            separator = ""
+        elif _should_join_hyphenated_lines(content_lines[line_idx - 1], content_lines[line_idx]):
+            content_parts[-1] = content_parts[-1][:-1]
+            separator = ""
+        else:
+            separator = " "
+        content_parts.extend([separator, rendered_lines[line_idx]])
+    return "".join(content_parts).strip()
+
+
+def _build_ocr_det_line_items(lines: list[Line], page_size: tuple[float, float]) -> list[dict[str, Any]]:
+    """将内部 Line 转换为只含类型和归一化 bbox 的 block 内行级 sidecar。"""
+    line_items = []
+    for line in lines:
+        normalized_bbox = _page_bbox_to_unit_bbox(line.bbox, page_size)
+        if normalized_bbox is not None:
+            line_items.append({"type": "line", "bbox": normalized_bbox})
+    return line_items
+
+
+def _resolve_model_title_line_avg_height(lines: list[Line], block_bbox: BBox | None) -> int:
+    """根据标题 block 高宽比计算平均行尺寸，无有效行时回退到 block 对应尺寸。"""
+    if block_bbox is None or len(block_bbox) < 4:
+        return 0
+
+    block_width = max(0.0, block_bbox[2] - block_bbox[0])
+    block_height = max(0.0, block_bbox[3] - block_bbox[1])
+    # 复用 span 的严格竖排阈值，高宽比等于阈值时仍按横排标题处理。
+    is_vertical_title = (
+        block_width > 0 and block_height > 0 and block_height / block_width > VERTICAL_SPAN_HEIGHT_TO_WIDTH_RATIO_THRESHOLD
+    )
+
+    line_sizes = []
+    for line in lines:
+        bbox = line.bbox
+        if not bbox or len(bbox) < 4:
+            continue
+        line_size = bbox[2] - bbox[0] if is_vertical_title else bbox[3] - bbox[1]
+        if line_size > 0:
+            line_sizes.append(line_size)
+
+    if line_sizes:
+        return round(sum(line_sizes) / len(line_sizes))
+    return round(block_width if is_vertical_title else block_height)
+
+
+def _apply_block_content_and_line_metadata(
+    page_model_list: list[dict[str, Any]],
+    block_lines: dict[int, list[Line]],
+    block_bboxes: dict[int, BBox],
+    page_size: tuple[float, float],
+) -> None:
+    """将组行结果回填到 block，并只为 TEXT 保存行框、为标题保存平均行高。"""
+    for block_item in page_model_list:
+        block_type = str(block_item.get("type") or block_item.get("label") or "")
+        if block_type == BlockType.TEXT:
+            block_item["_ocr_det_lines"] = []
+        else:
+            block_item.pop("_ocr_det_lines", None)
+        if block_type not in TITLE_BLOCK_TYPES:
+            block_item.pop("_line_avg_height", None)
+
+    for block_idx, lines in block_lines.items():
+        block_item = page_model_list[block_idx]
+        block_type = str(block_item.get("type") or block_item.get("label") or "")
+        block_content = block_item.get("content")
+        has_nonempty_content = bool(block_content.strip()) if isinstance(block_content, str) else bool(block_content)
+        if not has_nonempty_content:
+            block_item["content"] = _lines_to_block_content(lines, block_type)
+
+        if block_type == BlockType.TEXT:
+            block_item["_ocr_det_lines"] = _build_ocr_det_line_items(lines, page_size)
+        elif block_type in TITLE_BLOCK_TYPES:
+            block_item["_line_avg_height"] = _resolve_model_title_line_avg_height(
+                lines,
+                block_bboxes.get(block_idx),
+            )
+
+
+def _fill_window_block_content_and_lines(
+    images_list: list[dict[str, Any]],
+    pdf_pages: list[PDFPage],
     model_list: list[list[dict[str, Any]]],
     inline_formula_list: list[list[dict[str, Any]]],
     ocr_res_list: list[list[dict[str, Any]]],
-    keep_ocr_text: bool = True,
+    parse_mode: Literal["txt", "ocr"],
+    ocr_det_type: set[str],
+    local_model_context: HybridLocalModelContext,
 ) -> list[list[dict[str, Any]]]:
-    merged_model_list: list[list[dict[str, Any]]] = []
-    for page_model_list, page_inline_formula_list, page_ocr_res_list in zip(model_list, inline_formula_list, ocr_res_list):
-        merged_page_model_list: list[dict[str, Any]] = list(page_model_list)
-        merged_page_model_list.extend(
-            _build_inline_formula_model_item(formula) for formula in page_inline_formula_list if formula.get("bbox") is not None
+    """按页完成 span 回填与行级元数据构造，返回不含页面级 sidecar 的 model list。"""
+    page_counts = {
+        "images": len(images_list),
+        "pdf_pages": len(pdf_pages),
+        "model_list": len(model_list),
+        "inline_formulas": len(inline_formula_list),
+        "ocr_results": len(ocr_res_list),
+    }
+    if len(set(page_counts.values())) != 1:
+        raise ValueError(f"Hybrid block content page count mismatch: {page_counts}")
+
+    target_block_types = set(ocr_det_type) | TITLE_BLOCK_TYPES | {BlockType.TEXT}
+    for image_dict, pdf_page, page_model_list, page_inline_formula_list, page_ocr_res_list in zip(
+        images_list,
+        pdf_pages,
+        model_list,
+        inline_formula_list,
+        ocr_res_list,
+    ):
+        page_pil_image = image_dict["img_pil"]
+        render_scale = float(image_dict["scale"])
+        page_size = tuple(float(value) for value in pdf_page.size)
+        page_spans = _build_page_text_formula_spans(
+            page_inline_formula_list,
+            page_ocr_res_list,
+            page_size,
+            render_scale,
         )
-        merged_page_model_list.extend(
-            _build_ocr_text_model_item(ocr_res, keep_text=keep_ocr_text)
-            for ocr_res in page_ocr_res_list
-            if ocr_res.get("bbox") is not None
+        if parse_mode == "txt":
+            page_spans = _fill_native_pdf_text_spans(
+                pdf_page,
+                page_spans,
+                page_pil_image,
+                render_scale,
+                page_size,
+            )
+
+        block_lines, block_bboxes = _group_page_spans_by_block(
+            page_model_list,
+            page_spans,
+            page_size,
+            target_block_types,
         )
-        merged_model_list.append(merged_page_model_list)
-    return merged_model_list
+        if parse_mode == "txt":
+            _apply_window_post_ocr(local_model_context, block_lines)
+        _apply_block_content_and_line_metadata(
+            page_model_list,
+            block_lines,
+            block_bboxes,
+            page_size,
+        )
+    return model_list
 
 
 def _medium_bbox_to_quad(bbox: list[float] | tuple[float, ...]) -> np.ndarray:
@@ -775,14 +1114,23 @@ def _apply_medium_formula_number_ocr(
 
 
 def _process_text_and_formulas(
-    images_pil_list: list[Image.Image],
+    images_list: list[dict[str, Any]],
+    pdf_pages: list[PDFPage],
     model_list: list[list[dict[str, Any]]],
     parse_mode: Literal["txt", "ocr"],
     effort: Literal["medium", "high", "xhigh"],
     local_model_context: HybridLocalModelContext,
     images_layout_res: list[list[dict[str, Any]]],
 ) -> list[list[dict[str, Any]]]:
-    """处理OCR和公式识别"""
+    """在当前窗口内完成 OCR、公式、原生文本及 block 行信息回填。"""
+
+    _validate_text_formula_window_inputs(
+        images_list,
+        pdf_pages,
+        model_list,
+        images_layout_res,
+    )
+    images_pil_list = [image_dict["img_pil"] for image_dict in images_list]
 
     # 遍历model_list,对文本块截图交由OCR识别
     # 根据 parse_mode 和 effort 决定需要ocr的文本块的类型以及只开det还是det+rec
@@ -841,13 +1189,16 @@ def _process_text_and_formulas(
     if need_rec_img:
         _apply_ocr_rec_results(local_model_context, ocr_res_list)
 
-    _normalize_bbox(inline_formula_list, ocr_res_list, images_pil_list)
-    merged_model_list = _merge_page_sidecar_items(
+    return _fill_window_block_content_and_lines(
+        images_list,
+        pdf_pages,
         model_list,
         inline_formula_list,
         ocr_res_list,
+        parse_mode,
+        ocr_det_type,
+        local_model_context,
     )
-    return merged_model_list
 
 
 def _collect_layout_doc_title_bboxes(layout_res: list[dict[str, Any]], page_size: tuple[int, int]) -> list[BBox]:
@@ -943,8 +1294,7 @@ def doc_analyze(
 
                     np_images = [np.asarray(pil_image).copy() for pil_image in images_pil_list]
                     images_layout_res = hybrid_model.layout_model.batch_predict(
-                        images_pil_list,
-                        batch_size=min(8, BATCH_RATIO * LAYOUT_BASE_BATCH_SIZE)
+                        images_pil_list, batch_size=min(8, BATCH_RATIO * LAYOUT_BASE_BATCH_SIZE)
                     )
 
                     # 使用小模型layout时对layout的表格做旋转检测
@@ -1008,7 +1358,8 @@ def doc_analyze(
                         raise ValueError(f"Unsupported parse mode: {parse_mode}")
 
                     window_model_list = _process_text_and_formulas(
-                        images_pil_list,
+                        images_list,
+                        pdf_pages,
                         window_model_list,
                         parse_mode,
                         effort,
@@ -1059,9 +1410,9 @@ def doc_analyze(
             pdf_doc.close()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     # pdf_path = "/Users/myhloli/pdf/截断合并/demo1-2.pdf"
-    pdf_path = "/Users/myhloli/pdf/png/shubiao.png"
+    pdf_path = "/Users/myhloli/pdf/png/2407.00079v4_origi-10.pdf"
     pdf_bytes = read_fn(pdf_path)
     middle_json, model_list = doc_analyze(pdf_bytes, effort="medium", image_analysis=True)
     logger.info(f"middle_json: {middle_json}")
