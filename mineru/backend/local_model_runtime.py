@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import threading
 from collections.abc import Callable
+from functools import cached_property
 from typing import Any
 
 import torch
@@ -264,6 +265,7 @@ class HybridLocalModelContextSingleton:
     def get_model(
         self,
     ) -> HybridLocalModelContext:
+        """获取并复用唯一的 Hybrid 本地模型上下文。"""
         with self._lock:
             if self._model is None:
                 self._model = HybridLocalModelContext()
@@ -290,6 +292,7 @@ class HybridLocalModelContext:
         self,
         device: str | None = None,
     ) -> None:
+        """初始化 Hybrid 基础运行时，其他模型在首次访问对应属性时加载。"""
         if device is not None:
             self.device: str = device
         else:
@@ -317,23 +320,35 @@ class HybridLocalModelContext:
         # 初始化layout模型，用于提供行内公式检测框和Hybrid标题拆分
         self.layout_model = self.get_layout_model()
 
-        # 初始化公式解析模型
-        self.mfr_model = self.get_mfr_model()
+    @cached_property
+    def mfr_model(self) -> UnimernetModel | FormulaRecognizer:
+        """首次访问时加载公式识别模型，并在当前 Context 内复用。"""
+        return self.get_mfr_model()
 
-        # 初始化无线表格识别模型
-        self.wireless_table_model = self.get_wireless_table_model()
+    @cached_property
+    def wireless_table_model(self) -> PaddleTableModel:
+        """首次访问时加载无线表格识别模型，并在当前 Context 内复用。"""
+        return self.get_wireless_table_model()
 
-        # 初始化有线表格识别模型
-        self.wired_table_model = self.get_wired_table_model()
+    @cached_property
+    def wired_table_model(self) -> UnetTableModel:
+        """首次访问时加载有线表格识别模型，并在当前 Context 内复用。"""
+        return self.get_wired_table_model()
 
-        # 初始化表格类型分类模型
-        self.table_cls_model = self.get_table_cls_model()
+    @cached_property
+    def table_cls_model(self) -> PaddleTableClsModel:
+        """首次访问时加载表格类型分类模型，并在当前 Context 内复用。"""
+        return self.get_table_cls_model()
 
-        # 初始化表格方向分类模型
-        self.table_orientation_cls_model = self.get_table_orientation_cls_model()
+    @cached_property
+    def table_orientation_cls_model(self) -> MineruTableOrientationClsModel:
+        """首次访问时加载基于 OCR 的表格方向包装器，并在当前 Context 内复用。"""
+        return self.get_table_orientation_cls_model()
 
-        # 初始化印章识别模型
-        self.seal_model = self.get_seal_ocr_model()
+    @cached_property
+    def seal_model(self) -> PytorchPaddleOCR:
+        """首次访问时加载印章 OCR 模型，并在当前 Context 内复用。"""
+        return self.get_seal_ocr_model()
 
     def get_ocr_model(
         self,

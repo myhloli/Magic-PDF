@@ -2076,8 +2076,8 @@ def doc_analyze(
 
 if __name__ == "__main__":
     # pdf_path = "/Users/myhloli/pdf/截断合并/demo1-3.pdf"
-    # pdf_path = "/Users/myhloli/pdf/png/20250911-100102.png"  # shubiao.png
-    pdf_path = "/Users/myhloli/pdf/纵向表格.pdf"
+    # pdf_path = "/Users/myhloli/pdf/png/shubiao.png"  # shubiao.png
+    pdf_path = "/Users/myhloli/pdf/demo1.pdf"
     pdf_bytes = read_fn(pdf_path)
     middle_json, model_list = doc_analyze(pdf_bytes, effort="low", image_analysis=True)
     logger.info(f"middle_json: {middle_json}")
