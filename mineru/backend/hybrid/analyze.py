@@ -62,7 +62,6 @@ TITLE_BLOCK_TYPES = {
 }
 CODE_CONTENT_BLOCK_TYPES = {
     BlockType.CODE,
-    BlockType.CODE_BODY,
     BlockType.ALGORITHM,
 }
 
@@ -1268,7 +1267,11 @@ def doc_analyze(
         if effort in ["high", "xhigh"]:
             vlm_runtime = _load_vlm_runtime()
             vlm_backend = get_vlm_engine(inference_engine="auto", is_async=False)
-            vlm_predictor = vlm_runtime["ModelSingleton"]().get_model(backend=vlm_backend)
+            vlm_predictor = vlm_runtime["ModelSingleton"]().get_model(
+                backend=vlm_backend,
+                model_path=None,
+                server_url=None,
+            )
             vlm_predictor = vlm_runtime["_maybe_enable_serial_execution"](vlm_predictor, vlm_backend)
         else:
             vlm_predictor = None
@@ -1414,6 +1417,6 @@ if __name__ == "__main__":
     # pdf_path = "/Users/myhloli/pdf/截断合并/demo1-2.pdf"
     pdf_path = "/Users/myhloli/pdf/png/2407.00079v4_origi-10.pdf"
     pdf_bytes = read_fn(pdf_path)
-    middle_json, model_list = doc_analyze(pdf_bytes, effort="medium", image_analysis=True)
+    middle_json, model_list = doc_analyze(pdf_bytes, effort="high", image_analysis=True)
     logger.info(f"middle_json: {middle_json}")
     logger.info(f"model_list: {model_list}")
