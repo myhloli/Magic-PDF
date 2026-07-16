@@ -417,5 +417,5 @@ class HybridLocalModelContext:
         """获取印章识别 OCR 原子模型"""
         return self.atom_model_manager.get_atom_model(
             atom_model_name=AtomicModel.OCR,
-            lang="seal_lite",
+            lang="seal",
         )
