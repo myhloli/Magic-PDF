@@ -1302,8 +1302,6 @@ def _apply_seal_ocr(
             seal_crop_bgr = cv2.cvtColor(seal_crop_rgb, cv2.COLOR_RGB2BGR)
             seal_ocr_results = local_model_context.seal_model.ocr(
                 seal_crop_bgr,
-                tqdm_enable=True,
-                tqdm_desc="OCR-seal",
             )
             seal_ocr_result = seal_ocr_results[0] if seal_ocr_results else []
 
@@ -2148,12 +2146,16 @@ def _apply_layout_title_split(
 def doc_analyze(
     pdf_bytes: bytes,
     effort: Literal["low", "medium", "high", "xhigh"] = "high",
+    parse_mode: Literal["auto", "txt", "ocr"] = "auto",
     image_analysis: bool = True,
     page_index_map: list[int] | None = None,
     image_cache: ImagePayloadCache | None = None,
 ) -> tuple[list[PageInfo], list[list[dict[str, Any]]]]:
     pdf_doc = PDFDocument(pdf_bytes)
-    parse_mode = pdf_doc.classify()
+    if parse_mode == "auto":
+        parse_mode = pdf_doc.classify()
+    if parse_mode not in ["txt", "ocr"]:
+        raise ValueError(f"parse_mode {parse_mode} is not supported")
 
     middle_json: list[PageInfo] = []
     model_list: list[list[dict[str, Any]]] = []
