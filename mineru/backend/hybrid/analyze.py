@@ -1,8 +1,10 @@
 # Copyright (c) Opendatalab. All rights reserved.
 import base64
 import html
+import math
 import os
 import time
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -18,7 +20,10 @@ from mineru.backend.local_model_runtime import (
     HybridLocalModelContextSingleton,
     run_ocr_inference,
 )
-from mineru.backend.utils.boxbase import calculate_overlap_area_2_minbox_area_ratio
+from mineru.backend.utils.boxbase import (
+    calculate_overlap_area_2_minbox_area_ratio,
+    calculate_overlap_area_in_bbox1_area_ratio,
+)
 from mineru.backend.utils.char_utils import is_hyphen_at_line_end
 from mineru.backend.utils.formula_number import optimize_hybrid_formula_number_blocks
 from mineru.backend.utils.runtime_utils import exclude_progress_bar_idle_time
@@ -65,6 +70,10 @@ MFR_BASE_BATCH_SIZE = 16
 OCR_DET_BASE_BATCH_SIZE = 8
 LAYOUT_TITLE_SPLIT_OVERLAP_THRESHOLD = 0.8
 BATCH_RATIO = 2
+TABLE_TEXT_LINE_OVERLAP_THRESHOLD = 0.5
+TABLE_TEXT_ORIENTATION_MIN_VALID_LINES = 3
+TABLE_TEXT_ORIENTATION_MIN_DOMINANCE_RATIO = 0.6
+TABLE_TEXT_ORIENTATION_ANGLES = frozenset({0, 90, 180, 270})
 CJK_LANGS = frozenset({"zh", "ja", "ko"})
 TITLE_BLOCK_TYPES = {
     BlockType.TITLE,
@@ -308,7 +317,7 @@ def _collect_table_items(
     np_images: list[np.ndarray],
 ) -> list[dict[str, Any]]:
     table_items = []
-    for layout_res, np_img in zip(images_layout_res, np_images):
+    for page_idx, (layout_res, np_img) in enumerate(zip(images_layout_res, np_images)):
         for table_res in layout_res:
             if table_res.get("label") != "table":
                 continue
@@ -319,6 +328,7 @@ def _collect_table_items(
                 {
                     "table_img": table_img,
                     "layout_item": table_res,
+                    "page_idx": page_idx,
                 }
             )
     return table_items
@@ -749,6 +759,155 @@ def _sidecar_bbox_to_page_bbox(
     if right <= left or bottom <= top:
         return None
     return (left, top, right, bottom)
+
+
+def _detect_table_angle_from_pdf_lines(
+    pdf_lines: list[dict[str, Any]],
+    table_bbox: BBox,
+) -> int | None:
+    """统计表格框内标准方向文本行，满足强众数门槛时返回表格角度。"""
+    angle_counts: Counter[int] = Counter()
+    for pdf_line in pdf_lines:
+        try:
+            raw_bbox = pdf_line.get("bbox")
+            line_bbox = getattr(raw_bbox, "bbox", raw_bbox)
+            if line_bbox is None or len(line_bbox) != 4:
+                continue
+            x0, y0, x1, y1 = [float(value) for value in line_bbox]
+            if x1 <= x0 or y1 <= y0:
+                continue
+
+            line_text = "".join(
+                str(pdf_span.get("text", "") or "")
+                for pdf_span in pdf_line.get("spans", [])
+            ).strip()
+            if not line_text:
+                continue
+
+            rotation = float(pdf_line.get("rotation", 0.0) or 0.0)
+        except (AttributeError, TypeError, ValueError):
+            continue
+
+        if (
+            calculate_overlap_area_in_bbox1_area_ratio(
+                (x0, y0, x1, y1),
+                table_bbox,
+            )
+            <= TABLE_TEXT_LINE_OVERLAP_THRESHOLD
+        ):
+            continue
+        if not _is_supported_rotation(rotation):
+            continue
+
+        angle = int(round(math.degrees(rotation))) % 360
+        if angle in TABLE_TEXT_ORIENTATION_ANGLES:
+            angle_counts[angle] += 1
+
+    valid_line_count = sum(angle_counts.values())
+    if valid_line_count < TABLE_TEXT_ORIENTATION_MIN_VALID_LINES:
+        return None
+
+    max_count = max(angle_counts.values())
+    dominant_angles = [angle for angle, count in angle_counts.items() if count == max_count]
+    if len(dominant_angles) != 1:
+        return None
+    if max_count / valid_line_count < TABLE_TEXT_ORIENTATION_MIN_DOMINANCE_RATIO:
+        return None
+    return dominant_angles[0]
+
+
+def _resolve_txt_table_orientations(
+    table_items: list[dict[str, Any]],
+    pdf_pages: list[PDFPage],
+    images_list: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """优先用原生 PDF 文本行写回表格角度，并返回需要视觉兜底的表格。"""
+    fallback_table_items: list[dict[str, Any]] = []
+    page_lines_cache: dict[int, list[dict[str, Any]] | None] = {}
+
+    for table_item in table_items:
+        page_idx = table_item.get("page_idx")
+        if (
+            not isinstance(page_idx, int)
+            or page_idx < 0
+            or page_idx >= len(pdf_pages)
+            or page_idx >= len(images_list)
+        ):
+            fallback_table_items.append(table_item)
+            continue
+
+        try:
+            pdf_page = pdf_pages[page_idx]
+            render_scale = float(images_list[page_idx].get("scale", 0) or 0)
+            table_bbox = _sidecar_bbox_to_page_bbox(
+                table_item["layout_item"].get("bbox"),
+                tuple(float(value) for value in pdf_page.size),
+                render_scale,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Hybrid txt table orientation falls back to visual model: "
+                f"page_idx={page_idx}, error={exc}"
+            )
+            fallback_table_items.append(table_item)
+            continue
+
+        if table_bbox is None:
+            fallback_table_items.append(table_item)
+            continue
+
+        if page_idx not in page_lines_cache:
+            try:
+                page_lines_cache[page_idx] = get_lines_from_chars(pdf_page.get_chars())
+            except Exception as exc:
+                logger.warning(
+                    "Hybrid txt table orientation falls back to visual model: "
+                    f"page_idx={page_idx}, error={exc}"
+                )
+                page_lines_cache[page_idx] = None
+
+        pdf_lines = page_lines_cache[page_idx]
+        if pdf_lines is None:
+            fallback_table_items.append(table_item)
+            continue
+
+        table_angle = _detect_table_angle_from_pdf_lines(pdf_lines, table_bbox)
+        if table_angle is None:
+            fallback_table_items.append(table_item)
+            continue
+        table_item["layout_item"]["angle"] = table_angle
+
+    return fallback_table_items
+
+
+def _apply_table_orientations(
+    table_items: list[dict[str, Any]],
+    parse_mode: Literal["txt", "ocr"],
+    pdf_pages: list[PDFPage],
+    images_list: list[dict[str, Any]],
+    hybrid_model: HybridLocalModelContext,
+) -> None:
+    """按解析模式写回表格角度，文本证据不足时批量调用视觉方向模型。"""
+    if parse_mode == "txt":
+        fallback_table_items = _resolve_txt_table_orientations(
+            table_items,
+            pdf_pages,
+            images_list,
+        )
+    elif parse_mode == "ocr":
+        fallback_table_items = table_items
+    else:
+        raise ValueError(f"Unsupported parse mode: {parse_mode}")
+
+    if not fallback_table_items:
+        return
+
+    rotate_labels = hybrid_model.table_orientation_cls_model.batch_predict(
+        fallback_table_items,
+        det_batch_size=BATCH_RATIO * OCR_DET_BASE_BATCH_SIZE,
+        tqdm_enable=True,
+    )
+    _apply_table_rotate_labels(fallback_table_items, rotate_labels)
 
 
 def _page_bbox_to_unit_bbox(bbox: BBox, page_size: tuple[float, float]) -> list[float] | None:
@@ -1955,12 +2114,13 @@ def doc_analyze(
                     if effort in ["low", "medium", "high"]:
                         table_items = _collect_table_items(images_layout_res, np_images)
                         if table_items:
-                            rotate_labels = hybrid_model.table_orientation_cls_model.batch_predict(
+                            _apply_table_orientations(
                                 table_items,
-                                det_batch_size=BATCH_RATIO * OCR_DET_BASE_BATCH_SIZE,
-                                tqdm_enable=True,
+                                parse_mode,
+                                pdf_pages,
+                                images_list,
+                                hybrid_model,
                             )
-                            _apply_table_rotate_labels(table_items, rotate_labels)
 
                     vl_style_layout_blocks = _build_vl_style_layout_blocks(images_layout_res, images_pil_list)
 
@@ -2076,7 +2236,7 @@ def doc_analyze(
 
 if __name__ == "__main__":
     # pdf_path = "/Users/myhloli/pdf/截断合并/demo1-3.pdf"
-    # pdf_path = "/Users/myhloli/pdf/png/shubiao.png"  # shubiao.png
+    # pdf_path = "/Users/myhloli/pdf/png/table_image3.png"  # shubiao.png
     pdf_path = "/Users/myhloli/pdf/demo1.pdf"
     pdf_bytes = read_fn(pdf_path)
     middle_json, model_list = doc_analyze(pdf_bytes, effort="low", image_analysis=True)
