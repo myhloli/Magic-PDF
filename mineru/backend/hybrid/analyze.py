@@ -1271,13 +1271,14 @@ def _apply_seal_ocr(
     model_list: list[list[dict[str, Any]]],
     np_images: list[np.ndarray],
 ) -> None:
-    """对 medium/high 最终 seal block 执行专用 OCR，并将多段文本按行写回 content。"""
+    """对 medium/high 最终 seal block 逐张执行专用 OCR，并将多段文本按行写回 content。"""
     if len(model_list) != len(np_images):
         raise ValueError(
             "Hybrid seal OCR page count mismatch: "
             f"model_list={len(model_list)}, images={len(np_images)}"
         )
 
+    seal_tasks: list[tuple[dict[str, Any], np.ndarray]] = []
     for page_model_list, np_img in zip(model_list, np_images):
         image_h, image_w = np_img.shape[:2]
         for block_item in page_model_list:
@@ -1300,25 +1301,34 @@ def _apply_seal_ocr(
                 continue
 
             seal_crop_bgr = cv2.cvtColor(seal_crop_rgb, cv2.COLOR_RGB2BGR)
-            seal_ocr_results = local_model_context.seal_model.ocr(
-                seal_crop_bgr,
-            )
-            seal_ocr_result = seal_ocr_results[0] if seal_ocr_results else []
+            seal_tasks.append((block_item, seal_crop_bgr))
 
-            seal_texts = []
-            for seal_item in seal_ocr_result or []:
-                if not isinstance(seal_item, (list, tuple)) or len(seal_item) != 2:
-                    continue
-                rec_result = seal_item[1]
-                if not isinstance(rec_result, (list, tuple)) or not rec_result:
-                    continue
-                seal_text = _normalize_medium_content(rec_result[0])
-                if seal_text:
-                    seal_texts.append(seal_text)
+    if not seal_tasks:
+        return
 
-            seal_content = "\n".join(seal_texts)
-            if seal_content:
-                block_item["content"] = seal_content
+    seal_model = local_model_context.seal_model
+    for block_item, seal_crop_bgr in tqdm(
+        seal_tasks,
+        total=len(seal_tasks),
+        desc="OCR-seal",
+    ):
+        seal_ocr_results = seal_model.ocr(seal_crop_bgr)
+        seal_ocr_result = seal_ocr_results[0] if seal_ocr_results else []
+
+        seal_texts = []
+        for seal_item in seal_ocr_result or []:
+            if not isinstance(seal_item, (list, tuple)) or len(seal_item) != 2:
+                continue
+            rec_result = seal_item[1]
+            if not isinstance(rec_result, (list, tuple)) or not rec_result:
+                continue
+            seal_text = _normalize_medium_content(rec_result[0])
+            if seal_text:
+                seal_texts.append(seal_text)
+
+        seal_content = "\n".join(seal_texts)
+        if seal_content:
+            block_item["content"] = seal_content
 
 
 def _table_bbox_center(bbox: BBox) -> tuple[float, float]:
@@ -2335,7 +2345,7 @@ def doc_analyze(
 
 if __name__ == "__main__":
     # pdf_path = "/Users/myhloli/pdf/截断合并/demo1-3.pdf"
-    pdf_path = "/Users/myhloli/pdf/png/seal2.jpg"  # shubiao.png
+    pdf_path = "/Users/myhloli/pdf/png/seal4.png"  # shubiao.png
     # pdf_path = "/Users/myhloli/pdf/demo1.pdf"
     pdf_bytes = read_fn(pdf_path)
     middle_json, model_list = doc_analyze(pdf_bytes, effort="medium")
