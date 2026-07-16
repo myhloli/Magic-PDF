@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import MISSING, Field, InitVar, dataclass, field, fields
-from typing import Any, Iterator, Literal, TypeAlias, TypeVar, get_type_hints
+from typing import Any, Iterator, Literal, TypeAlias, TypeVar, get_type_hints, TypedDict
 
 T = TypeVar("T", bound="_DocElement")
 
@@ -416,6 +416,14 @@ class Line(_DocElement):
 
 
 @dataclass
+class OcrDetLineItem(TypedDict):
+    """OCR 检测得到的归一化行框。"""
+
+    bbox: list[float]
+    type: Literal["line"]
+
+
+@dataclass
 class Block(_DocElement):
     """A layout block on a page.  May nest child blocks (e.g. list items, image body)."""
 
@@ -451,7 +459,7 @@ class Block(_DocElement):
     _merge_prev: bool = False
     _is_numbered_style: bool = False
     _lines_deleted: bool = False
-    _ocr_det_lines: list[Line] = field(default_factory=list)
+    _ocr_det_lines: list[OcrDetLineItem] = field(default_factory=list)
     _line_avg_height: int = 0
     _cell_merge: list[int] = field(default_factory=list)
     _fix_spans: list[Span] = field(default_factory=list)

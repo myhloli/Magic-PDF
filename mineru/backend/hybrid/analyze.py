@@ -129,7 +129,6 @@ PIPELINE_DET_TYPE = {
 VLM_TXT_DET_TYPE = NOT_EXTRACT_TYPES
 VLM_OCR_DET_TYPE = {
     BlockType.TEXT,
-    BlockType.TITLE,
     BlockType.DOC_TITLE,
     BlockType.PARAGRAPH_TITLE,
 }
@@ -2345,8 +2344,8 @@ def doc_analyze(
 
 if __name__ == "__main__":
     # pdf_path = "/Users/myhloli/pdf/截断合并/demo1-3.pdf"
-    pdf_path = "/Users/myhloli/pdf/png/seal4.png"  # shubiao.png
-    # pdf_path = "/Users/myhloli/pdf/demo1.pdf"
+    # pdf_path = "/Users/myhloli/pdf/png/seal4.png"  # shubiao.png
+    pdf_path = "/Users/myhloli/pdf/demo1.pdf"
     pdf_bytes = read_fn(pdf_path)
     middle_json, model_list = doc_analyze(pdf_bytes, effort="medium")
     logger.info(f"middle_json: {middle_json}")

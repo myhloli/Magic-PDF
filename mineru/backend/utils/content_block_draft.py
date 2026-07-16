@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from ...types import BBox
+from ...types import BBox, OcrDetLineItem
 
 
 @dataclass(slots=True)
@@ -18,6 +18,8 @@ class VlmContentBlockDraft:
     merge_prev: bool = False
     sub_type: str | None = None
     cell_merge: list[int] = field(default_factory=list)
+    ocr_det_lines: list[OcrDetLineItem] = field(default_factory=list)
+    line_avg_height: int = 0
 
     @classmethod
     def from_content_block(cls, content_block: Mapping[str, Any], width: int, height: int) -> VlmContentBlockDraft:
@@ -42,4 +44,6 @@ class VlmContentBlockDraft:
             merge_prev=bool(content_block.get("merge_prev", False)),
             sub_type=content_block.get("sub_type"),
             cell_merge=list(content_block.get("cell_merge") or []),
+            ocr_det_lines=content_block.get("_ocr_det_lines", []),
+            line_avg_height=content_block.get("_line_avg_height", 0),
         )

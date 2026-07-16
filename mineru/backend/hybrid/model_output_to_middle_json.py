@@ -44,19 +44,11 @@ def blocks_to_page_info(
     image_dict: dict[str, Any],
     pdf_page: PDFPage,
     page_index: int,
-    _ocr_enable: bool,
-    use_vlm_text_content: bool | None = None,
     image_cache: ImagePayloadCache | None = None,
-    _vlm_ocr_enable: bool | None = None,
 ) -> PageInfo:
     """将blocks转换为页面信息"""
-    if use_vlm_text_content is None:
-        use_vlm_text_content = bool(_vlm_ocr_enable)
-
-    page_model_list = optimize_hybrid_formula_number_blocks(page_model_list)
     scale = image_dict["scale"]
     page_pil_img = image_dict["img_pil"]
-    page_img_md5 = bytes_md5(page_pil_img.tobytes())
     page_size = getattr(pdf_page, "size", None)
     if page_size is None and hasattr(pdf_page, "get_size"):
         page_size = pdf_page.get_size()
@@ -64,14 +56,8 @@ def blocks_to_page_info(
 
     magic_model = MagicModel(
         page_model_list,
-        pdf_page,
-        scale,
-        page_pil_img,
         width,
         height,
-        _ocr_enable,
-        use_vlm_text_content,
-        image_cache=image_cache,
     )
     image_blocks = magic_model.get_image_blocks()
     table_blocks = magic_model.get_table_blocks()
