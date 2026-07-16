@@ -1266,12 +1266,12 @@ def _normalize_medium_content(value: Any) -> str:
     return ""
 
 
-def _medium_table_bbox_center(bbox: BBox) -> tuple[float, float]:
+def _table_bbox_center(bbox: BBox) -> tuple[float, float]:
     """计算 bbox 中心点，用于判断图片或公式应归属哪个表格。"""
     return (float(bbox[0]) + float(bbox[2])) / 2.0, (float(bbox[1]) + float(bbox[3])) / 2.0
 
 
-def _medium_table_bbox_intersection(bbox1: BBox, bbox2: BBox) -> BBox | None:
+def _table_bbox_intersection(bbox1: BBox, bbox2: BBox) -> BBox | None:
     """计算两个 bbox 的有效交集，无重叠时返回 None。"""
     x0 = max(float(bbox1[0]), float(bbox2[0]))
     y0 = max(float(bbox1[1]), float(bbox2[1]))
@@ -1282,12 +1282,12 @@ def _medium_table_bbox_intersection(bbox1: BBox, bbox2: BBox) -> BBox | None:
     return (x0, y0, x1, y1)
 
 
-def _select_medium_table_owner(
+def _select_table_owner(
     item_bbox: BBox,
     table_entries: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
-    """按中心点包含关系匹配表格，多表命中时选择交叠面积最大的表格。"""
-    center_x, center_y = _medium_table_bbox_center(item_bbox)
+    """为 low/medium 对象匹配所属表格，多表命中时选择交叠面积最大的表格。"""
+    center_x, center_y = _table_bbox_center(item_bbox)
     candidates: list[tuple[float, dict[str, Any]]] = []
     for table_entry in table_entries:
         table_bbox = table_entry["table_bbox"]
@@ -1296,7 +1296,7 @@ def _select_medium_table_owner(
             and float(table_bbox[1]) <= center_y <= float(table_bbox[3])
         ):
             continue
-        overlap_bbox = _medium_table_bbox_intersection(item_bbox, table_bbox)
+        overlap_bbox = _table_bbox_intersection(item_bbox, table_bbox)
         if overlap_bbox is None:
             continue
         overlap_area = float(overlap_bbox[2] - overlap_bbox[0]) * float(overlap_bbox[3] - overlap_bbox[1])
@@ -1356,7 +1356,7 @@ def _get_medium_table_virtual_image_bbox(
 ) -> BBox:
     """在图片中心生成小 OCR token 框，避免图片大框干扰单元格匹配。"""
     image_width, image_height = image_size
-    center_x, center_y = _medium_table_bbox_center(bbox)
+    center_x, center_y = _table_bbox_center(bbox)
     half_size = box_size / 2.0
     return (
         max(0.0, center_x - half_size),
@@ -1434,7 +1434,7 @@ def _collect_medium_table_tasks(
             image_bbox = _bbox_to_pixel_bbox(block.get("bbox"), page_size)
             if image_bbox is None:
                 continue
-            owner = _select_medium_table_owner(image_bbox, table_entries)
+            owner = _select_table_owner(image_bbox, table_entries)
             if owner is None:
                 continue
             owner["inline_objects"].append(
@@ -1451,7 +1451,7 @@ def _collect_medium_table_tasks(
             formula_bbox = _bbox_to_pixel_bbox(formula.get("bbox"), page_size)
             if formula_bbox is None:
                 continue
-            owner = _select_medium_table_owner(formula_bbox, table_entries)
+            owner = _select_table_owner(formula_bbox, table_entries)
             if owner is None:
                 continue
             owner["inline_objects"].append(
@@ -1477,7 +1477,7 @@ def _collect_medium_table_tasks(
             rotated_h, rotated_w = rotated_crop.shape[:2]
             prepared_objects: list[dict[str, Any]] = []
             for inline_object in table_entry["inline_objects"]:
-                overlap_bbox = _medium_table_bbox_intersection(inline_object["page_bbox"], table_bbox)
+                overlap_bbox = _table_bbox_intersection(inline_object["page_bbox"], table_bbox)
                 if overlap_bbox is None:
                     continue
                 relative_bbox = (
@@ -1715,6 +1715,40 @@ def _apply_medium_formula_number_ocr(
             block_item["content"] = normalized_text
 
 
+def _remove_low_table_inner_blocks(
+    images_list: list[dict[str, Any]],
+    model_list: list[list[dict[str, Any]]],
+) -> None:
+    """按表格中心点归属规则移除 low 表内图片、公式和公式编号块。"""
+    inner_block_types = {
+        BlockType.IMAGE,
+        BlockType.EQUATION,
+        BlockType.FORMULA_NUMBER,
+    }
+    for image_dict, page_model_list in zip(images_list, model_list):
+        page_size = _normalize_page_size(image_dict["img_pil"])
+        table_entries = []
+        for block in page_model_list:
+            if block.get("type") != BlockType.TABLE:
+                continue
+            table_bbox = _bbox_to_pixel_bbox(block.get("bbox"), page_size)
+            if table_bbox is not None:
+                table_entries.append({"table_bbox": table_bbox})
+
+        if not table_entries:
+            continue
+
+        retained_blocks = []
+        for block in page_model_list:
+            if block.get("type") not in inner_block_types:
+                retained_blocks.append(block)
+                continue
+            block_bbox = _bbox_to_pixel_bbox(block.get("bbox"), page_size)
+            if block_bbox is None or _select_table_owner(block_bbox, table_entries) is None:
+                retained_blocks.append(block)
+        page_model_list[:] = retained_blocks
+
+
 def _fill_low_table_contents(
     images_list: list[dict[str, Any]],
     pdf_pages: list[PDFPage],
@@ -1741,6 +1775,9 @@ def _fill_low_table_contents(
 
     if not table_entries:
         return
+
+    # 表格一旦认领内部对象便立即从 model_list 删除，后续文本回填失败也不恢复。
+    _remove_low_table_inner_blocks(images_list, model_list)
 
     if parse_mode == "txt":
         page_chars_cache: dict[int, list[Any]] = {}
