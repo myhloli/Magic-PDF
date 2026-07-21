@@ -4,15 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from ...types import Block, BlockType, PageInfo
-from ...utils.hash_utils import bytes_md5
+from ...types import BlockType, PageInfo
 from ...utils.image_payload import ImagePayloadCache
 from ...utils.pdf_document import PDFPage
 from ...utils.title_level_postprocess import apply_title_leveling_to_pdf_info
 from ...utils.backend_options import DEFAULT_HYBRID_EFFORT, LAYOUT_HYBRID_EFFORT, LOCAL_HYBRID_EFFORT, validate_effort
-from ..local_model_runtime import HybridLocalModelContext
-from ..utils.formula_number import optimize_hybrid_formula_number_blocks
-from ..utils.middle_json_utils import apply_post_ocr
 from ..utils.para_block_utils import (
     build_para_blocks_from_preproc,
     cleanup_internal_para_block_metadata,
@@ -20,24 +16,7 @@ from ..utils.para_block_utils import (
 )
 from ..utils.runtime_utils import cross_page_table_merge
 from ..utils.visual_span_utils import cut_visual_spans_in_blocks
-from .hybrid_magic_model import MagicModel
-
-
-def _resolve_title_line_avg_height(title_block: Block) -> int:
-    """解析标题平均行高：优先复用 Hybrid OCR det 行提示，再回退到原始行或块高。"""
-    for lines in [title_block._ocr_det_lines, title_block.lines]:
-        line_heights = []
-        for line in lines:
-            bbox = line.bbox
-            if not bbox or len(bbox) < 4:
-                continue
-            line_height = bbox[3] - bbox[1]
-            if line_height > 0:
-                line_heights.append(line_height)
-        if line_heights:
-            return round(sum(line_heights) / len(line_heights))
-    return int(title_block.bbox[3] - title_block.bbox[1])
-
+from .magic_model import MagicModel
 
 def blocks_to_page_info(
     page_model_list: list[dict[str, Any]],
@@ -69,10 +48,6 @@ def blocks_to_page_info(
     phonetic_blocks = magic_model.get_phonetic_blocks()
     list_blocks = magic_model.get_list_blocks()
 
-    # 标题平均行高是 finalized middle json 的稳定字段，供服务端和客户端标题分级共用。
-    for title_block in title_blocks:
-        title_block._line_avg_height = _resolve_title_line_avg_height(title_block)
-
     text_blocks = magic_model.get_text_blocks()
     interline_equation_blocks = magic_model.get_interline_equation_blocks()
 
@@ -97,7 +72,6 @@ def blocks_to_page_info(
     cut_visual_spans_in_blocks(
         [*page_blocks, *discarded_blocks],
         page_pil_img,
-        page_img_md5,
         page_index,
         scale=scale,
         image_cache=image_cache,
@@ -111,10 +85,6 @@ def blocks_to_page_info(
         _backend="hybrid",
     )
     return page_info
-
-
-def _apply_post_ocr(pages: list[PageInfo], local_context: HybridLocalModelContext) -> None:
-    apply_post_ocr(pages, local_context.ocr_model)
 
 
 def _normalize_split_title_blocks(pages: list[PageInfo]) -> None:
@@ -131,21 +101,6 @@ def _normalize_split_title_blocks(pages: list[PageInfo]) -> None:
                     continue
                 block.type = BlockType.TITLE
                 block.level = title_level
-
-
-def apply_server_side_postprocess(
-    pages: list[PageInfo],
-    local_context: HybridLocalModelContext,
-    _ocr_enable: bool,
-    use_vlm_text_content: bool | None = None,
-    *,
-    _vlm_ocr_enable: bool | None = None,
-) -> None:
-    """执行 Hybrid 只能在服务端完成的 post-OCR，避免客户端依赖本地 OCR 模型。"""
-    if use_vlm_text_content is None:
-        use_vlm_text_content = bool(_vlm_ocr_enable)
-    if not (use_vlm_text_content or _ocr_enable):
-        _apply_post_ocr(pages, local_context)
 
 
 def finalize_middle_json_from_preproc(pages: list[PageInfo], effort: str = DEFAULT_HYBRID_EFFORT) -> None:
@@ -167,15 +122,6 @@ def finalize_middle_json_from_preproc(pages: list[PageInfo], effort: str = DEFAU
 
 def finalize_middle_json(
     pages: list[PageInfo],
-    local_context: HybridLocalModelContext,
-    _ocr_enable: bool,
-    use_vlm_text_content: bool | None = None,
     effort: str = DEFAULT_HYBRID_EFFORT,
-    *,
-    _vlm_ocr_enable: bool | None = None,
 ) -> None:
-    """保持旧入口语义：服务端先做必要 post-OCR，再执行完整 finalize。"""
-    if use_vlm_text_content is None:
-        use_vlm_text_content = bool(_vlm_ocr_enable)
-    apply_server_side_postprocess(pages, local_context, _ocr_enable, use_vlm_text_content)
     finalize_middle_json_from_preproc(pages, effort=effort)

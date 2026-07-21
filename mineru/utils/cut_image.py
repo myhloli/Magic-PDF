@@ -14,14 +14,10 @@ from .pdf_reader import image_to_bytes
 def cut_image_and_table(
     span: Span,
     page_pil_img: Any,
-    page_img_md5: str,
     page_id: int,
-    scale: int = 2,
+    scale: float|int = 2,
     image_cache: ImagePayloadCache | None = None,
 ) -> Span:
-
-    def return_path(path_type: str) -> str:
-        return f"{path_type}/{page_img_md5}"
 
     span_type = span.type
 
@@ -29,7 +25,7 @@ def cut_image_and_table(
         span.image_path = ""
     else:
         filename = f"{page_id}_{int(span.bbox[0])}_{int(span.bbox[1])}_{int(span.bbox[2])}_{int(span.bbox[3])}"
-        path_key = f"{return_path(span_type)}_{filename}"
+        path_key = f"{span_type}_{filename}"
         crop_img = get_crop_img(span.bbox, page_pil_img, scale=scale)
         img_bytes = image_to_bytes(crop_img, image_format="JPEG")
         span.image_path = image_path_from_key(path_key, "jpg")

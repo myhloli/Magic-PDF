@@ -19,9 +19,8 @@ VISUAL_SPAN_TYPES = {
 def cut_visual_spans_in_blocks(
     blocks: list[Block],
     page_pil_img: Any,
-    page_img_md5: str,
     page_index: int,
-    scale: float = 2,
+    scale: float|int = 2,
     image_cache: ImagePayloadCache | None = None,
 ) -> None:
     """在最终 block tree 中裁剪视觉 span，避免 regroup/deepcopy 后 image_path 写回旧对象。"""
@@ -31,7 +30,6 @@ def cut_visual_spans_in_blocks(
                 cut_image_and_table(
                     span,
                     page_pil_img,
-                    page_img_md5,
                     page_index,
                     scale=scale,
                     image_cache=image_cache,

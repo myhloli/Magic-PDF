@@ -26,6 +26,7 @@ from mineru.backend.utils.boxbase import (
 )
 from mineru.backend.utils.char_utils import is_hyphen_at_line_end
 from mineru.backend.utils.formula_number import optimize_hybrid_formula_number_blocks
+from mineru.backend.utils.middle_json_utils import append_pages
 from mineru.backend.utils.runtime_utils import exclude_progress_bar_idle_time
 from mineru.backend.utils.span_block_fix import fix_text_block
 from mineru.backend.utils.span_orientation import VERTICAL_SPAN_HEIGHT_TO_WIDTH_RATIO_THRESHOLD
@@ -2313,11 +2314,8 @@ def doc_analyze(
                         window_model_list,
                         images_list,
                         pdf_doc,
-                        page_cvt_fn=blocks_to_page_info,
                         page_start_index=window.start,
                         page_index_map=page_index_map,
-                        _ocr_enable=_ocr_enable,
-                        use_vlm_text_content=use_vlm_text_content,
                         progress_bar=progress_bar,
                         image_cache=image_cache,
                     )
@@ -2343,9 +2341,9 @@ def doc_analyze(
 
 
 if __name__ == "__main__":
-    # pdf_path = "/Users/myhloli/pdf/截断合并/demo1-3.pdf"
+    pdf_path = "/Users/myhloli/pdf/截断合并/demo1-3.pdf"
     # pdf_path = "/Users/myhloli/pdf/png/seal4.png"  # shubiao.png
-    pdf_path = "/Users/myhloli/pdf/demo1.pdf"
+    # pdf_path = "/Users/myhloli/pdf/demo1.pdf"
     pdf_bytes = read_fn(pdf_path)
     middle_json, model_list = doc_analyze(pdf_bytes, effort="medium")
     logger.info(f"middle_json: {middle_json}")

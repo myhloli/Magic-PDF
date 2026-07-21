@@ -48,7 +48,7 @@ def image_path_from_data_uri(data_uri: str) -> str | None:
 def image_path_from_key(path_key: str, image_format: str = "JPEG") -> str:
     """复用旧裁图路径哈希规则，根据逻辑路径生成稳定图片文件名。"""
     ext = normalize_image_extension(image_format)
-    return f"{str_sha256(path_key)}.{ext}"
+    return f"{path_key}.{ext}"
 
 
 class ImagePayloadCache:
