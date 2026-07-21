@@ -390,7 +390,6 @@ class Span(_DocElement):
     image_path: str = ""
 
     # Internal
-    _cross_page: bool = False
     _np_img: Any = None
 
     _url: str = ""
@@ -406,13 +405,6 @@ class Line(_DocElement):
 
     bbox: BBox
     spans: list[Span] = field(default_factory=list)
-
-    # Internal
-    _is_list_start: bool = False
-    _is_list_end: bool = False
-
-    _code_type: str | None = None
-    _code_guess_lang: str | None = None
 
 
 @dataclass
@@ -433,6 +425,7 @@ class Block(_DocElement):
     bbox: BBox
     lines: list[Line] = field(default_factory=list)
     blocks: list[Block] = field(default_factory=list)
+    content: str = ""
 
     # Optional
     level: int | None = None
@@ -453,19 +446,11 @@ class Block(_DocElement):
     is_numbered_style: InitVar[bool] = False
 
     # Internal
-    _cross_page: bool = False
-    _angle: int | None = None
-    _layout_score: float | None = None
-    _merge_prev: bool = False
-    _is_numbered_style: bool = False
-    _lines_deleted: bool = False
     _ocr_det_lines: list[OcrDetLineItem] = field(default_factory=list)
     _line_avg_height: int = 0
     _cell_merge: list[int] = field(default_factory=list)
     _fix_spans: list[Span] = field(default_factory=list)
     _list_attribute: str = ""
-    _page_num: int | None = None
-    _page_size: tuple[float, float] | None = None
     _bbox_fs: BBox | None = None
     _sub_images: list[Block] = field(default_factory=list)
 
@@ -547,9 +532,7 @@ class PageInfo(_DocElement):
 
     page_idx: int
     page_size: tuple[int, int] | None = None
-    preproc_blocks: list[Block] = field(default_factory=list)
-    para_blocks: list[Block] = field(default_factory=list)
-    discarded_blocks: list[Block] = field(default_factory=list)
+    blocks: list[Block] = field(default_factory=list)
 
     # Temporary — will be removed once the render layer converges.
     _backend: Literal["hybrid", "office"] | None = None
