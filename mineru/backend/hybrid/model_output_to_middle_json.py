@@ -78,8 +78,7 @@ def blocks_to_page_info(
     )
 
     page_info = PageInfo(
-        preproc_blocks=page_blocks,
-        discarded_blocks=discarded_blocks,
+        blocks=[*page_blocks, *discarded_blocks],
         page_size=(width, height),
         page_idx=page_index,
         _backend="hybrid",
