@@ -1119,13 +1119,15 @@ def _lines_to_block_content(lines: list[Line], block_type: str) -> str:
 
 
 def _build_ocr_det_line_items(lines: list[Line], page_size: tuple[float, float]) -> list[dict[str, Any]]:
-    """将内部 Line 转换为只含类型和归一化 bbox 的 block 内行级 sidecar。"""
+    """将内部 Line 转换为归一化行框，并仅保留首尾有效行。"""
     line_items = []
     for line in lines:
         normalized_bbox = _page_bbox_to_unit_bbox(line.bbox, page_size)
         if normalized_bbox is not None:
             line_items.append({"type": "line", "bbox": normalized_bbox})
-    return line_items
+    if len(line_items) <= 2:
+        return line_items
+    return [line_items[0], line_items[-1]]
 
 
 def _resolve_model_title_line_avg_height(lines: list[Line], block_bbox: BBox | None) -> int:
@@ -2341,9 +2343,9 @@ def doc_analyze(
 
 
 if __name__ == "__main__":
-    pdf_path = "/Users/myhloli/pdf/截断合并/demo1-3.pdf"
+    # pdf_path = "/Users/myhloli/pdf/截断合并/demo1-3.pdf"
     # pdf_path = "/Users/myhloli/pdf/png/seal4.png"  # shubiao.png
-    # pdf_path = "/Users/myhloli/pdf/demo1.pdf"
+    pdf_path = "/Users/myhloli/pdf/demo1.pdf"
     pdf_bytes = read_fn(pdf_path)
     middle_json, model_list = doc_analyze(pdf_bytes, effort="medium")
     logger.info(f"middle_json: {middle_json}")
