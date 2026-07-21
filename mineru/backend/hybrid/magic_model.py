@@ -6,7 +6,7 @@ from typing import Any
 
 from loguru import logger
 
-from ...types import BBox, Block, BlockType, ContentType, Line, Span
+from ...types import Block, BlockType
 from ...utils.guess_suffix_or_lang import guess_language_by_text
 from ..utils.boxbase import calculate_overlap_area_in_bbox1_area_ratio
 from ..utils.content_block_draft import VlmContentBlockDraft
@@ -24,36 +24,8 @@ from ..utils.visual_magic_model_utils import (
 
 
 def _has_inline_formula_content(content: str | None) -> bool:
-    """判断 content 是否包含可安全拆分的成对行内公式标记。"""
+    """判断 content 是否包含成对行内公式标记，用于 code/algorithm 分类。"""
     return bool(content) and content.count("\\(") == content.count("\\)") and content.count("\\(") > 0
-
-
-def _split_inline_formula_content_to_spans(content: str | None, bbox: BBox) -> list[Span]:
-    """按 \\(...\\) 将文本拆成普通文本 span 和行内公式 span。"""
-    if not content:
-        return []
-
-    spans: list[Span] = []
-    last_end = 0
-    for match in re.finditer(r"\\\((.+?)\\\)", content):
-        start, end = match.span()
-        if start > last_end:
-            text_before = content[last_end:start]
-            if text_before.strip():
-                spans.append(Span(type=ContentType.TEXT, bbox=bbox, content=text_before))
-
-        formula = match.group(1).strip()
-        if formula:
-            spans.append(Span(type=ContentType.INLINE_EQUATION, bbox=bbox, content=formula))
-
-        last_end = end
-
-    if last_end < len(content):
-        text_after = content[last_end:]
-        if text_after.strip():
-            spans.append(Span(type=ContentType.TEXT, bbox=bbox, content=text_after))
-
-    return spans
 
 
 def _copy_raw_text_block_metadata(draft: VlmContentBlockDraft, block: Block) -> None:
@@ -73,6 +45,7 @@ class MagicModel:
         self.height = height
 
         blocks: list[Block] = []
+        code_metadata_by_index: dict[int, tuple[str, str]] = {}
 
         # 解析每个块
         for index, block_info in enumerate(page_model_list):
@@ -81,7 +54,7 @@ class MagicModel:
                 block_bbox = draft.bbox
                 block_type = draft.raw_type
                 raw_block_type = draft.raw_type
-                block_content = draft.content
+                block_content = draft.content or ""
                 block_angle = draft.angle
                 block_sub_type = draft.sub_type if raw_block_type in ["image", "chart"] else None
             except Exception as e:
@@ -89,7 +62,6 @@ class MagicModel:
                 logger.warning(f"Invalid block format: {block_info}, error: {e}")
                 continue
 
-            span_type = ""
             code_block_sub_type = None
             guess_lang = None
 
@@ -99,16 +71,12 @@ class MagicModel:
                 block_type = BlockType.FOOTNOTE
             elif block_type == "image":
                 block_type = BlockType.IMAGE_BODY
-                span_type = ContentType.IMAGE
             elif block_type == "image_block":
                 block_type = IMAGE_BLOCK_BODY
-                span_type = ContentType.IMAGE
             elif block_type == "table":
                 block_type = BlockType.TABLE_BODY
-                span_type = ContentType.TABLE
             elif block_type == "chart":
                 block_type = BlockType.CHART_BODY
-                span_type = ContentType.CHART
             elif block_type in ["code", "algorithm"]:
                 block_content = code_content_clean(block_content)
                 code_block_sub_type = block_type
@@ -116,60 +84,29 @@ class MagicModel:
                 guess_lang = guess_language_by_text(block_content)
             elif block_type == "equation":
                 block_type = BlockType.INTERLINE_EQUATION
-                span_type = ContentType.INTERLINE_EQUATION
 
-            # code 和 algorithm 类型的块，如果内容中包含行内公式，则需要将块类型切换为 algorithm
-            switch_code_to_algorithm = False
-
-            span = None
-            if span_type in [ContentType.IMAGE, ContentType.TABLE, ContentType.CHART]:
-                span = Span(type=span_type, bbox=block_bbox)
-                if raw_block_type in ["table", "image", "chart"] and block_content is not None:
-                    span.content = block_content
-            elif span_type == ContentType.INTERLINE_EQUATION:
-                span = Span(
-                    type=span_type,
-                    bbox=block_bbox,
-                    content=isolated_formula_clean(block_content or ""),
-                )
-            else:
-                # 所有文本块都直接消费 block content。
+            if raw_block_type == "equation":
+                block_content = isolated_formula_clean(block_content)
+            elif raw_block_type not in ["image", "image_block", "table", "chart"]:
+                # 文本类块继续沿用现有 content 清洗规则，但不再拆分为 line/span。
                 if block_content:
-                    block_content = clean_content(block_content)
+                    block_content = clean_content(block_content) or ""
 
                 if block_type in [BlockType.TITLE, BlockType.DOC_TITLE, BlockType.PARAGRAPH_TITLE] and block_content:
                     block_content = re.sub(r"\n\s*", " ", block_content).strip()
 
-                if _has_inline_formula_content(block_content):
-                    if block_type == BlockType.CODE_BODY and code_block_sub_type == "code":
-                        switch_code_to_algorithm = True
-                    span = _split_inline_formula_content_to_spans(block_content, block_bbox)
-                else:
-                    span = Span(
-                        type=ContentType.TEXT,
-                        bbox=block_bbox,
-                        content=block_content or "",
-                    )
-
-            if span is None:
-                continue
-            if isinstance(span, Span):
-                spans = [span]
-            elif isinstance(span, list):
-                spans = span
-            else:
-                raise ValueError(f"Invalid span type: {span_type}, expected dict or list, got {type(span)}")
-
-            if block_type == BlockType.CODE_BODY:
-                if switch_code_to_algorithm and code_block_sub_type == "code":
+                if (
+                    block_type == BlockType.CODE_BODY
+                    and code_block_sub_type == "code"
+                    and _has_inline_formula_content(block_content)
+                ):
                     code_block_sub_type = "algorithm"
-                line = Line(spans=spans, bbox=block_bbox, _code_type=code_block_sub_type, _code_guess_lang=guess_lang)
-            else:
-                line = Line(spans=spans, bbox=block_bbox)
 
-            block = Block(index=index, type=block_type, bbox=block_bbox, lines=[line], angle=block_angle)
+            block = Block(index=index, type=block_type, bbox=block_bbox, content=block_content, angle=block_angle)
             if block_sub_type:
                 block.sub_type = block_sub_type
+            if block_type == BlockType.CODE_BODY and code_block_sub_type:
+                code_metadata_by_index[index] = (code_block_sub_type, guess_lang or "")
             if raw_block_type == "table" and draft.cell_merge:
                 block._cell_merge = draft.cell_merge
             if block_type == BlockType.TEXT:
@@ -236,18 +173,9 @@ class MagicModel:
         self.code_blocks = visual_groups[BlockType.CODE]
 
         for code_block in self.code_blocks:
-            for block in code_block.blocks:
-                if block.type == BlockType.CODE_BODY:
-                    if block.lines:
-                        line = block.lines[0]
-                        code_block.sub_type = line._code_type or ""
-                        line._code_type = None
-                        if code_block.sub_type == "code":
-                            code_block.guess_lang = line._code_guess_lang or ""
-                            line._code_guess_lang = None
-                    else:
-                        code_block.sub_type = "code"
-                        code_block.guess_lang = "txt"
+            code_block.sub_type, guess_lang = code_metadata_by_index.get(code_block.index, ("code", "txt"))
+            if code_block.sub_type == "code":
+                code_block.guess_lang = guess_lang
 
         for block in unmatched_child_blocks:
             block.type = BlockType.TEXT
