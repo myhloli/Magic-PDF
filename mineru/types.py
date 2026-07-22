@@ -531,7 +531,6 @@ class PageInfo(_DocElement):
     """Parsed content of a single page."""
 
     page_idx: int
-    page_size: tuple[int, int] | None = None
     blocks: list[Block] = field(default_factory=list)
 
     # Temporary — will be removed once the render layer converges.

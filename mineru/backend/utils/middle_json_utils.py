@@ -45,12 +45,9 @@ def append_pages(
         )
 
         if page_info is None:
-            page_w, page_h = map(int, pdf_page.size)
             page_info = PageInfo(
-                preproc_blocks=[],
+                blocks=[],
                 page_idx=output_page_idx,
-                page_size=(page_w, page_h),
-                discarded_blocks=[],
                 _backend=None,
             )
 

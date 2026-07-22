@@ -10,9 +10,9 @@ from .para_block_utils import iter_block_spans
 
 VISUAL_SPAN_TYPES = {
     ContentType.IMAGE,
-    ContentType.TABLE,
+    # ContentType.TABLE,
     ContentType.CHART,
-    ContentType.INTERLINE_EQUATION,
+    # ContentType.INTERLINE_EQUATION,
 }
 
 

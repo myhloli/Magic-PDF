@@ -79,27 +79,10 @@ def blocks_to_page_info(
 
     page_info = PageInfo(
         blocks=[*page_blocks, *discarded_blocks],
-        page_size=(width, height),
         page_idx=page_index,
         _backend="hybrid",
     )
     return page_info
-
-
-def _normalize_split_title_blocks(pages: list[PageInfo]) -> None:
-    """将Hybrid内部拆分标题统一为输出层通用title，并补齐默认标题层级。"""
-    title_type_to_level = {
-        BlockType.DOC_TITLE: 1,
-        BlockType.PARAGRAPH_TITLE: 2,
-    }
-    for page_info in pages:
-        for blocks in [page_info.preproc_blocks, page_info.para_blocks]:
-            for block in blocks:
-                title_level = title_type_to_level.get(block.type)
-                if title_level is None:
-                    continue
-                block.type = BlockType.TITLE
-                block.level = title_level
 
 
 def finalize_middle_json_from_preproc(pages: list[PageInfo], effort: str = DEFAULT_HYBRID_EFFORT) -> None:
@@ -115,7 +98,6 @@ def finalize_middle_json_from_preproc(pages: list[PageInfo], effort: str = DEFAU
     cross_page_table_merge(pages)
 
     apply_title_leveling_to_pdf_info(pages)
-    _normalize_split_title_blocks(pages)
     cleanup_internal_para_block_metadata(pages)
 
 
