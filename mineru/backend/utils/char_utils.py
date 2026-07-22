@@ -1,6 +1,9 @@
 # Copyright (c) Opendatalab. All rights reserved.
 import re
 
+# 中日韩文本的物理换行通常不需要插入额外空格，集中定义以供各后端和渲染器共享。
+CJK_LANGS = frozenset({"zh", "ja", "ko"})
+
 # PDF 文本抽取时，英文跨行断词可能被编码为多种 hyphen 字符。
 # 这里只用于判断“行末英文断词符”，不要扩展到 en/em dash 等普通破折号。
 LINE_END_HYPHEN_CHARS = "-\u00ad\u2010\u2011\u2043"
@@ -13,6 +16,29 @@ def is_hyphen_at_line_end(line: str) -> bool:
     只识别字母后紧跟行末 hyphen 的断词场景，不处理词内连字符或普通破折号。
     """
     return bool(LINE_END_HYPHEN_RE.search(line))
+
+
+def resolve_text_line_boundary(
+    previous_content: str,
+    *,
+    block_language: str,
+    next_starts_with_lowercase: bool,
+) -> tuple[str, str]:
+    """返回处理后的上一行内容和本次物理行边界分隔符。
+
+    CJK 文本直接连接物理行；普通西文行插入一个空格。西文行末如果是合法的
+    hyphen，则始终直接连接下一行，并仅在下一行以小写字母开头时删除 hyphen。
+    """
+    processed_content = previous_content.rstrip()
+    if not processed_content:
+        return "", ""
+    if block_language in CJK_LANGS:
+        return processed_content, ""
+    if not is_hyphen_at_line_end(processed_content):
+        return processed_content, " "
+    if next_starts_with_lowercase:
+        return processed_content[:-1], ""
+    return processed_content, ""
 
 
 def full_to_half_exclude_marks(text: str) -> str:

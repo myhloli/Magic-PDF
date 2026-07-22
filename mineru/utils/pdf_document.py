@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import math
 import os
 from contextlib import contextmanager
+from dataclasses import dataclass
 from io import BytesIO
 from typing import Any, Iterator, Literal, TypeAlias, cast
 
 import numpy as np
 import pypdfium2 as pdfium
+import pypdfium2.raw as pdfium_c
 from pdftext.pdf.chars import deduplicate_chars, get_chars
 from pdftext.pdf.pages import assign_scripts, get_lines, get_spans
 from pdftext.schema import Bbox, Char, Line
@@ -30,6 +33,13 @@ NEAR_IDENTICAL_CHAR_BBOX_TOLERANCE = 1.0
 OFFSET_DUPLICATE_CHAR_BBOX_TOLERANCE = 2.5
 OFFSET_DUPLICATE_TRANSLATION_TOLERANCE = 0.1
 OFFSET_DUPLICATE_MIN_BBOX_OVERLAP_RATIO = 0.45
+DRAWING_FORM_MAX_DEPTH = 15
+DRAWING_LINE_MERGE_TOLERANCE = 2.0
+DRAWING_LINE_AXIS_ABSOLUTE_TOLERANCE = 1.0
+DRAWING_LINE_AXIS_RATIO_TOLERANCE = 0.02
+DRAWING_LINE_MIN_LENGTH = 1.0
+DRAWING_THIN_RECT_MAX_THICKNESS = 2.0
+DRAWING_THIN_RECT_MIN_ASPECT_RATIO = 4.0
 
 try:
     from pdftext.pdf.chars import PageChars
@@ -53,6 +63,26 @@ class PDFPageImage:
     def __init__(self, pil_image: Image.Image, scale: float) -> None:
         self.pil_image = pil_image
         self.scale = scale
+
+
+@dataclass(frozen=True)
+class PDFDrawingLine:
+    """PDF 页面中可见的水平或竖直绘图线，坐标使用页面左上原点的 PDF point。"""
+
+    start: tuple[float, float]
+    end: tuple[float, float]
+    bbox: BBox
+    width: float
+    orientation: Literal["horizontal", "vertical"]
+
+
+@dataclass
+class _PathSubpath:
+    """保存一个 PDF Path 子路径的点、直线段和闭合状态。"""
+
+    points: list[tuple[float, float]]
+    straight_segments: list[tuple[tuple[float, float], tuple[float, float]]]
+    closed: bool = False
 
 
 class PDFPage:
@@ -165,7 +195,24 @@ class PDFDocument:
         with self._open_page(page_idx) as page:
             # rect: (left, bottom, right, top)
             rect: tuple[float, float, float, float] = page.get_bbox()
-        return (abs(rect[2] - rect[0]), abs(rect[1] - rect[3]))
+            try:
+                page_rotation = int(page.get_rotation()) % 360
+            except Exception:
+                page_rotation = 0
+        width = abs(rect[2] - rect[0])
+        height = abs(rect[1] - rect[3])
+        # PDFium 文本与渲染坐标已经应用页面旋转，页面尺寸必须使用相同视觉方向。
+        return (height, width) if page_rotation in {90, 270} else (width, height)
+
+    def page_rotation(self, page_idx: int) -> Literal[0, 90, 180, 270]:
+        """在线程锁保护下返回 PDF 页面字典声明的标准旋转角度。"""
+
+        with self._open_page(page_idx) as page:
+            try:
+                rotation = int(page.get_rotation()) % 360
+            except Exception:
+                rotation = 0
+        return rotation if rotation in {0, 90, 180, 270} else 0
 
     # ------------------------------------------------------------------ #
     #  Rendering
@@ -261,6 +308,20 @@ class PDFDocument:
         return text or ""
 
     # ------------------------------------------------------------------ #
+    #  Drawing geometry
+    # ------------------------------------------------------------------ #
+
+    def get_page_drawing_lines(self, page_idx: int) -> list[PDFDrawingLine]:
+        """提取页面中可见的水平、竖直绘图线，并转换为页面左上原点坐标。"""
+        with self._open_page(page_idx) as page:
+            page_bbox = _normalize_pdf_page_bbox(page.get_bbox())
+            try:
+                page_rotation = int(page.get_rotation()) % 360
+            except Exception:
+                page_rotation = 0
+            return _extract_page_drawing_lines(page, page_bbox, page_rotation)
+
+    # ------------------------------------------------------------------ #
     #  Classification
     # ------------------------------------------------------------------ #
 
@@ -333,6 +394,539 @@ class PDFDocument:
                 yield page
             finally:
                 _try_close(page)
+
+
+def _normalize_pdf_page_bbox(bbox: tuple[float, float, float, float]) -> BBox:
+    """规范化 PDFium 页面框，兼容上下坐标顺序相反的测试或异常文档。"""
+    x0, y0, x1, y1 = (float(value) for value in bbox)
+    return min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)
+
+
+def _drawing_page_size(page_bbox: BBox, page_rotation: int) -> tuple[float, float]:
+    """根据未旋转页面框和页面旋转角计算左上坐标系中的页面尺寸。"""
+    width = page_bbox[2] - page_bbox[0]
+    height = page_bbox[3] - page_bbox[1]
+    if page_rotation in (90, 270):
+        return height, width
+    return width, height
+
+
+def _transform_drawing_point(
+    point: tuple[float, float],
+    page_bbox: BBox,
+    page_rotation: int,
+) -> tuple[float, float]:
+    """把 PDF 底左原点坐标转换为应用页面旋转后的左上原点坐标。"""
+    x, y = point
+    left, bottom, right, top = page_bbox
+    if page_rotation == 90:
+        return y - bottom, x - left
+    if page_rotation == 180:
+        return right - x, y - bottom
+    if page_rotation == 270:
+        return top - y, right - x
+    return x - left, top - y
+
+
+def _multiply_pdf_matrices(
+    first: tuple[float, float, float, float, float, float],
+    second: tuple[float, float, float, float, float, float],
+) -> tuple[float, float, float, float, float, float]:
+    """按 PDF 行向量约定合并对象矩阵与父 Form 矩阵。"""
+    a1, b1, c1, d1, e1, f1 = first
+    a2, b2, c2, d2, e2, f2 = second
+    return (
+        a1 * a2 + b1 * c2,
+        a1 * b2 + b1 * d2,
+        c1 * a2 + d1 * c2,
+        c1 * b2 + d1 * d2,
+        e1 * a2 + f1 * c2 + e2,
+        e1 * b2 + f1 * d2 + f2,
+    )
+
+
+def _apply_pdf_matrix(
+    point: tuple[float, float],
+    matrix: tuple[float, float, float, float, float, float],
+) -> tuple[float, float]:
+    """将 PDF 仿射矩阵应用到一个路径点。"""
+    x, y = point
+    a, b, c, d, e, f = matrix
+    return a * x + c * y + e, b * x + d * y + f
+
+
+def _get_raw_object_matrix(raw_obj: Any) -> tuple[float, float, float, float, float, float] | None:
+    """读取一个原始 PDFium 页面对象矩阵，读取失败时返回 None。"""
+    matrix = pdfium_c.FS_MATRIX()
+    try:
+        ok = pdfium_c.FPDFPageObj_GetMatrix(raw_obj, ctypes.byref(matrix))
+    except Exception:
+        return None
+    if not ok:
+        return None
+    return (
+        float(matrix.a),
+        float(matrix.b),
+        float(matrix.c),
+        float(matrix.d),
+        float(matrix.e),
+        float(matrix.f),
+    )
+
+
+def _walk_raw_path_objects(
+    container: Any,
+    *,
+    is_form: bool,
+    parent_matrix: tuple[float, float, float, float, float, float],
+    depth: int,
+) -> Iterator[tuple[Any, tuple[float, float, float, float, float, float]]]:
+    """递归遍历页面或 Form 中的 Path，并携带累积到页面坐标的矩阵。"""
+    if depth >= DRAWING_FORM_MAX_DEPTH:
+        return
+
+    count_objects = pdfium_c.FPDFFormObj_CountObjects if is_form else pdfium_c.FPDFPage_CountObjects
+    get_object = pdfium_c.FPDFFormObj_GetObject if is_form else pdfium_c.FPDFPage_GetObject
+    try:
+        object_count = int(count_objects(container))
+    except Exception:
+        return
+    if object_count < 0:
+        return
+
+    for object_index in range(object_count):
+        try:
+            raw_obj = get_object(container, object_index)
+            if not raw_obj:
+                continue
+            object_type = int(pdfium_c.FPDFPageObj_GetType(raw_obj))
+            object_matrix = _get_raw_object_matrix(raw_obj)
+            if object_matrix is None:
+                continue
+            combined_matrix = _multiply_pdf_matrices(object_matrix, parent_matrix)
+        except Exception:
+            # 单个损坏页面对象不能中断同页其他绘图线提取。
+            continue
+
+        if object_type == pdfium_c.FPDF_PAGEOBJ_PATH:
+            yield raw_obj, combined_matrix
+        elif object_type == pdfium_c.FPDF_PAGEOBJ_FORM:
+            yield from _walk_raw_path_objects(
+                raw_obj,
+                is_form=True,
+                parent_matrix=combined_matrix,
+                depth=depth + 1,
+            )
+
+
+def _iter_raw_path_objects(
+    page: pdfium.PdfPage,
+) -> Iterator[tuple[Any, tuple[float, float, float, float, float, float]]]:
+    """从页面根对象开始遍历全部 Path，包括嵌套 Form 中的 Path。"""
+    identity = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+    yield from _walk_raw_path_objects(
+        page,
+        is_form=False,
+        parent_matrix=identity,
+        depth=0,
+    )
+
+
+def _get_raw_object_alpha(raw_obj: Any, color_getter: Any) -> int:
+    """读取对象颜色 alpha；旧 PDFium 或读取失败时按不透明处理。"""
+    red = ctypes.c_uint()
+    green = ctypes.c_uint()
+    blue = ctypes.c_uint()
+    alpha = ctypes.c_uint()
+    try:
+        ok = color_getter(
+            raw_obj,
+            ctypes.byref(red),
+            ctypes.byref(green),
+            ctypes.byref(blue),
+            ctypes.byref(alpha),
+        )
+    except Exception:
+        return 255
+    return int(alpha.value) if ok else 255
+
+
+def _get_path_visibility(raw_obj: Any) -> tuple[bool, bool]:
+    """分别判断 Path 的填充与描边是否实际可见。"""
+    fill_mode = ctypes.c_int()
+    stroke = ctypes.c_int()
+    try:
+        ok = pdfium_c.FPDFPath_GetDrawMode(raw_obj, ctypes.byref(fill_mode), ctypes.byref(stroke))
+    except Exception:
+        return False, False
+    if not ok:
+        return False, False
+
+    fill_visible = (
+        fill_mode.value != pdfium_c.FPDF_FILLMODE_NONE and _get_raw_object_alpha(raw_obj, pdfium_c.FPDFPageObj_GetFillColor) > 0
+    )
+    stroke_visible = bool(stroke.value) and _get_raw_object_alpha(raw_obj, pdfium_c.FPDFPageObj_GetStrokeColor) > 0
+    return fill_visible, stroke_visible
+
+
+def _get_raw_stroke_width(raw_obj: Any) -> float:
+    """读取 Path 在对象局部坐标中的描边宽度。"""
+    stroke_width = ctypes.c_float()
+    try:
+        ok = pdfium_c.FPDFPageObj_GetStrokeWidth(raw_obj, ctypes.byref(stroke_width))
+    except Exception:
+        return 0.0
+    if not ok:
+        return 0.0
+    width = abs(float(stroke_width.value))
+    return width if math.isfinite(width) else 0.0
+
+
+def _get_segment_stroke_width(
+    raw_width: float,
+    start: tuple[float, float],
+    end: tuple[float, float],
+    matrix: tuple[float, float, float, float, float, float],
+) -> float:
+    """按线段局部法向量换算非等比矩阵下的实际描边宽度。"""
+    delta_x = end[0] - start[0]
+    delta_y = end[1] - start[1]
+    segment_length = math.hypot(delta_x, delta_y)
+    a, b, c, d, _, _ = matrix
+    if segment_length <= 0:
+        scale = math.sqrt(abs(a * d - b * c))
+    else:
+        normal_x = -delta_y / segment_length
+        normal_y = delta_x / segment_length
+        transformed_x = a * normal_x + c * normal_y
+        transformed_y = b * normal_x + d * normal_y
+        scale = math.hypot(transformed_x, transformed_y)
+    width = raw_width * scale
+    return width if math.isfinite(width) else 0.0
+
+
+def _read_raw_path_subpaths(raw_obj: Any) -> list[_PathSubpath]:
+    """读取 Path 段并拆为子路径，只把 LINETO 与闭合边记录为直线段。"""
+    try:
+        segment_count = int(pdfium_c.FPDFPath_CountSegments(raw_obj))
+    except Exception:
+        return []
+    if segment_count <= 0:
+        return []
+
+    subpaths: list[_PathSubpath] = []
+    current_subpath: _PathSubpath | None = None
+    current_point: tuple[float, float] | None = None
+    subpath_start: tuple[float, float] | None = None
+
+    for segment_index in range(segment_count):
+        try:
+            segment = pdfium_c.FPDFPath_GetPathSegment(raw_obj, segment_index)
+            if not segment:
+                continue
+            x = ctypes.c_float()
+            y = ctypes.c_float()
+            if not pdfium_c.FPDFPathSegment_GetPoint(segment, ctypes.byref(x), ctypes.byref(y)):
+                continue
+            point = (float(x.value), float(y.value))
+            segment_type = int(pdfium_c.FPDFPathSegment_GetType(segment))
+            segment_closes = bool(pdfium_c.FPDFPathSegment_GetClose(segment))
+        except Exception:
+            continue
+
+        if segment_type == pdfium_c.FPDF_SEGMENT_MOVETO:
+            if current_subpath is not None and current_subpath.points:
+                subpaths.append(current_subpath)
+            current_subpath = _PathSubpath(points=[point], straight_segments=[])
+            current_point = point
+            subpath_start = point
+        else:
+            if current_subpath is None:
+                current_subpath = _PathSubpath(points=[point], straight_segments=[])
+                current_point = point
+                subpath_start = point
+            else:
+                current_subpath.points.append(point)
+                if segment_type == pdfium_c.FPDF_SEGMENT_LINETO and current_point is not None:
+                    current_subpath.straight_segments.append((current_point, point))
+                current_point = point
+
+        if segment_closes and current_subpath is not None and current_point is not None and subpath_start is not None:
+            if current_point != subpath_start:
+                current_subpath.straight_segments.append((current_point, subpath_start))
+            current_subpath.closed = True
+            current_point = subpath_start
+
+    if current_subpath is not None and current_subpath.points:
+        subpaths.append(current_subpath)
+    return subpaths
+
+
+def _transform_path_subpath(
+    subpath: _PathSubpath,
+    matrix: tuple[float, float, float, float, float, float],
+    page_bbox: BBox,
+    page_rotation: int,
+) -> _PathSubpath:
+    """将一个子路径从对象局部坐标转换为页面左上坐标。"""
+
+    def transform(point: tuple[float, float]) -> tuple[float, float]:
+        """先应用对象/Form 矩阵，再应用页面坐标与旋转转换。"""
+        return _transform_drawing_point(_apply_pdf_matrix(point, matrix), page_bbox, page_rotation)
+
+    return _PathSubpath(
+        points=[transform(point) for point in subpath.points],
+        straight_segments=[(transform(start), transform(end)) for start, end in subpath.straight_segments],
+        closed=subpath.closed,
+    )
+
+
+def _get_thin_filled_subpath_line(
+    subpath: _PathSubpath,
+    page_size: tuple[float, float],
+) -> PDFDrawingLine | None:
+    """把闭合的细长填充子路径折叠为一条中心线，避免把矩形四边重复输出。"""
+    if not subpath.closed or len(subpath.points) < 4:
+        return None
+    x_values = [point[0] for point in subpath.points]
+    y_values = [point[1] for point in subpath.points]
+    x0, x1 = min(x_values), max(x_values)
+    y0, y1 = min(y_values), max(y_values)
+    width = x1 - x0
+    height = y1 - y0
+    long_side = max(width, height)
+    short_side = min(width, height)
+    if (
+        long_side < DRAWING_LINE_MIN_LENGTH
+        or short_side > DRAWING_THIN_RECT_MAX_THICKNESS
+        or long_side < DRAWING_THIN_RECT_MIN_ASPECT_RATIO * max(short_side, 0.01)
+    ):
+        return None
+    if width >= height:
+        return _make_axis_drawing_line((x0, (y0 + y1) / 2), (x1, (y0 + y1) / 2), short_side, page_size)
+    return _make_axis_drawing_line(((x0 + x1) / 2, y0), ((x0 + x1) / 2, y1), short_side, page_size)
+
+
+def _make_axis_drawing_line(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    width: float,
+    page_size: tuple[float, float],
+) -> PDFDrawingLine | None:
+    """将近水平或近竖直线段吸附到坐标轴、裁剪到页面并生成公开结果。"""
+    page_width, page_height = page_size
+    x0, y0 = start
+    x1, y1 = end
+    if not all(math.isfinite(value) for value in (x0, y0, x1, y1, width)):
+        return None
+    delta_x = abs(x1 - x0)
+    delta_y = abs(y1 - y0)
+
+    if delta_x >= delta_y and delta_y <= max(
+        DRAWING_LINE_AXIS_ABSOLUTE_TOLERANCE,
+        delta_x * DRAWING_LINE_AXIS_RATIO_TOLERANCE,
+    ):
+        coordinate = (y0 + y1) / 2
+        if coordinate < 0 or coordinate > page_height:
+            return None
+        main_start = max(0.0, min(x0, x1))
+        main_end = min(page_width, max(x0, x1))
+        if main_end - main_start < DRAWING_LINE_MIN_LENGTH:
+            return None
+        line_width = max(0.0, width, delta_y)
+        half_width = line_width / 2
+        bbox = (
+            main_start,
+            max(0.0, coordinate - half_width),
+            main_end,
+            min(page_height, coordinate + half_width),
+        )
+        return PDFDrawingLine(
+            start=(main_start, coordinate),
+            end=(main_end, coordinate),
+            bbox=bbox,
+            width=line_width,
+            orientation="horizontal",
+        )
+
+    if delta_y > delta_x and delta_x <= max(
+        DRAWING_LINE_AXIS_ABSOLUTE_TOLERANCE,
+        delta_y * DRAWING_LINE_AXIS_RATIO_TOLERANCE,
+    ):
+        coordinate = (x0 + x1) / 2
+        if coordinate < 0 or coordinate > page_width:
+            return None
+        main_start = max(0.0, min(y0, y1))
+        main_end = min(page_height, max(y0, y1))
+        if main_end - main_start < DRAWING_LINE_MIN_LENGTH:
+            return None
+        line_width = max(0.0, width, delta_x)
+        half_width = line_width / 2
+        bbox = (
+            max(0.0, coordinate - half_width),
+            main_start,
+            min(page_width, coordinate + half_width),
+            main_end,
+        )
+        return PDFDrawingLine(
+            start=(coordinate, main_start),
+            end=(coordinate, main_end),
+            bbox=bbox,
+            width=line_width,
+            orientation="vertical",
+        )
+    return None
+
+
+def _extract_path_drawing_lines(
+    raw_obj: Any,
+    matrix: tuple[float, float, float, float, float, float],
+    page_bbox: BBox,
+    page_rotation: int,
+) -> list[PDFDrawingLine]:
+    """从单个 Path 提取可见直线，坏 Path 返回空结果且不影响同页其他对象。"""
+    fill_visible, stroke_visible = _get_path_visibility(raw_obj)
+    if not fill_visible and not stroke_visible:
+        return []
+
+    page_size = _drawing_page_size(page_bbox, page_rotation)
+    raw_stroke_width = _get_raw_stroke_width(raw_obj) if stroke_visible else 0.0
+    drawing_lines: list[PDFDrawingLine] = []
+    for raw_subpath in _read_raw_path_subpaths(raw_obj):
+        subpath = _transform_path_subpath(raw_subpath, matrix, page_bbox, page_rotation)
+        if fill_visible:
+            filled_line = _get_thin_filled_subpath_line(subpath, page_size)
+            if filled_line is not None:
+                drawing_lines.append(filled_line)
+                # 细长填充矩形已经折叠为中心线，不再输出其描边四条边。
+                continue
+        if not stroke_visible:
+            continue
+        for (raw_start, raw_end), (segment_start, segment_end) in zip(
+            raw_subpath.straight_segments,
+            subpath.straight_segments,
+        ):
+            stroke_width = _get_segment_stroke_width(raw_stroke_width, raw_start, raw_end, matrix)
+            drawing_line = _make_axis_drawing_line(segment_start, segment_end, stroke_width, page_size)
+            if drawing_line is not None:
+                drawing_lines.append(drawing_line)
+    return drawing_lines
+
+
+def _line_axis_coordinate(line: PDFDrawingLine) -> float:
+    """返回绘图线在垂直于自身方向的轴坐标。"""
+    return line.start[1] if line.orientation == "horizontal" else line.start[0]
+
+
+def _line_main_interval(line: PDFDrawingLine) -> tuple[float, float]:
+    """返回绘图线沿自身方向的起止区间。"""
+    if line.orientation == "horizontal":
+        return line.start[0], line.end[0]
+    return line.start[1], line.end[1]
+
+
+def _combine_collinear_line_group(
+    lines: list[PDFDrawingLine],
+    page_size: tuple[float, float],
+) -> PDFDrawingLine | None:
+    """把坐标接近且区间相连的一组线合并为一条稳定中心线。"""
+    orientation = lines[0].orientation
+    intervals = [_line_main_interval(line) for line in lines]
+    lengths = [max(end - start, 0.01) for start, end in intervals]
+    coordinates = [_line_axis_coordinate(line) for line in lines]
+    total_length = sum(lengths)
+    coordinate = sum(value * length for value, length in zip(coordinates, lengths)) / total_length
+    coordinate_span = max(coordinates) - min(coordinates)
+    width = max(max(line.width for line in lines), coordinate_span + max(line.width for line in lines))
+    main_start = min(start for start, _ in intervals)
+    main_end = max(end for _, end in intervals)
+    if orientation == "horizontal":
+        return _make_axis_drawing_line((main_start, coordinate), (main_end, coordinate), width, page_size)
+    return _make_axis_drawing_line((coordinate, main_start), (coordinate, main_end), width, page_size)
+
+
+def _merge_orientation_lines(
+    lines: list[PDFDrawingLine],
+    page_size: tuple[float, float],
+) -> list[PDFDrawingLine]:
+    """按轴坐标聚类，再合并间距不超过约 2pt 的同方向线段。"""
+    if not lines:
+        return []
+    coordinate_clusters: list[list[PDFDrawingLine]] = []
+    for line in sorted(lines, key=lambda item: (_line_axis_coordinate(item), _line_main_interval(item)[0])):
+        if (
+            not coordinate_clusters
+            or _line_axis_coordinate(line) - min(_line_axis_coordinate(item) for item in coordinate_clusters[-1])
+            > DRAWING_LINE_MERGE_TOLERANCE
+        ):
+            coordinate_clusters.append([line])
+        else:
+            coordinate_clusters[-1].append(line)
+
+    merged: list[PDFDrawingLine] = []
+    for cluster in coordinate_clusters:
+        interval_group: list[PDFDrawingLine] = []
+        interval_end = -math.inf
+        for line in sorted(cluster, key=lambda item: _line_main_interval(item)[0]):
+            line_start, line_end = _line_main_interval(line)
+            if interval_group and line_start > interval_end + DRAWING_LINE_MERGE_TOLERANCE:
+                combined = _combine_collinear_line_group(interval_group, page_size)
+                if combined is not None:
+                    merged.append(combined)
+                interval_group = []
+                interval_end = -math.inf
+            interval_group.append(line)
+            interval_end = max(interval_end, line_end)
+        if interval_group:
+            combined = _combine_collinear_line_group(interval_group, page_size)
+            if combined is not None:
+                merged.append(combined)
+    return merged
+
+
+def _merge_collinear_drawing_lines(
+    lines: list[PDFDrawingLine],
+    page_size: tuple[float, float],
+) -> list[PDFDrawingLine]:
+    """合并水平和竖直共线段，并按页面视觉位置稳定排序。"""
+    horizontal = _merge_orientation_lines(
+        [line for line in lines if line.orientation == "horizontal"],
+        page_size,
+    )
+    vertical = _merge_orientation_lines(
+        [line for line in lines if line.orientation == "vertical"],
+        page_size,
+    )
+    return sorted(
+        [*horizontal, *vertical],
+        key=lambda line: (line.bbox[1], line.bbox[0], line.orientation),
+    )
+
+
+def _extract_page_drawing_lines(
+    page: pdfium.PdfPage,
+    page_bbox: BBox,
+    page_rotation: int,
+) -> list[PDFDrawingLine]:
+    """在调用方持有 PDFium 锁时提取整页绘图线，并隔离单个对象异常。"""
+    drawing_lines: list[PDFDrawingLine] = []
+    for raw_obj, matrix in _iter_raw_path_objects(page):
+        try:
+            drawing_lines.extend(
+                _extract_path_drawing_lines(
+                    raw_obj,
+                    matrix,
+                    page_bbox,
+                    page_rotation,
+                )
+            )
+        except Exception:
+            # PDFium 遇到个别损坏 Path 时，保留同页其他对象的有效结果。
+            continue
+    return _merge_collinear_drawing_lines(
+        drawing_lines,
+        _drawing_page_size(page_bbox, page_rotation),
+    )
 
 
 def _try_close(obj: object) -> None:

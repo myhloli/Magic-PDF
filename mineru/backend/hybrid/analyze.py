@@ -24,7 +24,8 @@ from mineru.backend.utils.boxbase import (
     calculate_overlap_area_2_minbox_area_ratio,
     calculate_overlap_area_in_bbox1_area_ratio,
 )
-from mineru.backend.utils.char_utils import is_hyphen_at_line_end
+from mineru.backend.utils.char_utils import CJK_LANGS as CJK_LANGS
+from mineru.backend.utils.char_utils import resolve_text_line_boundary
 from mineru.backend.utils.formula_number import optimize_hybrid_formula_number_blocks
 from mineru.backend.utils.middle_json_utils import append_pages
 from mineru.backend.utils.runtime_utils import exclude_progress_bar_idle_time
@@ -75,7 +76,6 @@ TABLE_TEXT_LINE_OVERLAP_THRESHOLD = 0.5
 TABLE_TEXT_ORIENTATION_MIN_VALID_LINES = 3
 TABLE_TEXT_ORIENTATION_MIN_DOMINANCE_RATIO = 0.6
 TABLE_TEXT_ORIENTATION_ANGLES = frozenset({0, 90, 180, 270})
-CJK_LANGS = frozenset({"zh", "ja", "ko"})
 TITLE_BLOCK_TYPES = {
     BlockType.TITLE,
     BlockType.DOC_TITLE,
@@ -1073,24 +1073,6 @@ def _line_content_parts(line: Line) -> list[tuple[str, str]]:
     return parts
 
 
-def _should_join_hyphenated_lines(
-    previous_parts: list[tuple[str, str]],
-    current_parts: list[tuple[str, str]],
-) -> bool:
-    """判断相邻西文行是否属于行末断词，需要删除连字符后直接拼接。"""
-    if not previous_parts or not current_parts:
-        return False
-    previous_type, previous_content = previous_parts[-1]
-    current_type, current_content = current_parts[0]
-    return (
-        previous_type == ContentType.TEXT
-        and current_type == ContentType.TEXT
-        and is_hyphen_at_line_end(previous_content)
-        and bool(current_content)
-        and current_content[0].islower()
-    )
-
-
 def _lines_to_block_content(lines: list[Line], block_type: str) -> str:
     """将真实行折叠为统一 block content，保留代码换行并处理自然语言跨行连接。"""
     content_lines = [parts for line in lines if (parts := _line_content_parts(line))]
@@ -1107,13 +1089,17 @@ def _lines_to_block_content(lines: list[Line], block_type: str) -> str:
     block_language = detect_lang(text_for_language)
     content_parts = [rendered_lines[0]]
     for line_idx in range(1, len(rendered_lines)):
-        if block_language in CJK_LANGS:
-            separator = ""
-        elif _should_join_hyphenated_lines(content_lines[line_idx - 1], content_lines[line_idx]):
-            content_parts[-1] = content_parts[-1][:-1]
-            separator = ""
-        else:
-            separator = " "
+        current_type, current_content = content_lines[line_idx][0]
+        next_starts_with_lowercase = (
+            current_type == ContentType.TEXT
+            and bool(current_content)
+            and current_content[0].islower()
+        )
+        content_parts[-1], separator = resolve_text_line_boundary(
+            content_parts[-1],
+            block_language=block_language,
+            next_starts_with_lowercase=next_starts_with_lowercase,
+        )
         content_parts.extend([separator, rendered_lines[line_idx]])
     return "".join(content_parts).strip()
 

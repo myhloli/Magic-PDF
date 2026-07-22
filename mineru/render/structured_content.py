@@ -3,12 +3,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..backend.utils.char_utils import is_hyphen_at_line_end
+from ..backend.utils.char_utils import CJK_LANGS, resolve_text_line_boundary
 from ..types import BBox, Block, BlockType, ContentType, ContentTypeV2, IntBBox, Line
 from ..utils.language import detect_lang
 from .markdown import _get_title_level
 from .merge import (
-    CJK_LANGS,
     _collect_text_for_lang_detection,
     _next_line_starts_with_lowercase_text,
     _normalize_text_content,
@@ -510,15 +509,22 @@ def _render_text_span_content(
     is_last_span = span_idx == len(line.spans) - 1
     has_following_joinable_span = _has_following_joinable_span(para_block, line_idx, span_idx)
 
+    # 物理行末文本与 Markdown/Hybrid 共用同一套空格和断词规则。
+    if is_last_span:
+        processed_content, separator = resolve_text_line_boundary(
+            content,
+            block_language=block_lang,
+            next_starts_with_lowercase=_next_line_starts_with_lowercase_text(para_block, line_idx),
+        )
+        if has_following_joinable_span:
+            return f"{processed_content}{separator}"
+        return processed_content
+
     if block_lang in CJK_LANGS:
         if has_following_joinable_span and not is_last_span:
             return f"{content} "
         return content
 
-    if is_last_span and is_hyphen_at_line_end(content):
-        if _next_line_starts_with_lowercase_text(para_block, line_idx):
-            return content[:-1]
-        return content
     if has_following_joinable_span:
         return f"{content} "
     return content

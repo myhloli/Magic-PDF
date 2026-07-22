@@ -8,12 +8,10 @@ Markdown escaping.
 
 from __future__ import annotations
 
-from ..backend.utils.char_utils import full_to_half_exclude_marks, is_hyphen_at_line_end
+from ..backend.utils.char_utils import CJK_LANGS, full_to_half_exclude_marks, resolve_text_line_boundary
 from ..types import Block, BlockType, ContentType, Line, Span
 from ..utils.config_reader import get_latex_delimiter_config
 from ..utils.language import detect_lang
-
-CJK_LANGS = frozenset({"zh", "ja", "ko"})
 
 _default_delimiters = {"display": {"left": "$$", "right": "$$"}, "inline": {"left": "$", "right": "$"}}
 _latex_config = get_latex_delimiter_config() or _default_delimiters
@@ -172,6 +170,14 @@ def _join_rendered_span(
 
     is_last_span = bool(span_idx == len(line.spans) - 1)
 
+    # 物理行末的普通文本统一走共享边界规则；行内公式及同行 span 仍保留渲染器原有处理。
+    if is_last_span and span_type == ContentType.TEXT:
+        return resolve_text_line_boundary(
+            content,
+            block_language=block_lang,
+            next_starts_with_lowercase=_next_line_starts_with_lowercase_text(para_block, line_idx),
+        )
+
     # 中文/日语/韩文语境下，换行不需要空格分隔,但是如果是行内公式结尾，还是要加空格
     if block_lang in CJK_LANGS:
         if is_last_span and span_type != ContentType.INLINE_EQUATION:
@@ -180,11 +186,6 @@ def _join_rendered_span(
         return content, " "
 
     if span_type not in (ContentType.TEXT, ContentType.INLINE_EQUATION):
-        return content, ""
-
-    if is_last_span and span_type == ContentType.TEXT and is_hyphen_at_line_end(content):
-        if _next_line_starts_with_lowercase_text(para_block, line_idx):
-            return content[:-1], ""
         return content, ""
     # 西方文本语境下 content间需要空格分隔
     return content, " "

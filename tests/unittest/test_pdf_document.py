@@ -1,11 +1,67 @@
 from __future__ import annotations
 
+from io import BytesIO
 from typing import Any
 
+import pytest
+from pypdf import PdfReader, PdfWriter
 from pdftext.schema import Bbox
 from PIL import Image
+from reportlab.pdfgen.canvas import Canvas
 
 from mineru.utils import pdf_document
+
+
+def _build_drawing_pdf() -> bytes:
+    """构造包含描边、填充细矩形、相邻线段、Form 矩阵和斜线的测试 PDF。"""
+    output = BytesIO()
+    canvas = Canvas(output, pagesize=(100, 200))
+    canvas.setLineWidth(1)
+    canvas.line(10, 180, 90, 180)
+    canvas.line(10, 160, 50, 160)
+    canvas.line(51, 160, 90, 160)
+    canvas.rect(10, 139.5, 80, 0.5, stroke=0, fill=1)
+
+    canvas.beginForm("NestedLine", 0, 0, 20, 10)
+    canvas.setLineWidth(1)
+    canvas.line(0, 0, 20, 0)
+    canvas.endForm()
+    canvas.saveState()
+    canvas.translate(30, 100)
+    canvas.scale(2, 1)
+    canvas.doForm("NestedLine")
+    canvas.restoreState()
+
+    # alpha 为 0 的描边不可见，公共接口应过滤。
+    canvas.saveState()
+    canvas.setStrokeAlpha(0)
+    canvas.line(10, 120, 90, 120)
+    canvas.restoreState()
+
+    # 斜线不属于表格横竖线，公共接口应过滤。
+    canvas.line(10, 10, 90, 50)
+    canvas.save()
+    return output.getvalue()
+
+
+def _build_rotated_cropped_drawing_pdf() -> bytes:
+    """构造带 CropBox 与 90 度页面旋转的测试 PDF。"""
+    source = BytesIO()
+    canvas = Canvas(source, pagesize=(100, 200))
+    canvas.setLineWidth(2)
+    canvas.line(10, 20, 90, 20)
+    canvas.save()
+
+    reader = PdfReader(BytesIO(source.getvalue()))
+    page = reader.pages[0]
+    page.rotate(90)
+    page.cropbox.lower_left = (5, 10)
+    page.cropbox.upper_right = (95, 190)
+    writer = PdfWriter()
+    writer.add_page(page)
+    output = BytesIO()
+    writer.write(output)
+    return output.getvalue()
 
 
 class _TrackingLock:
@@ -19,7 +75,7 @@ class _TrackingLock:
         self.depth -= 1
 
 
-def test_pdf_document_methods_keep_page_access_inside_pdfium_lock(monkeypatch) -> None:
+def test_pdf_document_methods_keep_page_access_inside_pdfium_lock(monkeypatch: pytest.MonkeyPatch) -> None:
     lock = _TrackingLock()
     monkeypatch.setattr(pdf_document, "_pdfium_lock", lock)
 
@@ -87,9 +143,19 @@ def test_pdf_document_methods_keep_page_access_inside_pdfium_lock(monkeypatch) -
             }
         ]
 
+    def fake_extract_page_drawing_lines(
+        page: _FakePage,
+        page_bbox: tuple[float, float, float, float],
+        page_rotation: int,
+    ) -> list[pdf_document.PDFDrawingLine]:
+        """记录绘图对象遍历时仍由 PDFDocument 持有 PDFium 锁。"""
+        events.append(f"drawing_lines:{lock.depth}:{page_bbox}:{page_rotation}")
+        return []
+
     monkeypatch.setattr(pdf_document.pdfium, "PdfDocument", _FakeDoc)
     monkeypatch.setattr(pdf_document, "get_chars", fake_get_chars, raising=False)
     monkeypatch.setattr(pdf_document, "pdftext_get_chars", fake_get_chars, raising=False)
+    monkeypatch.setattr(pdf_document, "_extract_page_drawing_lines", fake_extract_page_drawing_lines)
 
     doc = pdf_document.PDFDocument(b"%PDF")
 
@@ -98,6 +164,7 @@ def test_pdf_document_methods_keep_page_access_inside_pdfium_lock(monkeypatch) -
     assert image.pil_image.size == (2, 2)
     assert image.scale == 3
     assert doc.get_page_chars(0)[0]["char"] == "A"
+    assert doc.get_page_drawing_lines(0) == []
 
     assert any(event.startswith("doc.open:") and not event.startswith("doc.open:0:") for event in events)
     assert any(event.startswith("doc.__getitem__:") and not event.startswith("doc.__getitem__:0:") for event in events)
@@ -109,6 +176,7 @@ def test_pdf_document_methods_keep_page_access_inside_pdfium_lock(monkeypatch) -
     assert "page.get_textpage:1" in events
     assert "get_chars:1:[0.0, 10.0, 20.0, 0.0]:0" in events
     assert "textpage.close:1" in events
+    assert "drawing_lines:1:(0.0, 0.0, 20.0, 10.0):0" in events
 
 
 def test_pdf_document_does_not_expose_legacy_compat_hooks() -> None:
@@ -117,3 +185,70 @@ def test_pdf_document_does_not_expose_legacy_compat_hooks() -> None:
     assert not hasattr(pdf_document, "get_text_quality_signal_pdfium")
     assert not hasattr(pdf_document.PDFDocument, "get_text_quality")
     assert pdf_document.PDFDocument._pdf_doc.fset is None
+
+
+def test_get_page_drawing_lines_extracts_forms_filled_rectangles_and_merges_segments() -> None:
+    """验证绘图线接口支持 Form、细长填充矩形、共线合并并过滤斜线。"""
+    with pdf_document.PDFDocument(_build_drawing_pdf()) as doc:
+        lines = doc.get_page_drawing_lines(0)
+
+    assert [line.orientation for line in lines] == ["horizontal"] * 4
+    assert [line.start for line in lines] == pytest.approx(
+        [
+            (10.0, 20.0),
+            (10.0, 40.0),
+            (10.0, 60.25),
+            (30.0, 100.0),
+        ]
+    )
+    assert [line.end for line in lines] == pytest.approx(
+        [
+            (90.0, 20.0),
+            (90.0, 40.0),
+            (90.0, 60.25),
+            (70.0, 100.0),
+        ]
+    )
+    assert [line.width for line in lines] == pytest.approx([1.0, 1.0, 0.5, 1.0])
+    assert lines[2].bbox == pytest.approx((10.0, 60.0, 90.0, 60.5))
+
+
+def test_get_page_drawing_lines_applies_crop_box_and_page_rotation() -> None:
+    """验证页面 CropBox 与 90 度旋转被转换为左上原点坐标。"""
+    with pdf_document.PDFDocument(_build_rotated_cropped_drawing_pdf()) as doc:
+        page_size = doc.page_size(0)
+        page_rotation = doc.page_rotation(0)
+        lines = doc.get_page_drawing_lines(0)
+
+    assert page_size == pytest.approx((180.0, 90.0))
+    assert page_rotation == 90
+    assert len(lines) == 1
+    line = lines[0]
+    assert line.orientation == "vertical"
+    assert line.start == pytest.approx((10.0, 5.0))
+    assert line.end == pytest.approx((10.0, 85.0))
+    assert line.bbox == pytest.approx((9.0, 5.0, 11.0, 85.0))
+    assert line.width == pytest.approx(2.0)
+
+
+def test_get_page_drawing_lines_skips_one_bad_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """验证单个 Path 解析异常不会丢失同页其他有效绘图线。"""
+    original_extract = pdf_document._extract_path_drawing_lines
+    call_count = 0
+
+    def flaky_extract(*args: Any, **kwargs: Any) -> list[pdf_document.PDFDrawingLine]:
+        """仅让首个 Path 失败，后续对象仍调用真实实现。"""
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise RuntimeError("broken path")
+        return original_extract(*args, **kwargs)
+
+    monkeypatch.setattr(pdf_document, "_extract_path_drawing_lines", flaky_extract)
+    with pdf_document.PDFDocument(_build_drawing_pdf()) as doc:
+        lines = doc.get_page_drawing_lines(0)
+
+    assert call_count >= 5
+    assert len(lines) == 3
+    assert all(line.start[1] != pytest.approx(20.0) for line in lines)
+    assert [line.start[1] for line in lines] == pytest.approx([40.0, 60.25, 100.0])
