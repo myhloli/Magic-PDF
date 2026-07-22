@@ -24,7 +24,6 @@ from mineru.backend.utils.boxbase import (
     calculate_overlap_area_2_minbox_area_ratio,
     calculate_overlap_area_in_bbox1_area_ratio,
 )
-from mineru.backend.utils.char_utils import CJK_LANGS as CJK_LANGS
 from mineru.backend.utils.char_utils import resolve_text_line_boundary
 from mineru.backend.utils.formula_number import optimize_hybrid_formula_number_blocks
 from mineru.backend.utils.middle_json_utils import append_pages
