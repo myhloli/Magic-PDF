@@ -260,13 +260,10 @@ class PdfHybridParser(PdfBaseParser):
             else _resolve_hybrid_backend(self.backend, is_async=False)
         )
         server_url = self.server_url if backend.endswith("client") else None
-        middle_json, model_list, _vlm_ocr_enable = hybrid_doc_analyze(
-            pdf_bytes,
-            backend=backend,
-            parse_method=self.method,
-            language=self.lang,
+        middle_json, model_list = hybrid_doc_analyze(
+            pdf_bytes=pdf_bytes,
             effort=self.effort,
-            server_url=server_url,
+            parse_mode=self.method,
             image_analysis=self.image_analysis,
             page_index_map=page_index_map,
             image_cache=image_cache,
