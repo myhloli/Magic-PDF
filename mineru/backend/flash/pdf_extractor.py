@@ -1608,7 +1608,12 @@ def _build_formula_like_blocks(
                     axis="y",
                 ) < 0.2:
                     continue
-                block = _formula_members_to_block(members, page_size, angle)
+                block = _formula_members_to_block(
+                    members,
+                    page_size,
+                    angle,
+                    anchor_source_index=anchor_line.source_index,
+                )
                 if block is None:
                     continue
                 blocks.append(block)
@@ -1819,12 +1824,47 @@ def _formula_lines_are_connected(
     return horizontal_overlap > 0.0 or horizontal_gap <= 1.5 * pair_height
 
 
+def _is_detached_formula_sidecar(
+    anchor: tuple[_LineItem, BBox],
+    members: list[tuple[_LineItem, BBox]],
+    median_height: float,
+) -> bool:
+    """仅依据 bbox 判断右侧锚点是否为与公式主体分离的窄幅 sidecar。"""
+
+    anchor_line, anchor_bbox = anchor
+    body_bboxes = [
+        bbox
+        for line, bbox in members
+        if line.source_index != anchor_line.source_index
+    ]
+    if not body_bboxes:
+        return False
+
+    body_bbox = _bbox_union_many(body_bboxes)
+    component_bbox = _bbox_union(body_bbox, anchor_bbox)
+    effective_height = max(0.1, median_height)
+    anchor_width = max(0.0, anchor_bbox[2] - anchor_bbox[0])
+    component_width = max(0.1, component_bbox[2] - component_bbox[0])
+    horizontal_gap = anchor_bbox[0] - body_bbox[2]
+    right_tolerance = max(0.5, 0.1 * effective_height)
+    minimum_gap = max(2.5 * effective_height, 0.08 * component_width)
+
+    return (
+        anchor_bbox[0] >= body_bbox[2]
+        and anchor_bbox[2] >= component_bbox[2] - right_tolerance
+        and anchor_width <= 2.0 * effective_height
+        and horizontal_gap > minimum_gap
+    )
+
+
 def _formula_members_to_block(
     members: list[tuple[_LineItem, BBox]],
     page_size: tuple[float, float],
     angle: int,
+    *,
+    anchor_source_index: int,
 ) -> dict[str, Any] | None:
-    """把公式空间分量按视觉行聚类，并使用几何空格生成普通 text block。"""
+    """把公式空间分量按视觉行聚类，并将非末视觉行的离散右侧 sidecar 后置。"""
 
     heights = [_line_effective_height(line, bbox) for line, bbox in members]
     median_height = statistics.median(heights) if heights else 1.0
@@ -1840,7 +1880,25 @@ def _formula_members_to_block(
         else:
             rows.append([member])
 
-    row_contents = [_join_formula_visual_row(row, page_size) for row in rows]
+    trailing_sidecar_content: str | None = None
+    # 右侧 sidecar 按视觉 y 常落在分式中部；仅在其后仍有公式行时转为逻辑末行。
+    for row_index, row in enumerate(rows[:-1]):
+        anchor_member = next(
+            (member for member in row if member[0].source_index == anchor_source_index),
+            None,
+        )
+        if anchor_member is None:
+            continue
+        if _is_detached_formula_sidecar(anchor_member, members, median_height):
+            rows[row_index] = [
+                member for member in row if member[0].source_index != anchor_source_index
+            ]
+            trailing_sidecar_content = anchor_member[0].text.strip()
+        break
+
+    row_contents = [_join_formula_visual_row(row, page_size) for row in rows if row]
+    if trailing_sidecar_content is not None:
+        row_contents.append(trailing_sidecar_content)
     content = _sanitize_pdf_control_text("\n".join(filter(None, row_contents)), preserve_newlines=True)
     if not content.strip():
         return None
