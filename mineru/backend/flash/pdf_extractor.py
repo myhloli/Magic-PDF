@@ -8,7 +8,6 @@ from __future__ import annotations
 import math
 import re
 import statistics
-from bisect import bisect_right
 from dataclasses import dataclass, field
 from typing import Any, Literal, Sequence
 
@@ -28,9 +27,9 @@ _TABLE_CAPTION_RE = re.compile(
     r"^(?:table|tab\.?|表格?)[\s:.–—-]*(?:\d+|[ivxlcdm]+|[一二三四五六七八九十]+)\b(?P<suffix>.*)$",
     re.IGNORECASE,
 )
-_NUMERIC_CELL_RE = re.compile(r"(?:\d|%|\bna\b|\bns\b)", re.IGNORECASE)
 _TABLE_NOTE_RE = re.compile(
     r"^(?:notes?|sources?)\b|^(?:注释?|说明)\s*[:：]?|^for\s+[*†‡]"
+    r"|^(?:\d+|[*†‡])\s+\S"
     r"|^(?:[*†‡]|[a-z]|p|t|ns|na)\s+(?:indicates?|denotes?|rainfall\b|total\b|low\b|for\b)",
     re.IGNORECASE,
 )
@@ -100,7 +99,7 @@ class _LocalAxisLine:
 
 @dataclass(slots=True)
 class _TableCandidate:
-    """保存已通过文本或线框规则的表格候选。"""
+    """保存已通过三横线与文本分布校验的表格候选。"""
 
     bbox: BBox
     local_bbox: BBox
@@ -547,7 +546,7 @@ def _analyze_page_source(source: _PageSource) -> list[dict[str, Any]]:
 
 
 def _detect_table_candidates(source: _PageSource) -> list[_TableCandidate]:
-    """融合多列文本稳定性与横竖线证据，生成高精度表格候选。"""
+    """按文本方向融合三条长横线与规则文本分布，生成表格候选。"""
 
     candidates: list[_TableCandidate] = []
     angles = sorted({line.angle for line in source.lines})
@@ -566,18 +565,7 @@ def _detect_table_candidates(source: _PageSource) -> list[_TableCandidate]:
             angle,
         )
         candidates.extend(
-            _build_text_table_candidates(
-                rows,
-                angle_lines,
-                source.page_size,
-                angle,
-                median_height,
-                local_axis_lines,
-            )
-        )
-        candidates.extend(
-            _build_grid_table_candidates(
-                fragments,
+            _build_rule_table_candidates(
                 rows,
                 angle_lines,
                 source.page_size,
@@ -667,7 +655,7 @@ def _cluster_fragment_rows(
     return rows
 
 
-def _build_text_table_candidates(
+def _build_rule_table_candidates(
     rows: list[_VisualRow],
     lines: list[_LineItem],
     page_size: tuple[float, float],
@@ -675,188 +663,238 @@ def _build_text_table_candidates(
     median_height: float,
     axis_lines: list[_LocalAxisLine],
 ) -> list[_TableCandidate]:
-    """从连续多列行中识别无边框或横线型表格。"""
-
-    candidate_rows = [row for row in rows if len(row.fragments) >= 2]
-    if len(candidate_rows) < 3:
-        return []
-    max_gap = max(4.0 * median_height, 8.0)
-    segments: list[list[_VisualRow]] = []
-    for row in candidate_rows:
-        if not segments or row.center_y - segments[-1][-1].center_y > max_gap:
-            segments.append([row])
-        else:
-            segments[-1].append(row)
+    """用三条长横线确定区域，再以连续多列文本分布确认表格。"""
 
     candidates: list[_TableCandidate] = []
-    for segment in segments:
-        if len(segment) < 3:
+    for rule_group in _group_long_horizontal_rules(axis_lines, median_height):
+        rule_bbox = _bbox_union_many([line.bbox for line in rule_group])
+        core_rows: list[_VisualRow] = []
+        for row in rows:
+            clipped_row = _clip_visual_row_to_corridor(row, rule_bbox, margin=0.0)
+            if clipped_row is not None and rule_bbox[1] <= clipped_row.center_y <= rule_bbox[3]:
+                core_rows.append(clipped_row)
+
+        dense_rows = _longest_dense_multi_cell_rows(core_rows, median_height)
+        if len(dense_rows) < 3:
             continue
-        core_bbox = _bbox_union_many([row.bbox for row in segment])
-        caption_line = _find_table_caption(lines, core_bbox, page_size, angle, median_height)
-        stable_columns, column_coverage = _count_stable_columns(segment, median_height)
-        multi_cell_ratio = sum(len(row.fragments) >= 3 for row in segment) / len(segment)
-        accepts_three_columns = stable_columns >= 3 and multi_cell_ratio >= 0.6
-        accepts_two_columns = (
-            stable_columns == 2
-            and column_coverage >= 0.7
-            and len(segment) >= 5
-            and (caption_line is not None or _two_column_data_row_ratio(segment) >= 0.5)
-        )
-        if not accepts_three_columns and not accepts_two_columns:
+        stable_columns, column_coverage = _count_stable_columns(dense_rows, median_height)
+        if stable_columns < 2 or column_coverage < 0.5:
             continue
 
-        candidate = _expand_text_candidate(
-            segment,
-            lines,
+        caption_line = _find_table_caption(lines, rule_bbox, page_size, angle, median_height)
+        candidate = _expand_rule_table_candidate(
+            rule_group,
+            core_rows,
+            rows,
             page_size,
             angle,
             median_height,
             caption_line,
         )
-        horizontal_count, vertical_count, intersection_count = _candidate_grid_evidence(
-            candidate.local_bbox,
-            axis_lines,
-            median_height,
-        )
-        # 横线型表格必须至少包含三条足够长的规则线，不再接纳无线多列文本。
-        if horizontal_count < 3:
-            continue
-        has_grid_evidence = horizontal_count >= 2 and vertical_count >= 2 and intersection_count >= 2
-        horizontal_rule_evidence = horizontal_count >= 3 and stable_columns >= 3
-        candidate.score = (
-            stable_columns * 2.0
-            + len(segment)
-            + multi_cell_ratio * 3.0
-            + (4.0 if has_grid_evidence else 0.0)
-            + (2.0 if horizontal_rule_evidence else 0.0)
-            + (1.0 if caption_line is not None else 0.0)
-        )
+        candidate.score = float(len(rule_group) + len(dense_rows) + stable_columns)
         candidates.append(candidate)
     return candidates
 
 
-def _expand_text_candidate(
+def _group_long_horizontal_rules(
+    axis_lines: list[_LocalAxisLine],
+    median_height: float,
+) -> list[list[_LocalAxisLine]]:
+    """按近似左右端点和纵向距离聚合长横线，并去除同位置重复路径。"""
+
+    minimum_length = max(40.0, 10.0 * median_height)
+    horizontal_lines = [
+        line for line in axis_lines if line.orientation == "horizontal" and line.bbox[2] - line.bbox[0] >= minimum_length
+    ]
+    endpoint_tolerance = max(4.0, 2.0 * median_height)
+    span_groups: list[list[_LocalAxisLine]] = []
+    for line in sorted(horizontal_lines, key=lambda item: (item.bbox[0], item.bbox[2], item.bbox[1])):
+        target = next(
+            (
+                group
+                for group in span_groups
+                if abs(line.bbox[0] - group[0].bbox[0]) <= endpoint_tolerance
+                and abs(line.bbox[2] - group[0].bbox[2]) <= endpoint_tolerance
+            ),
+            None,
+        )
+        if target is None:
+            span_groups.append([line])
+        else:
+            target.append(line)
+
+    output: list[list[_LocalAxisLine]] = []
+    maximum_vertical_gap = 24.0 * median_height
+    for span_group in span_groups:
+        vertical_groups: list[list[_LocalAxisLine]] = []
+        for line in sorted(span_group, key=lambda item: _bbox_center_y(item.bbox)):
+            if (
+                not vertical_groups
+                or _bbox_center_y(line.bbox) - _bbox_center_y(vertical_groups[-1][-1].bbox) > maximum_vertical_gap
+            ):
+                vertical_groups.append([line])
+            else:
+                vertical_groups[-1].append(line)
+
+        for vertical_group in vertical_groups:
+            unique_lines: list[_LocalAxisLine] = []
+            for line in vertical_group:
+                if any(abs(_bbox_center_y(line.bbox) - _bbox_center_y(item.bbox)) <= 1.0 for item in unique_lines):
+                    continue
+                unique_lines.append(line)
+            if len(unique_lines) >= 3:
+                output.append(unique_lines)
+    return output
+
+
+def _clip_visual_row_to_corridor(
+    row: _VisualRow,
+    corridor_bbox: BBox,
+    *,
+    margin: float,
+) -> _VisualRow | None:
+    """仅保留横向走廊内的片段，避免同基线的另一栏文本污染表格区域。"""
+
+    fragments = [
+        fragment
+        for fragment in row.fragments
+        if corridor_bbox[0] - margin <= _bbox_center_x(fragment.local_bbox) <= corridor_bbox[2] + margin
+    ]
+    if not fragments:
+        return None
+    fragments.sort(key=lambda fragment: fragment.local_bbox[0])
+    return _VisualRow(
+        fragments=fragments,
+        center_y=sum(_bbox_center_y(fragment.local_bbox) for fragment in fragments) / len(fragments),
+        bbox=_bbox_union_many([fragment.local_bbox for fragment in fragments]),
+        visual_row_id=row.visual_row_id,
+    )
+
+
+def _longest_dense_multi_cell_rows(
+    rows: list[_VisualRow],
+    median_height: float,
+) -> list[_VisualRow]:
+    """返回行距不超过四倍行高的最长连续多单元格文本段。"""
+
+    segments: list[list[_VisualRow]] = []
+    for row in (item for item in rows if len(item.fragments) >= 2):
+        if not segments or row.center_y - segments[-1][-1].center_y > 4.0 * median_height:
+            segments.append([row])
+        else:
+            segments[-1].append(row)
+    return max(segments, key=len, default=[])
+
+
+def _expand_rule_table_candidate(
+    rule_group: list[_LocalAxisLine],
     core_rows: list[_VisualRow],
-    lines: list[_LineItem],
+    all_rows: list[_VisualRow],
     page_size: tuple[float, float],
     angle: int,
     median_height: float,
     caption_line: _LineItem | None,
 ) -> _TableCandidate:
-    """将核心数据行向上扩展到标题和表头，向下吸收近邻注释。"""
+    """合并横线核心、上方标题和下方脚注，构造统一投影候选。"""
 
-    core_local_bbox = _bbox_union_many([row.bbox for row in core_rows])
-    local_bottom = core_local_bbox[3]
-    included: list[_LineItem] = []
+    rule_bbox = _bbox_union_many([line.bbox for line in rule_group])
     core_line_indices = {fragment.line_index for row in core_rows for fragment in row.fragments}
-    bridge_bottom = local_bottom
-    for line in lines:
-        local_bbox = _rotate_bbox_to_upright(line.bbox, page_size, angle)
-        center_y = _bbox_center_y(local_bbox)
-        horizontal_overlap = _bbox_axis_overlap_ratio(local_bbox, core_local_bbox, axis="x")
-        if line.source_index in core_line_indices or (
-            core_local_bbox[1] <= center_y <= local_bottom and horizontal_overlap >= 0.05
-        ):
-            included.append(line)
-
-    # 仅在核心表格上方两倍行高内吸收表头；远距离显式标题单独加入，不能吞掉桥接走廊正文。
-    # 表格注释可以有多个物理行，按相邻行间隙逐行向下扩展。
-    included_indices = {line.source_index for line in included}
-    upper_lines = sorted(
-        (
-            line
-            for line in lines
-            if line.source_index not in included_indices
-            and _rotate_bbox_to_upright(line.bbox, page_size, angle)[3] <= core_local_bbox[1]
-        ),
-        key=lambda line: _rotate_bbox_to_upright(line.bbox, page_size, angle)[3],
-        reverse=True,
+    caption_rows = _collect_caption_rows(all_rows, caption_line, rule_bbox, median_height)
+    footnote_rows = _collect_footnote_rows(
+        all_rows,
+        rule_bbox,
+        median_height,
+        core_line_indices,
     )
-    for line in upper_lines:
-        local_bbox = _rotate_bbox_to_upright(line.bbox, page_size, angle)
-        if core_local_bbox[1] - local_bbox[3] > 2.0 * median_height:
-            break
-        horizontal_overlap = _bbox_axis_overlap_ratio(local_bbox, core_local_bbox, axis="x")
-        if horizontal_overlap >= 0.05:
-            included.append(line)
-            included_indices.add(line.source_index)
-
-    caption_members = (
-        _table_caption_members(caption_line, lines, page_size, angle, median_height) if caption_line is not None else []
-    )
-    for caption_member in caption_members:
-        if caption_member.source_index not in included_indices:
-            included.append(caption_member)
-            included_indices.add(caption_member.source_index)
-
-    if caption_members:
-        caption_local_bbox = _bbox_union_many(
-            [_rotate_bbox_to_upright(member.bbox, page_size, angle) for member in caption_members]
-        )
-        caption_bridge_bottom = caption_local_bbox[3]
-        caption_member_indices = {member.source_index for member in caption_members}
-        bridge_lines = sorted(
-            (
-                line
-                for line in lines
-                if line.source_index not in caption_member_indices
-                and caption_local_bbox[1] <= _rotate_bbox_to_upright(line.bbox, page_size, angle)[1] <= core_local_bbox[1]
-            ),
-            key=lambda line: _rotate_bbox_to_upright(line.bbox, page_size, angle)[1],
-        )
-        # 显式标题与表格核心之间仅沿不超过两倍行高的连续文本链桥接，避免吸收大空隙后的正文。
-        pending_bridge_lines: list[_LineItem] = []
-        for line in bridge_lines:
-            local_bbox = _rotate_bbox_to_upright(line.bbox, page_size, angle)
-            gap = local_bbox[1] - caption_bridge_bottom
-            if gap > 2.0 * median_height:
-                break
-            horizontal_overlap = _bbox_axis_overlap_ratio(local_bbox, core_local_bbox, axis="x")
-            if gap >= -median_height and horizontal_overlap >= 0.05:
-                if line.source_index not in included_indices:
-                    pending_bridge_lines.append(line)
-                caption_bridge_bottom = max(caption_bridge_bottom, local_bbox[3])
-        if core_local_bbox[1] - caption_bridge_bottom <= 2.0 * median_height:
-            included.extend(pending_bridge_lines)
-            included_indices.update(line.source_index for line in pending_bridge_lines)
-
-    lower_lines = sorted(
-        (
-            line
-            for line in lines
-            if line.source_index not in included_indices
-            and _rotate_bbox_to_upright(line.bbox, page_size, angle)[1] >= local_bottom
-        ),
-        key=lambda line: _rotate_bbox_to_upright(line.bbox, page_size, angle)[1],
-    )
-    note_chain_started = False
-    for line in lower_lines:
-        local_bbox = _rotate_bbox_to_upright(line.bbox, page_size, angle)
-        horizontal_overlap = _bbox_axis_overlap_ratio(local_bbox, core_local_bbox, axis="x")
-        gap = local_bbox[1] - bridge_bottom
-        if gap > 2.0 * median_height:
-            break
-        if gap >= -median_height and horizontal_overlap >= 0.05:
-            if not note_chain_started and not _is_table_note_text(line.text):
-                break
-            note_chain_started = True
-            included.append(line)
-            included_indices.add(line.source_index)
-            bridge_bottom = max(bridge_bottom, local_bbox[3])
-
-    if not included:
-        included = [line for line in lines if line.source_index in core_line_indices]
-    original_bbox = _bbox_union_many([line.bbox for line in included])
-    local_bbox = _bbox_union_many([_rotate_bbox_to_upright(line.bbox, page_size, angle) for line in included])
+    included_rows = [*caption_rows, *core_rows, *footnote_rows]
+    core_local_bbox = _bbox_union(rule_bbox, _bbox_union_many([row.bbox for row in core_rows]))
+    local_bbox = _bbox_union(core_local_bbox, _bbox_union_many([row.bbox for row in included_rows]))
     return _TableCandidate(
-        bbox=original_bbox,
+        bbox=_rotate_bbox_from_upright(local_bbox, page_size, angle),
         local_bbox=local_bbox,
         angle=angle,
         score=0.0,
         core_bbox=_rotate_bbox_from_upright(core_local_bbox, page_size, angle),
-        line_indices={line.source_index for line in included},
+        line_indices={fragment.line_index for row in included_rows for fragment in row.fragments},
     )
+
+
+def _collect_caption_rows(
+    rows: list[_VisualRow],
+    caption_line: _LineItem | None,
+    rule_bbox: BBox,
+    median_height: float,
+) -> list[_VisualRow]:
+    """收集显式标题所在行及其到表格上边界之间的连续换行。"""
+
+    if caption_line is None:
+        return []
+    caption_row_index = next(
+        (
+            index
+            for index, row in enumerate(rows)
+            if any(fragment.line_index == caption_line.source_index for fragment in row.fragments)
+        ),
+        None,
+    )
+    if caption_row_index is None:
+        return []
+
+    output: list[_VisualRow] = []
+    previous_bbox: BBox | None = None
+    margin = 2.0 * median_height
+    for index, row in enumerate(rows[caption_row_index:], start=caption_row_index):
+        clipped_row = _clip_visual_row_to_corridor(row, rule_bbox, margin=margin)
+        if clipped_row is None:
+            continue
+        if index > caption_row_index and clipped_row.center_y >= rule_bbox[1]:
+            break
+        if previous_bbox is not None and max(0.0, clipped_row.bbox[1] - previous_bbox[3]) > 2.0 * median_height:
+            break
+        output.append(clipped_row)
+        previous_bbox = clipped_row.bbox
+
+    if not output or rule_bbox[1] - output[-1].bbox[3] > 2.0 * median_height:
+        return []
+    return output
+
+
+def _collect_footnote_rows(
+    rows: list[_VisualRow],
+    rule_bbox: BBox,
+    median_height: float,
+    core_line_indices: set[int],
+) -> list[_VisualRow]:
+    """从表格下边界开始吸收带通用标记的脚注及其连续换行。"""
+
+    output: list[_VisualRow] = []
+    bottom = rule_bbox[3]
+    note_chain_started = False
+    margin = 2.0 * median_height
+    selected_line_indices = set(core_line_indices)
+    for row in rows:
+        clipped_row = _clip_visual_row_to_corridor(row, rule_bbox, margin=margin)
+        if clipped_row is None or clipped_row.bbox[3] <= bottom:
+            continue
+        line_indices = {fragment.line_index for fragment in clipped_row.fragments}
+        if line_indices.issubset(selected_line_indices):
+            bottom = max(bottom, clipped_row.bbox[3])
+            continue
+        if max(0.0, clipped_row.bbox[1] - bottom) > 1.5 * median_height:
+            break
+        if not note_chain_started and not _is_table_note_text(_visual_row_text(clipped_row)):
+            break
+        output.append(clipped_row)
+        selected_line_indices.update(line_indices)
+        bottom = max(bottom, clipped_row.bbox[3])
+        note_chain_started = True
+    return output
+
+
+def _visual_row_text(row: _VisualRow) -> str:
+    """按局部 x 顺序拼接视觉行文本，供拆分脚注标记判断。"""
+
+    return " ".join(fragment.text.strip() for fragment in row.fragments if fragment.text.strip())
 
 
 def _is_table_note_text(text: str) -> bool:
@@ -887,6 +925,8 @@ def _find_table_caption(
             if suffix and suffix[0].islower():
                 continue
         local_bbox = _rotate_bbox_to_upright(line.bbox, page_size, angle)
+        if _bbox_axis_overlap_ratio(local_bbox, core_bbox, axis="x") < 0.05:
+            continue
         if is_split_label:
             has_number_peer = bool(
                 _find_caption_number_peers(
@@ -933,30 +973,6 @@ def _find_caption_number_peers(
     )
 
 
-def _table_caption_members(
-    caption_line: _LineItem,
-    lines: list[_LineItem],
-    page_size: tuple[float, float],
-    angle: int,
-    median_height: float,
-) -> list[_LineItem]:
-    """返回显式表标题标签及其可能被 pdftext 拆开的编号成员。"""
-
-    text = caption_line.text.strip().lower().rstrip(".")
-    if text not in {"table", "tab", "表", "表格"}:
-        return [caption_line]
-    return [
-        caption_line,
-        *_find_caption_number_peers(
-            caption_line,
-            lines,
-            page_size,
-            angle,
-            median_height,
-        ),
-    ]
-
-
 def _count_stable_columns(
     rows: list[_VisualRow],
     median_height: float,
@@ -984,20 +1000,6 @@ def _count_stable_columns(
     return len(stable_coverages), min(stable_coverages)
 
 
-def _two_column_data_row_ratio(rows: list[_VisualRow]) -> float:
-    """统计两列候选中两个单元都具有短值或数值特征的行比例。"""
-
-    if not rows:
-        return 0.0
-    supported_rows = 0
-    for row in rows:
-        if len(row.fragments) != 2:
-            continue
-        if all(len(fragment.text.strip()) <= 20 or bool(_NUMERIC_CELL_RE.search(fragment.text)) for fragment in row.fragments):
-            supported_rows += 1
-    return supported_rows / len(rows)
-
-
 def _transform_axis_lines(
     lines: list[_AxisLine],
     page_size: tuple[float, float],
@@ -1022,160 +1024,8 @@ def _transform_axis_lines(
     return output
 
 
-def _candidate_grid_evidence(
-    candidate_bbox: BBox,
-    axis_lines: list[_LocalAxisLine],
-    median_height: float,
-) -> tuple[int, int, int]:
-    """统计候选内达到各自长度门槛的横竖线及其交点数。"""
-
-    margin = 2.0 * median_height
-    expanded = _expand_bbox(candidate_bbox, margin)
-    selected = [line for line in axis_lines if _bbox_intersects(line.bbox, expanded)]
-    horizontal_min_length = max(40.0, median_height * 10.0)
-    vertical_min_length = max(20.0, median_height * 4.0)
-    horizontal = [
-        line
-        for line in selected
-        if line.orientation == "horizontal" and line.bbox[2] - line.bbox[0] >= horizontal_min_length
-    ]
-    vertical = [
-        line
-        for line in selected
-        if line.orientation == "vertical" and line.bbox[3] - line.bbox[1] >= vertical_min_length
-    ]
-    intersections = sum(_axis_lines_intersect(h_line, v_line, tolerance=2.0) for h_line in horizontal for v_line in vertical)
-    return len(horizontal), len(vertical), intersections
-
-
-def _build_grid_table_candidates(
-    fragments: list[_Fragment],
-    rows: list[_VisualRow],
-    lines: list[_LineItem],
-    page_size: tuple[float, float],
-    angle: int,
-    median_height: float,
-    axis_lines: list[_LocalAxisLine],
-) -> list[_TableCandidate]:
-    """对相交横竖线连通分量生成独立强网格表格候选。"""
-
-    components = _axis_line_components(axis_lines, tolerance=2.0)
-    candidates: list[_TableCandidate] = []
-    for component in components:
-        horizontal = [line for line in component if line.orientation == "horizontal"]
-        vertical = [line for line in component if line.orientation == "vertical"]
-        if len(horizontal) < 2 or len(vertical) < 2:
-            continue
-        intersection_count = sum(
-            _axis_lines_intersect(h_line, v_line, tolerance=2.0) for h_line in horizontal for v_line in vertical
-        )
-        if intersection_count < 4:
-            continue
-        local_bbox = _bbox_union_many([line.bbox for line in component])
-        selected_fragments = [
-            fragment
-            for fragment in fragments
-            if _point_in_bbox(
-                (_bbox_center_x(fragment.local_bbox), _bbox_center_y(fragment.local_bbox)),
-                local_bbox,
-            )
-        ]
-        selected_line_indices = {fragment.line_index for fragment in selected_fragments}
-        selected_rows = [row for row in rows if any(fragment.line_index in selected_line_indices for fragment in row.fragments)]
-        # 至少三行文本才能形成表格，避免将带少量公式文字的线框示意图误判为表格。
-        if len(selected_rows) < 3:
-            continue
-        grid_text_columns = _count_grid_text_columns(selected_fragments, vertical)
-        # 强网格按竖线分隔后的实际文本占位计列，避免字符左边界波动时漏掉有框表格。
-        if grid_text_columns < 2:
-            continue
-        original_bbox = _rotate_bbox_from_upright(local_bbox, page_size, angle)
-        candidate = _TableCandidate(
-            bbox=original_bbox,
-            local_bbox=local_bbox,
-            angle=angle,
-            score=20.0 + intersection_count + len(selected_rows),
-            core_bbox=original_bbox,
-            line_indices=selected_line_indices,
-        )
-        caption = _find_table_caption(lines, local_bbox, page_size, angle, median_height)
-        if caption is not None:
-            for caption_member in _table_caption_members(
-                caption,
-                lines,
-                page_size,
-                angle,
-                median_height,
-            ):
-                candidate.bbox = _bbox_union(candidate.bbox, caption_member.bbox)
-                candidate.local_bbox = _bbox_union(
-                    candidate.local_bbox,
-                    _rotate_bbox_to_upright(caption_member.bbox, page_size, angle),
-                )
-                candidate.line_indices.add(caption_member.source_index)
-        candidates.append(candidate)
-    return candidates
-
-
-def _count_grid_text_columns(
-    fragments: list[_Fragment],
-    vertical_lines: list[_LocalAxisLine],
-) -> int:
-    """按竖线中心形成的区间统计实际包含文本的网格列数。"""
-
-    if not fragments or not vertical_lines:
-        return 0
-    boundaries: list[float] = []
-    for coordinate in sorted(_bbox_center_x(line.bbox) for line in vertical_lines):
-        if not boundaries or coordinate - boundaries[-1] > 2.0:
-            boundaries.append(coordinate)
-    occupied_columns = {bisect_right(boundaries, _bbox_center_x(fragment.local_bbox)) for fragment in fragments}
-    return len(occupied_columns)
-
-
-def _axis_line_components(
-    lines: list[_LocalAxisLine],
-    tolerance: float,
-) -> list[list[_LocalAxisLine]]:
-    """将相交或相邻的横竖线聚成网格连通分量。"""
-
-    if not lines:
-        return []
-    parents = list(range(len(lines)))
-
-    def find(index: int) -> int:
-        """查找线段所属并查集根节点。"""
-
-        while parents[index] != index:
-            parents[index] = parents[parents[index]]
-            index = parents[index]
-        return index
-
-    def union(left: int, right: int) -> None:
-        """合并两条相交或相邻线段的连通分量。"""
-
-        left_root = find(left)
-        right_root = find(right)
-        if left_root != right_root:
-            parents[right_root] = left_root
-
-    for left_index, left_line in enumerate(lines):
-        for right_index in range(left_index + 1, len(lines)):
-            right_line = lines[right_index]
-            if _bbox_intersects(
-                _expand_bbox(left_line.bbox, tolerance),
-                _expand_bbox(right_line.bbox, tolerance),
-            ):
-                union(left_index, right_index)
-
-    groups: dict[int, list[_LocalAxisLine]] = {}
-    for index, line in enumerate(lines):
-        groups.setdefault(find(index), []).append(line)
-    return list(groups.values())
-
-
 def _merge_table_candidates(candidates: list[_TableCandidate]) -> list[_TableCandidate]:
-    """合并同方向且明显重叠的文本/网格候选，避免同一表格重复输出。"""
+    """合并同方向且明显重叠的横线候选，避免同一表格重复输出。"""
 
     merged: list[_TableCandidate] = []
     for candidate in sorted(candidates, key=lambda item: item.score, reverse=True):
@@ -2558,21 +2408,6 @@ def _rotate_bbox_from_upright(
     if angle == 180:
         return (page_width - x1, page_height - y1, page_width - x0, page_height - y0)
     return bbox
-
-
-def _axis_lines_intersect(
-    horizontal: _LocalAxisLine,
-    vertical: _LocalAxisLine,
-    tolerance: float,
-) -> bool:
-    """检查一条横线与一条竖线是否在容差内相交。"""
-
-    horizontal_y = _bbox_center_y(horizontal.bbox)
-    vertical_x = _bbox_center_x(vertical.bbox)
-    return (
-        horizontal.bbox[0] - tolerance <= vertical_x <= horizontal.bbox[2] + tolerance
-        and vertical.bbox[1] - tolerance <= horizontal_y <= vertical.bbox[3] + tolerance
-    )
 
 
 def _median_fragment_height(fragments: list[_Fragment]) -> float:
