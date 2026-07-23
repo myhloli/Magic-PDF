@@ -1,6 +1,6 @@
-"""Flash PDF 文本与表格提取器。
+"""Flash PDF 原生文本与表格提取器。
 
-Flash 仅使用 PDF 原生文本或 OCR 文本行，不运行布局、公式、图片或表格结构模型。
+Flash 仅处理 PDF 原生文本；需要 OCR 时统一委托 Hybrid low。
 """
 
 from __future__ import annotations
@@ -12,21 +12,18 @@ from bisect import bisect_right
 from dataclasses import dataclass, field
 from typing import Any, Literal, Sequence
 
-import numpy as np
 from loguru import logger
 from pdftext.schema import Char
 
-from mineru.backend.hybrid.table_text import project_ocr_table_text, project_pdf_table_text
+from mineru.backend.hybrid.table_text import project_pdf_table_text
 from mineru.backend.utils.char_utils import is_hyphen_at_line_end, resolve_text_line_boundary
 from mineru.backend.utils.xycut_pp_sorter import sort_entries
 from mineru.cli_old.common import read_fn
 from mineru.types import BBox
-from mineru.utils.config_reader import get_processing_window_size
 from mineru.utils.language import detect_lang
 from mineru.utils.pdf_document import PDFDocument, get_lines_from_chars
 
 
-_OCR_MIN_CONFIDENCE = 0.5
 _TABLE_CAPTION_RE = re.compile(
     r"^(?:table|tab\.?|表格?)[\s:.–—-]*(?:\d+|[ivxlcdm]+|[一二三四五六七八九十]+)\b(?P<suffix>.*)$",
     re.IGNORECASE,
@@ -53,9 +50,7 @@ class _LineItem:
     bbox: BBox
     angle: int
     source_index: int
-    score: float = 1.0
     chars: list[Char] = field(default_factory=list)
-    pixel_quad: tuple[tuple[float, float], ...] | None = None
     visual_row_id: int | None = None
     run_index: int = 0
     effective_height: float = 0.0
@@ -72,7 +67,6 @@ class _Fragment:
     bbox: BBox
     local_bbox: BBox
     line_index: int
-    score: float = 1.0
     visual_row_id: int | None = None
 
 
@@ -88,7 +82,7 @@ class _VisualRow:
 
 @dataclass(slots=True)
 class _AxisLine:
-    """保存 PDF 路径或 OCR 图像中的横竖线。"""
+    """保存 PDF 路径中的横竖线。"""
 
     bbox: BBox
     width: float
@@ -130,15 +124,12 @@ class _TextLane:
 
 @dataclass(slots=True)
 class _PageSource:
-    """保存单页分析所需的文本、字符和可选 OCR 图像。"""
+    """保存单页原生文本分析所需的文本、字符和绘图线。"""
 
     page_size: tuple[float, float]
     lines: list[_LineItem]
     chars: list[Char]
     drawing_lines: list[_AxisLine]
-    render_scale: float = 1.0
-    bgr_image: np.ndarray | None = None
-    ocr_model: Any = None
 
 
 def extract_pages_text(filepath: str, start_page: int = 0, end_page: int | None = None) -> list[str]:
@@ -153,34 +144,6 @@ def extract_pages_text(filepath: str, start_page: int = 0, end_page: int | None 
         for page_idx in range(start_page, end):
             pages.append(pdf_doc.get_page_text(page_idx))
     return pages
-
-
-def doc_analyze(
-    pdf_bytes: bytes,
-    parse_mode: Literal["auto", "txt", "ocr"] = "auto",
-    page_index_map: list[int] | None = None,
-) -> list[list[dict[str, Any]]]:
-    """使用 Flash 规则提取文本与空间投影表格，返回物理页顺序的 model_list。"""
-
-    if parse_mode not in {"auto", "txt", "ocr"}:
-        raise ValueError(f"parse_mode {parse_mode} is not supported")
-
-    with PDFDocument(pdf_bytes) as pdf_doc:
-        page_count = pdf_doc.page_count
-        if page_index_map and len(page_index_map) != page_count:
-            raise ValueError(
-                f"Flash page_index_map length mismatch: page_count={page_count}, page_index_map={len(page_index_map)}"
-            )
-
-        resolved_mode: Literal["txt", "ocr"]
-        if parse_mode == "auto":
-            resolved_mode = pdf_doc.classify()
-        else:
-            resolved_mode = parse_mode
-
-        if resolved_mode == "txt":
-            return _analyze_native_document(pdf_doc)
-        return _analyze_ocr_document(pdf_doc)
 
 
 def _analyze_native_document(pdf_doc: PDFDocument) -> list[list[dict[str, Any]]]:
@@ -202,255 +165,8 @@ def _analyze_native_document(pdf_doc: PDFDocument) -> list[list[dict[str, Any]]]
             chars=chars,
             drawing_lines=drawing_lines,
         )
-        model_list.append(_analyze_page_source(source, "txt"))
+        model_list.append(_analyze_page_source(source))
     return model_list
-
-
-def _analyze_ocr_document(pdf_doc: PDFDocument) -> list[list[dict[str, Any]]]:
-    """按窗口渲染并 OCR 扫描 PDF，避免长文档同时常驻所有页图像。"""
-
-    page_count = pdf_doc.page_count
-    if page_count == 0:
-        return []
-    ocr_model, run_ocr_inference, sorted_boxes, crop_text_line = _load_ocr_runtime()
-    window_size = get_processing_window_size(default=64)
-    model_list: list[list[dict[str, Any]]] = []
-
-    for start in range(0, page_count, window_size):
-        end = min(page_count, start + window_size)
-        page_images = pdf_doc.render_pages(start, end - 1)
-        if len(page_images) != end - start:
-            for page_image in page_images:
-                page_image.pil_image.close()
-            raise ValueError(f"Flash OCR rendered page count mismatch: expected={end - start}, actual={len(page_images)}")
-
-        try:
-            bgr_images = [_pil_image_to_bgr(page_image.pil_image) for page_image in page_images]
-            window_lines = _run_full_page_ocr(
-                ocr_model,
-                bgr_images,
-                [page_image.scale for page_image in page_images],
-                [pdf_doc.page_size(page_idx) for page_idx in range(start, end)],
-                run_ocr_inference,
-                sorted_boxes,
-                crop_text_line,
-            )
-            for offset, (page_image, bgr_image, lines) in enumerate(zip(page_images, bgr_images, window_lines)):
-                page_size = pdf_doc.page_size(start + offset)
-                median_height = _median_line_height(lines)
-                drawing_lines = _collect_ocr_drawing_lines(
-                    pdf_doc,
-                    start + offset,
-                    bgr_image,
-                    page_image.scale,
-                    median_height,
-                )
-                source = _PageSource(
-                    page_size=page_size,
-                    lines=lines,
-                    chars=[],
-                    drawing_lines=drawing_lines,
-                    render_scale=page_image.scale,
-                    bgr_image=bgr_image,
-                    ocr_model=(ocr_model, run_ocr_inference),
-                )
-                model_list.append(_analyze_page_source(source, "ocr"))
-        finally:
-            for page_image in page_images:
-                page_image.pil_image.close()
-
-    return model_list
-
-
-def _pil_image_to_bgr(pil_image: Any) -> np.ndarray:
-    """将 PIL 页图像转为 OCR 使用的 BGR 数组，并及时关闭临时 RGB 副本。"""
-
-    rgb_image = pil_image if pil_image.mode == "RGB" else pil_image.convert("RGB")
-    try:
-        return np.asarray(rgb_image)[:, :, ::-1].copy()
-    finally:
-        if rgb_image is not pil_image:
-            rgb_image.close()
-
-
-def _load_ocr_runtime() -> tuple[Any, Any, Any, Any]:
-    """延迟加载 OCR 依赖，保证 txt 路径不导入本地视觉模型运行时。"""
-
-    try:
-        from mineru.backend.local_model_runtime import (
-            AtomicModel,
-            AtomModelSingleton,
-            run_ocr_inference,
-        )
-        from mineru.utils.ocr_utils import (
-            get_rotate_crop_image_for_text_rec,
-            sorted_boxes,
-        )
-
-        ocr_model = AtomModelSingleton().get_atom_model(
-            AtomicModel.OCR,
-            det_db_box_thresh=0.5,
-            lang="ch",
-            det_db_unclip_ratio=1.6,
-            enable_merge_det_boxes=False,
-        )
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise RuntimeError(
-            "Flash OCR dependencies are unavailable. Install the OCR runtime with `pip install 'mineru[medium]'`."
-        ) from exc
-    return ocr_model, run_ocr_inference, sorted_boxes, get_rotate_crop_image_for_text_rec
-
-
-def _run_full_page_ocr(
-    ocr_model: Any,
-    bgr_images: list[np.ndarray],
-    render_scales: list[float],
-    page_sizes: list[tuple[float, float]],
-    run_ocr_inference: Any,
-    sorted_boxes_fn: Any,
-    crop_text_line: Any,
-) -> list[list[_LineItem]]:
-    """先批量检测全页文本框，再将所有裁图合并执行一次 OCR rec。"""
-
-    if not bgr_images:
-        return []
-    det_results = run_ocr_inference(
-        ocr_model.text_detector.batch_predict,
-        bgr_images,
-        max_batch_size=min(16, len(bgr_images)),
-        tqdm_enable=False,
-    )
-    if len(det_results) != len(bgr_images):
-        raise ValueError(f"Flash OCR det result count mismatch: images={len(bgr_images)}, results={len(det_results)}")
-
-    page_boxes: list[list[np.ndarray]] = []
-    crop_images: list[np.ndarray] = []
-    crop_mapping: list[tuple[int, int]] = []
-    for page_offset, (bgr_image, det_result) in enumerate(zip(bgr_images, det_results)):
-        raw_boxes = det_result[0] if det_result else None
-        sorted_page_boxes = list(sorted_boxes_fn(raw_boxes)) if raw_boxes is not None else []
-        valid_boxes: list[np.ndarray] = []
-        for raw_box in sorted_page_boxes:
-            try:
-                box = np.asarray(raw_box, dtype=np.float32).reshape(-1, 2)
-            except (TypeError, ValueError):
-                continue
-            if box.shape[0] < 4 or not np.isfinite(box).all():
-                continue
-            crop = crop_text_line(bgr_image, box)
-            if crop is None or crop.size == 0:
-                continue
-            valid_boxes.append(box)
-            crop_images.append(crop)
-            crop_mapping.append((page_offset, len(valid_boxes) - 1))
-        page_boxes.append(valid_boxes)
-
-    page_rec_results: list[list[tuple[str, float] | None]] = [[None] * len(boxes) for boxes in page_boxes]
-    if crop_images:
-        raw_rec_results = run_ocr_inference(
-            ocr_model.ocr,
-            crop_images,
-            det=False,
-            rec=True,
-            tqdm_enable=False,
-        )
-        rec_results = raw_rec_results[0] if raw_rec_results else []
-        if len(rec_results) != len(crop_images):
-            raise ValueError(f"Flash OCR rec result count mismatch: crops={len(crop_images)}, results={len(rec_results)}")
-        for mapping, rec_result in zip(crop_mapping, rec_results):
-            try:
-                text, score = rec_result
-                normalized_result = (str(text or ""), float(score or 0.0))
-            except (TypeError, ValueError):
-                normalized_result = ("", 0.0)
-            page_rec_results[mapping[0]][mapping[1]] = normalized_result
-
-    output: list[list[_LineItem]] = []
-    for boxes, rec_results, scale, page_size in zip(
-        page_boxes,
-        page_rec_results,
-        render_scales,
-        page_sizes,
-    ):
-        page_lines: list[_LineItem] = []
-        for source_index, (box, rec_result) in enumerate(zip(boxes, rec_results)):
-            if rec_result is None:
-                continue
-            text, score = rec_result
-            text = text.strip()
-            if not text or score < _OCR_MIN_CONFIDENCE:
-                continue
-            bbox = _quad_to_page_bbox(box, scale, page_size)
-            if bbox is None:
-                continue
-            page_lines.append(
-                _LineItem(
-                    text=text,
-                    bbox=bbox,
-                    angle=_infer_ocr_angle(box),
-                    source_index=source_index,
-                    score=score,
-                    pixel_quad=tuple((float(point[0]), float(point[1])) for point in box),
-                    visual_row_id=source_index,
-                )
-            )
-        _promote_vertical_ocr_line_angles(page_lines)
-        for line in page_lines:
-            local_bbox = _rotate_bbox_to_upright(line.bbox, page_size, line.angle)
-            line.effective_height = max(0.1, local_bbox[3] - local_bbox[1])
-        output.append(page_lines)
-    return output
-
-
-def _quad_to_page_bbox(
-    quad: np.ndarray,
-    scale: float,
-    page_size: tuple[float, float],
-) -> BBox | None:
-    """将 OCR 像素四点框转为裁剪后的 PDF point bbox。"""
-
-    if scale <= 0:
-        return None
-    page_width, page_height = page_size
-    x0 = max(0.0, min(page_width, float(np.min(quad[:, 0])) / scale))
-    y0 = max(0.0, min(page_height, float(np.min(quad[:, 1])) / scale))
-    x1 = max(0.0, min(page_width, float(np.max(quad[:, 0])) / scale))
-    y1 = max(0.0, min(page_height, float(np.max(quad[:, 1])) / scale))
-    return _coerce_bbox((x0, y0, x1, y1))
-
-
-def _infer_ocr_angle(quad: np.ndarray) -> int:
-    """仅根据四点框首边方向返回可靠的标准 OCR 角度。"""
-
-    points = np.asarray(quad, dtype=np.float32).reshape(-1, 2)
-    if points.shape[0] < 4:
-        return 0
-    edge_angle = math.degrees(math.atan2(points[1][1] - points[0][1], points[1][0] - points[0][0]))
-    normalized = int(round(edge_angle / 90.0) * 90) % 360
-    return normalized if normalized in {0, 90, 180, 270} else 0
-
-
-def _promote_vertical_ocr_line_angles(lines: list[_LineItem]) -> None:
-    """仅在多个窄高多字符框形成主导证据时，将 OCR 行提升为竖排方向。"""
-
-    eligible: list[tuple[_LineItem, float, float]] = []
-    for line in lines:
-        if line.angle not in {0, 180} or line.pixel_quad is None:
-            continue
-        effective_text = "".join(char for char in line.text if not char.isspace())
-        if len(effective_text) < 2:
-            continue
-        points = np.asarray(line.pixel_quad, dtype=np.float32).reshape(-1, 2)
-        if points.shape[0] < 4:
-            continue
-        top_width = float(np.linalg.norm(points[1] - points[0]))
-        side_height = float(np.linalg.norm(points[3] - points[0]))
-        eligible.append((line, top_width, side_height))
-    vertical_lines = [line for line, top_width, side_height in eligible if side_height >= max(1.0, top_width * 1.5)]
-    if len(vertical_lines) < 3 or len(vertical_lines) / max(1, len(eligible)) < 0.6:
-        return
-    for line in vertical_lines:
-        line.angle = 90
 
 
 def _build_native_line_items(
@@ -574,7 +290,6 @@ def _split_native_visual_runs(
             bbox=_bbox_union_many(run_bboxes),
             angle=line.angle,
             source_index=-1,
-            score=line.score,
             chars=run_chars,
             visual_row_id=line.visual_row_id,
             run_index=run_index,
@@ -794,105 +509,15 @@ def _get_pdf_drawing_lines(pdf_doc: PDFDocument, page_idx: int) -> list[_AxisLin
     return output
 
 
-def _extract_image_drawing_lines(
-    bgr_image: np.ndarray,
-    render_scale: float,
-    median_line_height: float,
-) -> list[_AxisLine]:
-    """从 OCR 已渲染图像中提取足够长且足够细的横竖线。"""
-
-    if bgr_image.size == 0 or render_scale <= 0:
-        return []
-    try:
-        import cv2
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise RuntimeError(
-            "Flash OCR image-line dependencies are unavailable. Install the OCR runtime with `pip install 'mineru[medium]'`."
-        ) from exc
-
-    gray = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
-    _threshold, binary = cv2.threshold(
-        gray,
-        0,
-        255,
-        cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU,
-    )
-    image_height, image_width = gray.shape[:2]
-    median_height_px = max(1.0, median_line_height * render_scale)
-    max_thickness = max(5.0, median_height_px * 0.5)
-    min_length = max(20.0 * render_scale, median_height_px * 4.0)
-    kernels = {
-        "horizontal": cv2.getStructuringElement(
-            cv2.MORPH_RECT,
-            (max(15, int(round(image_width * 0.02))), 1),
-        ),
-        "vertical": cv2.getStructuringElement(
-            cv2.MORPH_RECT,
-            (1, max(15, int(round(image_height * 0.02)))),
-        ),
-    }
-
-    output: list[_AxisLine] = []
-    for orientation, kernel in kernels.items():
-        opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-        contours, _hierarchy = cv2.findContours(opened, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        for contour in contours:
-            x, y, width, height = cv2.boundingRect(contour)
-            length = width if orientation == "horizontal" else height
-            thickness = height if orientation == "horizontal" else width
-            if length < min_length or thickness > max_thickness:
-                continue
-            bbox = _coerce_bbox(
-                (
-                    x / render_scale,
-                    y / render_scale,
-                    (x + width) / render_scale,
-                    (y + height) / render_scale,
-                )
-            )
-            if bbox is None:
-                continue
-            output.append(
-                _AxisLine(
-                    bbox=bbox,
-                    width=max(0.1, thickness / render_scale),
-                    orientation=orientation,  # type: ignore[arg-type]
-                )
-            )
-    return _merge_axis_lines(output, tolerance=2.0)
-
-
-def _collect_ocr_drawing_lines(
-    pdf_doc: PDFDocument,
-    page_idx: int,
-    bgr_image: np.ndarray,
-    render_scale: float,
-    median_line_height: float,
-) -> list[_AxisLine]:
-    """合并 OCR 页面的 PDF 矢量线与图像形态学线，并统一去重。"""
-
-    vector_lines = _get_pdf_drawing_lines(pdf_doc, page_idx)
-    raster_lines = _extract_image_drawing_lines(
-        bgr_image,
-        render_scale,
-        median_line_height,
-    )
-    return _merge_axis_lines([*vector_lines, *raster_lines], tolerance=2.0)
-
-
-def _analyze_page_source(
-    source: _PageSource,
-    parse_mode: Literal["txt", "ocr"],
-) -> list[dict[str, Any]]:
+def _analyze_page_source(source: _PageSource) -> list[dict[str, Any]]:
     """在单页内先确认表格，再聚合剩余文本并排序。"""
 
     if not source.lines:
         return []
-    candidates = _detect_table_candidates(source, parse_mode)
+    candidates = _detect_table_candidates(source)
     table_blocks, claimed_line_indices = _materialize_table_blocks(
         source,
         candidates,
-        parse_mode,
     )
     table_bboxes = [block["bbox"] for block in table_blocks]
     remaining_lines = _merge_same_baseline_text_lines(
@@ -923,10 +548,7 @@ def _analyze_page_source(
     ]
 
 
-def _detect_table_candidates(
-    source: _PageSource,
-    parse_mode: Literal["txt", "ocr"],
-) -> list[_TableCandidate]:
+def _detect_table_candidates(source: _PageSource) -> list[_TableCandidate]:
     """融合多列文本稳定性与横竖线证据，生成高精度表格候选。"""
 
     candidates: list[_TableCandidate] = []
@@ -935,7 +557,7 @@ def _detect_table_candidates(
         angle_lines = [line for line in source.lines if line.angle == angle]
         if not angle_lines:
             continue
-        fragments = _build_fragments(angle_lines, source.page_size, parse_mode)
+        fragments = _build_fragments(angle_lines, source.page_size)
         if not fragments:
             continue
         median_height = _median_fragment_height(fragments)
@@ -972,9 +594,8 @@ def _detect_table_candidates(
 def _build_fragments(
     lines: list[_LineItem],
     page_size: tuple[float, float],
-    parse_mode: Literal["txt", "ocr"],
 ) -> list[_Fragment]:
-    """将精修后的原生 run 或 OCR 行直接转换成表格单元候选。"""
+    """将精修后的原生 run 转换成表格单元候选。"""
 
     fragments: list[_Fragment] = []
     for line in lines:
@@ -985,10 +606,9 @@ def _build_fragments(
                 bbox=line.bbox,
                 local_bbox=local_bbox,
                 line_index=line.source_index,
-                score=line.score,
-                # OCR det box 仍按几何中心聚成表格行；原生 run 则复用粗行身份，
-                # 避免同一字符行内不同 cell 因轻微基线差异被误拆成多行。
-                visual_row_id=line.visual_row_id if parse_mode == "txt" else None,
+                # 复用原生粗行身份，避免同一字符行内不同 cell
+                # 因轻微基线差异被误拆成多行。
+                visual_row_id=line.visual_row_id,
             )
         )
     return fragments
@@ -1482,7 +1102,7 @@ def _build_grid_table_candidates(
         if len(selected_rows) < 2:
             continue
         grid_text_columns = _count_grid_text_columns(selected_fragments, vertical)
-        # 强网格按竖线分隔后的实际文本占位计列，避免 OCR 左边界不稳定时漏掉有框表格。
+        # 强网格按竖线分隔后的实际文本占位计列，避免字符左边界波动时漏掉有框表格。
         if grid_text_columns < 2:
             continue
         original_bbox = _rotate_bbox_from_upright(local_bbox, page_size, angle)
@@ -1602,7 +1222,6 @@ def _merge_table_candidates(candidates: list[_TableCandidate]) -> list[_TableCan
 def _materialize_table_blocks(
     source: _PageSource,
     candidates: list[_TableCandidate],
-    parse_mode: Literal["txt", "ocr"],
 ) -> tuple[list[dict[str, Any]], set[int]]:
     """为候选生成空间投影 content，仅认领投影成功的文本行。"""
 
@@ -1614,35 +1233,17 @@ def _materialize_table_blocks(
         output_angle = candidate.angle
         projection_line_indices = _candidate_projection_line_indices(source, candidate)
         try:
-            if parse_mode == "txt":
-                candidate_chars = [
-                    char for line in source.lines if line.source_index in projection_line_indices for char in line.chars
-                ]
-                content = project_pdf_table_text(
-                    candidate_chars,
-                    candidate.bbox,
-                    angle=candidate.angle,
-                )
-            else:
-                content = _project_ocr_candidate(source, candidate)
-                if candidate.angle != 0:
-                    base_projection_score = _score_existing_ocr_projection(
-                        source,
-                        candidate,
-                        content,
-                    )
-                    rotated_content, rotated_angle, rotated_score = _recognize_rotated_ocr_table(
-                        source,
-                        candidate,
-                    )
-                    if rotated_score > base_projection_score:
-                        content = rotated_content
-                        output_angle = rotated_angle
-        except Exception as exc:
-            # 单个表格的字符或局部 OCR 异常只撤销该候选，不能中止整页提取。
-            logger.warning(
-                f"Flash table projection failed and rolled back: parse_mode={parse_mode}, bbox={candidate.bbox}, error={exc}"
+            candidate_chars = [
+                char for line in source.lines if line.source_index in projection_line_indices for char in line.chars
+            ]
+            content = project_pdf_table_text(
+                candidate_chars,
+                candidate.bbox,
+                angle=candidate.angle,
             )
+        except Exception as exc:
+            # 单个表格的字符投影异常只撤销该候选，不能中止整页提取。
+            logger.warning(f"Flash table projection failed and rolled back: bbox={candidate.bbox}, error={exc}")
             continue
         if not content or not content.strip():
             continue
@@ -1762,156 +1363,6 @@ def _expand_candidate_same_baseline_members(
                 line_indices.add(line.source_index)
                 changed = True
                 break
-
-
-def _project_ocr_candidate(source: _PageSource, candidate: _TableCandidate) -> str:
-    """将全页 OCR quad 平移并按表格角度旋转到局部投影坐标。"""
-
-    scale = source.render_scale
-    table_x0, table_y0, table_x1, table_y1 = candidate.bbox
-    width_px = max(1, int(round((table_x1 - table_x0) * scale)))
-    height_px = max(1, int(round((table_y1 - table_y0) * scale)))
-    ocr_result: list[list[Any]] = []
-    projection_line_indices = _candidate_projection_line_indices(source, candidate)
-    for line in source.lines:
-        if line.pixel_quad is None:
-            continue
-        if line.source_index not in projection_line_indices:
-            continue
-        local_points = [
-            (
-                point[0] - table_x0 * scale,
-                point[1] - table_y0 * scale,
-            )
-            for point in line.pixel_quad
-        ]
-        rotated_points = _rotate_local_points(
-            local_points,
-            width_px,
-            height_px,
-            candidate.angle,
-        )
-        ocr_result.append(
-            [
-                [[float(x), float(y)] for x, y in rotated_points],
-                (line.text, line.score),
-            ]
-        )
-    table_size = (height_px, width_px) if candidate.angle in {90, 270} else (width_px, height_px)
-    return project_ocr_table_text(ocr_result, table_size)
-
-
-def _recognize_rotated_ocr_table(
-    source: _PageSource,
-    candidate: _TableCandidate,
-) -> tuple[str, int, float]:
-    """对旋转 OCR 表格分别尝试 90/270 度，选择投影可读性更高的结果。"""
-
-    if source.bgr_image is None or source.ocr_model is None:
-        return "", candidate.angle, 0.0
-    ocr_model, run_ocr_inference = source.ocr_model
-    scale = source.render_scale
-    recognition_bbox = candidate.core_bbox or candidate.bbox
-    x0, y0, x1, y1 = recognition_bbox
-    image_height, image_width = source.bgr_image.shape[:2]
-    left = max(0, min(image_width, int(math.floor(x0 * scale))))
-    top = max(0, min(image_height, int(math.floor(y0 * scale))))
-    right = max(0, min(image_width, int(math.ceil(x1 * scale))))
-    bottom = max(0, min(image_height, int(math.ceil(y1 * scale))))
-    if right <= left or bottom <= top:
-        return "", candidate.angle, 0.0
-    crop = source.bgr_image[top:bottom, left:right].copy()
-    projection_line_indices = _candidate_projection_line_indices(source, candidate)
-    # 远标题形成的矩形走廊中若存在未被候选接纳的正文，二次 OCR 前先遮白。
-    for line in source.lines:
-        if line.source_index in projection_line_indices or not _bbox_intersects(line.bbox, recognition_bbox):
-            continue
-        mask_left = max(0, min(crop.shape[1], int(math.floor(line.bbox[0] * scale)) - left))
-        mask_top = max(0, min(crop.shape[0], int(math.floor(line.bbox[1] * scale)) - top))
-        mask_right = max(0, min(crop.shape[1], int(math.ceil(line.bbox[2] * scale)) - left))
-        mask_bottom = max(0, min(crop.shape[0], int(math.ceil(line.bbox[3] * scale)) - top))
-        if mask_right > mask_left and mask_bottom > mask_top:
-            crop[mask_top:mask_bottom, mask_left:mask_right] = 255
-    best_content = ""
-    best_angle = candidate.angle
-    best_score = 0.0
-    for quarter_turns, output_angle in ((1, 90), (3, 270)):
-        rotated = np.ascontiguousarray(np.rot90(crop, k=quarter_turns))
-        raw_result = run_ocr_inference(
-            ocr_model.ocr,
-            rotated,
-            det=True,
-            rec=True,
-            tqdm_enable=False,
-        )
-        raw_ocr_result = raw_result[0] if raw_result else []
-        filtered_ocr_result: list[list[Any]] = []
-        for item in raw_ocr_result or []:
-            if not item or len(item) < 2 or not item[1] or len(item[1]) < 2:
-                continue
-            text = str(item[1][0] or "").strip()
-            try:
-                confidence = float(item[1][1] or 0.0)
-            except (TypeError, ValueError):
-                confidence = 0.0
-            if not text or confidence < _OCR_MIN_CONFIDENCE:
-                continue
-            filtered_ocr_result.append([item[0], (text, confidence)])
-        if not filtered_ocr_result:
-            continue
-        content = project_ocr_table_text(
-            filtered_ocr_result,
-            (rotated.shape[1], rotated.shape[0]),
-        )
-        confidence_values = [
-            float(item[1][1]) for item in filtered_ocr_result if item and len(item) >= 2 and item[1] and len(item[1]) >= 2
-        ]
-        mean_confidence = statistics.fmean(confidence_values) if confidence_values else 0.0
-        score = mean_confidence * _valid_character_ratio(content) * _score_projected_table(content)
-        if score > best_score:
-            best_score = score
-            best_content = content
-            best_angle = output_angle
-    return best_content, best_angle, best_score
-
-
-def _score_existing_ocr_projection(
-    source: _PageSource,
-    candidate: _TableCandidate,
-    content: str,
-) -> float:
-    """使用候选原 OCR 均值置信度、字符有效率和空间结构评分现有投影。"""
-
-    projection_line_indices = _candidate_projection_line_indices(source, candidate)
-    confidence_values = [
-        line.score
-        for line in source.lines
-        if line.source_index in projection_line_indices and line.pixel_quad is not None and line.score >= _OCR_MIN_CONFIDENCE
-    ]
-    mean_confidence = statistics.fmean(confidence_values) if confidence_values else 0.0
-    return mean_confidence * _valid_character_ratio(content) * _score_projected_table(content)
-
-
-def _score_projected_table(content: str) -> float:
-    """根据非空行数和具有明显列间隔的行数评分投影结果。"""
-
-    if not content:
-        return 0.0
-    lines = [line for line in content.splitlines() if line.strip()]
-    if not lines:
-        return 0.0
-    column_lines = sum(bool(re.search(r"\S\s{2,}\S", line)) for line in lines)
-    return min(1.0, len(lines) / 3.0) * (1.0 + column_lines / len(lines))
-
-
-def _valid_character_ratio(content: str) -> float:
-    """计算 OCR 内字母、数字或 CJK 字符占所有非空字符的比例。"""
-
-    characters = [char for char in content if not char.isspace()]
-    if not characters:
-        return 0.0
-    valid = sum(char.isalnum() or "\u3400" <= char <= "\u9fff" for char in characters)
-    return valid / len(characters)
 
 
 def _merge_same_baseline_text_lines(
@@ -2065,7 +1516,6 @@ def _merge_same_baseline_group(
         bbox=_bbox_union_many([member.bbox for member in members]),
         angle=members[0].angle,
         source_index=min(member.source_index for member in members),
-        score=min(member.score for member in members),
         chars=[char for member in members for char in member.chars],
         visual_row_id=min(
             (member.visual_row_id for member in members if member.visual_row_id is not None),
@@ -2578,7 +2028,6 @@ def _merge_dense_split_visual_row(
         bbox=_bbox_union_many([member.bbox for member in ordered_members]),
         angle=ordered_members[0].angle,
         source_index=min(member.source_index for member in ordered_members),
-        score=min(member.score for member in ordered_members),
         chars=[char for member in ordered_members for char in member.chars],
         visual_row_id=ordered_members[0].visual_row_id,
         run_index=0,
@@ -3071,49 +2520,6 @@ def _rotate_bbox_from_upright(
     return bbox
 
 
-def _rotate_local_points(
-    points: list[tuple[float, float]],
-    width: float,
-    height: float,
-    angle: int,
-) -> list[tuple[float, float]]:
-    """将表格局部 OCR 点按标准方向旋转到正向坐标。"""
-
-    if angle == 270:
-        return [(height - y, x) for x, y in points]
-    if angle == 90:
-        return [(y, width - x) for x, y in points]
-    if angle == 180:
-        return [(width - x, height - y) for x, y in points]
-    return points
-
-
-def _merge_axis_lines(lines: list[_AxisLine], tolerance: float) -> list[_AxisLine]:
-    """合并方向相同、中心线相近且范围相接的图像线段。"""
-
-    merged: list[_AxisLine] = []
-    for line in sorted(lines, key=lambda item: (item.orientation, item.bbox[1], item.bbox[0])):
-        target: _AxisLine | None = None
-        for existing in merged:
-            if existing.orientation != line.orientation:
-                continue
-            if line.orientation == "horizontal":
-                same_axis = abs(_bbox_center_y(existing.bbox) - _bbox_center_y(line.bbox)) <= tolerance
-                touching = line.bbox[0] <= existing.bbox[2] + tolerance and line.bbox[2] >= existing.bbox[0] - tolerance
-            else:
-                same_axis = abs(_bbox_center_x(existing.bbox) - _bbox_center_x(line.bbox)) <= tolerance
-                touching = line.bbox[1] <= existing.bbox[3] + tolerance and line.bbox[3] >= existing.bbox[1] - tolerance
-            if same_axis and touching:
-                target = existing
-                break
-        if target is None:
-            merged.append(line)
-        else:
-            target.bbox = _bbox_union(target.bbox, line.bbox)
-            target.width = max(target.width, line.width)
-    return merged
-
-
 def _axis_lines_intersect(
     horizontal: _LocalAxisLine,
     vertical: _LocalAxisLine,
@@ -3127,13 +2533,6 @@ def _axis_lines_intersect(
         horizontal.bbox[0] - tolerance <= vertical_x <= horizontal.bbox[2] + tolerance
         and vertical.bbox[1] - tolerance <= horizontal_y <= vertical.bbox[3] + tolerance
     )
-
-
-def _median_line_height(lines: list[_LineItem]) -> float:
-    """返回有效文本行高的中位数。"""
-
-    heights = [line.bbox[3] - line.bbox[1] for line in lines if line.bbox[3] > line.bbox[1]]
-    return float(statistics.median(heights)) if heights else 1.0
 
 
 def _median_fragment_height(fragments: list[_Fragment]) -> float:
@@ -3270,10 +2669,48 @@ def _point_in_bbox(point: tuple[float, float], bbox: BBox) -> bool:
     return bbox[0] <= point[0] <= bbox[2] and bbox[1] <= point[1] <= bbox[3]
 
 
+def doc_analyze(
+    pdf_bytes: bytes,
+    parse_mode: Literal["auto", "txt", "ocr"] = "auto",
+    page_index_map: list[int] | None = None,
+) -> list[list[dict[str, Any]]]:
+    """使用 Flash 提取原生文本，OCR 文档则委托 Hybrid low。"""
+
+    if parse_mode not in {"auto", "txt", "ocr"}:
+        raise ValueError(f"parse_mode {parse_mode} is not supported")
+
+    with PDFDocument(pdf_bytes) as pdf_doc:
+        page_count = pdf_doc.page_count
+        if page_index_map and len(page_index_map) != page_count:
+            raise ValueError(
+                f"Flash page_index_map length mismatch: page_count={page_count}, page_index_map={len(page_index_map)}"
+            )
+
+        resolved_mode: Literal["txt", "ocr"]
+        if parse_mode == "auto":
+            resolved_mode = pdf_doc.classify()
+        else:
+            resolved_mode = parse_mode
+
+        if resolved_mode == "txt":
+            return _analyze_native_document(pdf_doc)
+
+    # OCR 路径延迟加载 Hybrid，保证原生 Flash 不引入本地视觉模型运行时。
+    from mineru.backend.hybrid.analyze import doc_analyze as hybrid_doc_analyze
+
+    _middle_json, model_list = hybrid_doc_analyze(
+        pdf_bytes,
+        effort="low",
+        parse_mode="ocr",
+        page_index_map=page_index_map,
+    )
+    return model_list
+
+
 if __name__ == '__main__':
     # pdf_path = "/Users/myhloli/pdf/截断合并/demo1-3.pdf"
     # pdf_path = "/Users/myhloli/pdf/png/seal4.png"  # shubiao.png
     pdf_path = "/Users/myhloli/pdf/demo1.pdf"
     pdf_bytes = read_fn(pdf_path)
-    model_list = doc_analyze(pdf_bytes, parse_mode="ocr")
+    model_list = doc_analyze(pdf_bytes, parse_mode="auto")
     logger.info(f"model_list: {model_list}")
