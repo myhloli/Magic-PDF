@@ -38,7 +38,6 @@ _TABLE_SPLIT_NUMBER_RE = re.compile(
     r"^(?:\d+|[ivxlcdm]+|[一二三四五六七八九十]+)[.:：]?$",
     re.IGNORECASE,
 )
-_EQUATION_NUMBER_RE = re.compile(r"^\(\d+(?:\.\d+)*[a-z]?\)$", re.IGNORECASE)
 _PDF_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
@@ -109,7 +108,6 @@ class _TableCandidate:
     score: float
     core_bbox: BBox | None = None
     line_indices: set[int] = field(default_factory=set)
-    has_grid: bool = False
 
 
 @dataclass(slots=True)
@@ -696,8 +694,6 @@ def _build_text_table_candidates(
             continue
         core_bbox = _bbox_union_many([row.bbox for row in segment])
         caption_line = _find_table_caption(lines, core_bbox, page_size, angle, median_height)
-        if caption_line is None and _looks_like_numbered_equation_segment(segment, core_bbox):
-            continue
         stable_columns, column_coverage = _count_stable_columns(segment, median_height)
         multi_cell_ratio = sum(len(row.fragments) >= 3 for row in segment) / len(segment)
         accepts_three_columns = stable_columns >= 3 and multi_cell_ratio >= 0.6
@@ -723,36 +719,21 @@ def _build_text_table_candidates(
             axis_lines,
             median_height,
         )
-        candidate.has_grid = horizontal_count >= 2 and vertical_count >= 2 and intersection_count >= 2
+        # 横线型表格必须至少包含三条足够长的规则线，不再接纳无线多列文本。
+        if horizontal_count < 3:
+            continue
+        has_grid_evidence = horizontal_count >= 2 and vertical_count >= 2 and intersection_count >= 2
         horizontal_rule_evidence = horizontal_count >= 3 and stable_columns >= 3
         candidate.score = (
             stable_columns * 2.0
             + len(segment)
             + multi_cell_ratio * 3.0
-            + (4.0 if candidate.has_grid else 0.0)
+            + (4.0 if has_grid_evidence else 0.0)
             + (2.0 if horizontal_rule_evidence else 0.0)
             + (1.0 if caption_line is not None else 0.0)
         )
         candidates.append(candidate)
     return candidates
-
-
-def _looks_like_numbered_equation_segment(
-    rows: list[_VisualRow],
-    core_bbox: BBox,
-) -> bool:
-    """识别短行组右侧的孤立公式编号，避免把多层公式误判为无框表格。"""
-
-    if len(rows) > 6:
-        return False
-    core_width = max(0.1, core_bbox[2] - core_bbox[0])
-    right_threshold = core_bbox[0] + 0.75 * core_width
-    return any(
-        _EQUATION_NUMBER_RE.match(fragment.text.strip())
-        and _bbox_center_x(fragment.local_bbox) >= right_threshold
-        for row in rows
-        for fragment in row.fragments
-    )
 
 
 def _expand_text_candidate(
@@ -1046,20 +1027,22 @@ def _candidate_grid_evidence(
     axis_lines: list[_LocalAxisLine],
     median_height: float,
 ) -> tuple[int, int, int]:
-    """统计候选内长横线、竖线和交点数。"""
+    """统计候选内达到各自长度门槛的横竖线及其交点数。"""
 
     margin = 2.0 * median_height
     expanded = _expand_bbox(candidate_bbox, margin)
     selected = [line for line in axis_lines if _bbox_intersects(line.bbox, expanded)]
+    horizontal_min_length = max(40.0, median_height * 10.0)
+    vertical_min_length = max(20.0, median_height * 4.0)
     horizontal = [
         line
         for line in selected
-        if line.orientation == "horizontal" and line.bbox[2] - line.bbox[0] >= max(20.0, median_height * 4.0)
+        if line.orientation == "horizontal" and line.bbox[2] - line.bbox[0] >= horizontal_min_length
     ]
     vertical = [
         line
         for line in selected
-        if line.orientation == "vertical" and line.bbox[3] - line.bbox[1] >= max(20.0, median_height * 4.0)
+        if line.orientation == "vertical" and line.bbox[3] - line.bbox[1] >= vertical_min_length
     ]
     intersections = sum(_axis_lines_intersect(h_line, v_line, tolerance=2.0) for h_line in horizontal for v_line in vertical)
     return len(horizontal), len(vertical), intersections
@@ -1099,7 +1082,8 @@ def _build_grid_table_candidates(
         ]
         selected_line_indices = {fragment.line_index for fragment in selected_fragments}
         selected_rows = [row for row in rows if any(fragment.line_index in selected_line_indices for fragment in row.fragments)]
-        if len(selected_rows) < 2:
+        # 至少三行文本才能形成表格，避免将带少量公式文字的线框示意图误判为表格。
+        if len(selected_rows) < 3:
             continue
         grid_text_columns = _count_grid_text_columns(selected_fragments, vertical)
         # 强网格按竖线分隔后的实际文本占位计列，避免字符左边界波动时漏掉有框表格。
@@ -1113,7 +1097,6 @@ def _build_grid_table_candidates(
             score=20.0 + intersection_count + len(selected_rows),
             core_bbox=original_bbox,
             line_indices=selected_line_indices,
-            has_grid=True,
         )
         caption = _find_table_caption(lines, local_bbox, page_size, angle, median_height)
         if caption is not None:
@@ -1215,7 +1198,6 @@ def _merge_table_candidates(candidates: list[_TableCandidate]) -> list[_TableCan
             target.core_bbox = _bbox_union(target.core_bbox, candidate.core_bbox)
         target.line_indices.update(candidate.line_indices)
         target.score = max(target.score, candidate.score)
-        target.has_grid = target.has_grid or candidate.has_grid
     return sorted(merged, key=lambda item: (item.bbox[1], item.bbox[0]))
 
 
