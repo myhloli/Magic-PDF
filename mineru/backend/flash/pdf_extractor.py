@@ -41,6 +41,8 @@ _FORMULA_NUMBER_SUFFIX_RE = re.compile(
     r"^(?P<prefix>.*?)(?P<marker>[(（﹙][^()（）﹙﹚\r\n]+[)）﹚])\s*$"
 )
 _PDF_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_MIN_RASTER_IMAGE_PAGE_AREA_RATIO = 0.005
+_IMAGE_CONTAINER_OVERLAP_THRESHOLD = 0.5
 
 
 @dataclass(slots=True)
@@ -142,12 +144,13 @@ class _FormulaAnchor:
 
 @dataclass(slots=True)
 class _PageSource:
-    """保存单页原生文本分析所需的文本、字符和绘图线。"""
+    """保存单页原生文本分析所需的文本、字符、绘图线和点阵图。"""
 
     page_size: tuple[float, float]
     lines: list[_LineItem]
     chars: list[Char]
     drawing_lines: list[_AxisLine]
+    image_bboxes: list[BBox] = field(default_factory=list)
 
 
 def extract_pages_text(filepath: str, start_page: int = 0, end_page: int | None = None) -> list[str]:
@@ -182,6 +185,7 @@ def _analyze_native_document(pdf_doc: PDFDocument) -> list[list[dict[str, Any]]]
             lines=lines,
             chars=chars,
             drawing_lines=drawing_lines,
+            image_bboxes=pdf_doc.get_page_image_bboxes(page_idx),
         )
         model_list.append(_analyze_page_source(source))
     return model_list
@@ -532,9 +536,9 @@ def _get_pdf_drawing_lines(pdf_doc: PDFDocument, page_idx: int) -> list[_AxisLin
 
 
 def _analyze_page_source(source: _PageSource) -> list[dict[str, Any]]:
-    """按表格、图形、公式、正文的优先级聚合单页文本并排序。"""
+    """按表格、图形、点阵图、公式、正文的优先级聚合单页内容并排序。"""
 
-    if not source.lines:
+    if not source.lines and not source.image_bboxes:
         return []
     candidates = _detect_table_candidates(source)
     table_blocks, claimed_line_indices = _materialize_table_blocks(
@@ -547,7 +551,12 @@ def _analyze_page_source(source: _PageSource) -> list[dict[str, Any]]:
         table_bboxes,
         claimed_line_indices,
     )
-    claimed_line_indices = claimed_line_indices | claimed_graphic_line_indices
+    raster_image_blocks, claimed_raster_line_indices = _build_raster_image_blocks(
+        source,
+        table_blocks + graphic_blocks,
+        claimed_line_indices | claimed_graphic_line_indices,
+    )
+    claimed_line_indices = claimed_line_indices | claimed_graphic_line_indices | claimed_raster_line_indices
     remaining_lines = _merge_same_baseline_text_lines(
         [line for line in source.lines if line.source_index not in claimed_line_indices],
         source.page_size,
@@ -569,7 +578,7 @@ def _analyze_page_source(source: _PageSource) -> list[dict[str, Any]]:
         source.page_size,
         source.drawing_lines,
     )
-    absolute_blocks = table_blocks + graphic_blocks + formula_blocks + text_blocks
+    absolute_blocks = table_blocks + graphic_blocks + raster_image_blocks + formula_blocks + text_blocks
     sorted_blocks = _sort_blocks_with_visual_row_groups(absolute_blocks, source.page_size)
     return [
         normalized for block in sorted_blocks if (normalized := _normalize_output_block(block, source.page_size)) is not None
@@ -1375,12 +1384,11 @@ def _is_graphic_label_member(
     return False
 
 
-def _graphic_members_to_block(
-    candidate: _GraphicCandidate,
+def _image_members_to_content(
     members: list[_LineItem],
     page_size: tuple[float, float],
-) -> dict[str, Any] | None:
-    """按视觉行生成图形标签 content，并用绘图核心和标签并集作为 text bbox。"""
+) -> str:
+    """按视觉行和页内位置生成图片内部文本，保留不同视觉行之间的换行。"""
 
     row_groups: dict[tuple[int, int, int], list[_LineItem]] = {}
     for line in members:
@@ -1402,18 +1410,98 @@ def _graphic_members_to_block(
         if content:
             rows.append((row_bbox, content))
     rows.sort(key=lambda item: (item[0][1], item[0][0]))
-    content = _sanitize_pdf_control_text(
+    return _sanitize_pdf_control_text(
         "\n".join(row_content for _row_bbox, row_content in rows),
         preserve_newlines=True,
     ).strip()
+
+
+def _graphic_members_to_block(
+    candidate: _GraphicCandidate,
+    members: list[_LineItem],
+    page_size: tuple[float, float],
+) -> dict[str, Any] | None:
+    """生成含内部文本的矢量图 image block，并合并绘图核心与标签 bbox。"""
+
+    content = _image_members_to_content(members, page_size)
     if not content:
         return None
     return {
-        "type": "text",
+        "type": "image",
         "bbox": _bbox_union(candidate.core_bbox, _bbox_union_many([line.bbox for line in members])),
         "angle": 0,
         "content": content,
     }
+
+
+def _bbox_area(bbox: BBox) -> float:
+    """返回合法 bbox 的非负面积。"""
+
+    return max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
+
+
+def _build_raster_image_blocks(
+    source: _PageSource,
+    container_blocks: list[dict[str, Any]],
+    claimed_line_indices: set[int],
+) -> tuple[list[dict[str, Any]], set[int]]:
+    """过滤点阵图、避让高优先级容器，并唯一认领图片内部的原生文本。"""
+
+    page_area = max(0.0, source.page_size[0]) * max(0.0, source.page_size[1])
+    if page_area <= 0:
+        return [], set()
+
+    container_bboxes = [
+        bbox
+        for block in container_blocks
+        if (bbox := _coerce_bbox(block.get("bbox"))) is not None
+    ]
+    candidate_bboxes: list[BBox] = []
+    for raw_bbox in source.image_bboxes:
+        bbox = _clip_bbox(_coerce_bbox(raw_bbox), source.page_size)
+        if bbox is None or _bbox_area(bbox) / page_area < _MIN_RASTER_IMAGE_PAGE_AREA_RATIO:
+            continue
+        if any(
+            _bbox_overlap_in_smaller(bbox, container_bbox) >= _IMAGE_CONTAINER_OVERLAP_THRESHOLD
+            for container_bbox in container_bboxes
+        ):
+            continue
+        candidate_bboxes.append(bbox)
+    if not candidate_bboxes:
+        return [], set()
+
+    members_by_candidate: list[list[_LineItem]] = [[] for _ in candidate_bboxes]
+    claimed: set[int] = set()
+    for line in source.lines:
+        if line.source_index in claimed_line_indices:
+            continue
+        center = (_bbox_center_x(line.bbox), _bbox_center_y(line.bbox))
+        matching_indices = [
+            candidate_index
+            for candidate_index, bbox in enumerate(candidate_bboxes)
+            if _point_in_bbox(center, bbox)
+        ]
+        if not matching_indices:
+            continue
+        # 重叠点阵图共享内部文本时归属最小容器，避免 content 重复。
+        candidate_index = min(
+            matching_indices,
+            key=lambda index: (_bbox_area(candidate_bboxes[index]), index),
+        )
+        members_by_candidate[candidate_index].append(line)
+        claimed.add(line.source_index)
+
+    blocks = [
+        {
+            "type": "image",
+            "bbox": bbox,
+            "angle": 0,
+            "content": _image_members_to_content(members, source.page_size),
+        }
+        for bbox, members in zip(candidate_bboxes, members_by_candidate, strict=True)
+    ]
+    blocks.sort(key=lambda block: (block["bbox"][1], block["bbox"][0]))
+    return blocks, claimed
 
 
 def _candidate_projection_line_indices(
@@ -2993,13 +3081,15 @@ def _normalize_output_block(
     if not isinstance(content, str):
         return None
     content = _sanitize_pdf_control_text(content, preserve_newlines=True)
-    if not content.strip():
+    block_type = block.get("type")
+    normalized_type = block_type if block_type in {"table", "image"} else "text"
+    if normalized_type != "image" and not content.strip():
         return None
     normalized_bbox = _normalize_bbox_to_thousandths(bbox, page_size)
     return {
-        "type": "table" if block.get("type") == "table" else "text",
+        "type": normalized_type,
         "bbox": normalized_bbox,
-        "angle": int(block.get("angle", 0) or 0) % 360,
+        "angle": 0 if normalized_type == "image" else int(block.get("angle", 0) or 0) % 360,
         "content": content,
     }
 

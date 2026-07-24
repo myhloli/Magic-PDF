@@ -321,6 +321,16 @@ class PDFDocument:
                 page_rotation = 0
             return _extract_page_drawing_lines(page, page_bbox, page_rotation)
 
+    def get_page_image_bboxes(self, page_idx: int) -> list[BBox]:
+        """提取页面及嵌套 Form 中的点阵图 bbox，并转换为页面左上原点坐标。"""
+        with self._open_page(page_idx) as page:
+            page_bbox = _normalize_pdf_page_bbox(page.get_bbox())
+            try:
+                page_rotation = int(page.get_rotation()) % 360
+            except Exception:
+                page_rotation = 0
+            return _extract_page_image_bboxes(page, page_bbox, page_rotation)
+
     # ------------------------------------------------------------------ #
     #  Classification
     # ------------------------------------------------------------------ #
@@ -474,14 +484,15 @@ def _get_raw_object_matrix(raw_obj: Any) -> tuple[float, float, float, float, fl
     )
 
 
-def _walk_raw_path_objects(
+def _walk_raw_page_objects(
     container: Any,
     *,
     is_form: bool,
     parent_matrix: tuple[float, float, float, float, float, float],
     depth: int,
+    target_type: int,
 ) -> Iterator[tuple[Any, tuple[float, float, float, float, float, float]]]:
-    """递归遍历页面或 Form 中的 Path，并携带累积到页面坐标的矩阵。"""
+    """递归遍历页面或 Form 中的目标对象，并携带累积到页面坐标的矩阵。"""
     if depth >= DRAWING_FORM_MAX_DEPTH:
         return
 
@@ -505,18 +516,36 @@ def _walk_raw_path_objects(
                 continue
             combined_matrix = _multiply_pdf_matrices(object_matrix, parent_matrix)
         except Exception:
-            # 单个损坏页面对象不能中断同页其他绘图线提取。
+            # 单个损坏页面对象不能中断同页其他目标对象遍历。
             continue
 
-        if object_type == pdfium_c.FPDF_PAGEOBJ_PATH:
+        if object_type == target_type:
             yield raw_obj, combined_matrix
-        elif object_type == pdfium_c.FPDF_PAGEOBJ_FORM:
-            yield from _walk_raw_path_objects(
+        if object_type == pdfium_c.FPDF_PAGEOBJ_FORM:
+            yield from _walk_raw_page_objects(
                 raw_obj,
                 is_form=True,
                 parent_matrix=combined_matrix,
                 depth=depth + 1,
+                target_type=target_type,
             )
+
+
+def _walk_raw_path_objects(
+    container: Any,
+    *,
+    is_form: bool,
+    parent_matrix: tuple[float, float, float, float, float, float],
+    depth: int,
+) -> Iterator[tuple[Any, tuple[float, float, float, float, float, float]]]:
+    """递归遍历页面或 Form 中的 Path，并携带累积到页面坐标的矩阵。"""
+    yield from _walk_raw_page_objects(
+        container,
+        is_form=is_form,
+        parent_matrix=parent_matrix,
+        depth=depth,
+        target_type=pdfium_c.FPDF_PAGEOBJ_PATH,
+    )
 
 
 def _iter_raw_path_objects(
@@ -529,6 +558,20 @@ def _iter_raw_path_objects(
         is_form=False,
         parent_matrix=identity,
         depth=0,
+    )
+
+
+def _iter_raw_image_objects(
+    page: pdfium.PdfPage,
+) -> Iterator[tuple[Any, tuple[float, float, float, float, float, float]]]:
+    """从页面根对象开始遍历全部点阵图，包括嵌套 Form 中的图片。"""
+    identity = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+    yield from _walk_raw_page_objects(
+        page,
+        is_form=False,
+        parent_matrix=identity,
+        depth=0,
+        target_type=pdfium_c.FPDF_PAGEOBJ_IMAGE,
     )
 
 
@@ -901,6 +944,52 @@ def _merge_collinear_drawing_lines(
         [*horizontal, *vertical],
         key=lambda line: (line.bbox[1], line.bbox[0], line.orientation),
     )
+
+
+def _image_bbox_from_matrix(
+    matrix: tuple[float, float, float, float, float, float],
+    page_bbox: BBox,
+    page_rotation: int,
+) -> BBox | None:
+    """把点阵图单位矩形经对象/Form 矩阵转换并裁剪为页面左上坐标 bbox。"""
+    page_points = [
+        _transform_drawing_point(
+            _apply_pdf_matrix(point, matrix),
+            page_bbox,
+            page_rotation,
+        )
+        for point in ((0.0, 0.0), (0.0, 1.0), (1.0, 0.0), (1.0, 1.0))
+    ]
+    coordinates = [coordinate for point in page_points for coordinate in point]
+    if not all(math.isfinite(value) for value in coordinates):
+        return None
+
+    page_width, page_height = _drawing_page_size(page_bbox, page_rotation)
+    left = max(0.0, min(point[0] for point in page_points))
+    top = max(0.0, min(point[1] for point in page_points))
+    right = min(page_width, max(point[0] for point in page_points))
+    bottom = min(page_height, max(point[1] for point in page_points))
+    if right <= left or bottom <= top:
+        return None
+    return left, top, right, bottom
+
+
+def _extract_page_image_bboxes(
+    page: pdfium.PdfPage,
+    page_bbox: BBox,
+    page_rotation: int,
+) -> list[BBox]:
+    """在调用方持有 PDFium 锁时提取全部有效点阵图 bbox，并隔离单对象异常。"""
+    image_bboxes: list[BBox] = []
+    for _raw_obj, matrix in _iter_raw_image_objects(page):
+        try:
+            image_bbox = _image_bbox_from_matrix(matrix, page_bbox, page_rotation)
+        except Exception:
+            # 单个损坏 Image 对象不能中断同页其他点阵图提取。
+            continue
+        if image_bbox is not None:
+            image_bboxes.append(image_bbox)
+    return sorted(image_bboxes, key=lambda bbox: (bbox[1], bbox[0], bbox[3], bbox[2]))
 
 
 def _extract_page_drawing_lines(

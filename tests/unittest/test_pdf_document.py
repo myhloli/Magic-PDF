@@ -7,6 +7,7 @@ import pytest
 from pypdf import PdfReader, PdfWriter
 from pdftext.schema import Bbox
 from PIL import Image
+from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen.canvas import Canvas
 
 from mineru.utils import pdf_document
@@ -50,6 +51,41 @@ def _build_rotated_cropped_drawing_pdf() -> bytes:
     canvas = Canvas(source, pagesize=(100, 200))
     canvas.setLineWidth(2)
     canvas.line(10, 20, 90, 20)
+    canvas.save()
+
+    reader = PdfReader(BytesIO(source.getvalue()))
+    page = reader.pages[0]
+    page.rotate(90)
+    page.cropbox.lower_left = (5, 10)
+    page.cropbox.upper_right = (95, 190)
+    writer = PdfWriter()
+    writer.add_page(page)
+    output = BytesIO()
+    writer.write(output)
+    return output.getvalue()
+
+
+def _build_rotated_cropped_image_pdf() -> bytes:
+    """构造普通、嵌套 Form、部分页外和完全页外点阵图，并应用 CropBox 与旋转。"""
+    image = Image.new("RGB", (3, 4), "red")
+    image_buffer = BytesIO()
+    image.save(image_buffer, format="PNG")
+    image_buffer.seek(0)
+    image_reader = ImageReader(image_buffer)
+
+    source = BytesIO()
+    canvas = Canvas(source, pagesize=(100, 200))
+    canvas.drawImage(image_reader, 10, 20, width=30, height=40)
+    canvas.drawImage(image_reader, -10, 170, width=30, height=40)
+    canvas.drawImage(image_reader, -30, -30, width=5, height=5)
+    canvas.beginForm("NestedImage", 0, 0, 20, 20)
+    canvas.drawImage(image_reader, 1, 2, width=3, height=4)
+    canvas.endForm()
+    canvas.saveState()
+    canvas.translate(50, 80)
+    canvas.scale(2, 3)
+    canvas.doForm("NestedImage")
+    canvas.restoreState()
     canvas.save()
 
     reader = PdfReader(BytesIO(source.getvalue()))
@@ -152,10 +188,20 @@ def test_pdf_document_methods_keep_page_access_inside_pdfium_lock(monkeypatch: p
         events.append(f"drawing_lines:{lock.depth}:{page_bbox}:{page_rotation}")
         return []
 
+    def fake_extract_page_image_bboxes(
+        page: _FakePage,
+        page_bbox: tuple[float, float, float, float],
+        page_rotation: int,
+    ) -> list[tuple[float, float, float, float]]:
+        """记录点阵图遍历时仍由 PDFDocument 持有 PDFium 锁。"""
+        events.append(f"image_bboxes:{lock.depth}:{page_bbox}:{page_rotation}")
+        return []
+
     monkeypatch.setattr(pdf_document.pdfium, "PdfDocument", _FakeDoc)
     monkeypatch.setattr(pdf_document, "get_chars", fake_get_chars, raising=False)
     monkeypatch.setattr(pdf_document, "pdftext_get_chars", fake_get_chars, raising=False)
     monkeypatch.setattr(pdf_document, "_extract_page_drawing_lines", fake_extract_page_drawing_lines)
+    monkeypatch.setattr(pdf_document, "_extract_page_image_bboxes", fake_extract_page_image_bboxes)
 
     doc = pdf_document.PDFDocument(b"%PDF")
 
@@ -165,6 +211,7 @@ def test_pdf_document_methods_keep_page_access_inside_pdfium_lock(monkeypatch: p
     assert image.scale == 3
     assert doc.get_page_chars(0)[0]["char"] == "A"
     assert doc.get_page_drawing_lines(0) == []
+    assert doc.get_page_image_bboxes(0) == []
 
     assert any(event.startswith("doc.open:") and not event.startswith("doc.open:0:") for event in events)
     assert any(event.startswith("doc.__getitem__:") and not event.startswith("doc.__getitem__:0:") for event in events)
@@ -177,6 +224,7 @@ def test_pdf_document_methods_keep_page_access_inside_pdfium_lock(monkeypatch: p
     assert "get_chars:1:[0.0, 10.0, 20.0, 0.0]:0" in events
     assert "textpage.close:1" in events
     assert "drawing_lines:1:(0.0, 0.0, 20.0, 10.0):0" in events
+    assert "image_bboxes:1:(0.0, 0.0, 20.0, 10.0):0" in events
 
 
 def test_pdf_document_does_not_expose_legacy_compat_hooks() -> None:
@@ -229,6 +277,22 @@ def test_get_page_drawing_lines_applies_crop_box_and_page_rotation() -> None:
     assert line.end == pytest.approx((10.0, 85.0))
     assert line.bbox == pytest.approx((9.0, 5.0, 11.0, 85.0))
     assert line.width == pytest.approx(2.0)
+
+
+def test_get_page_image_bboxes_applies_forms_crop_box_rotation_and_clipping() -> None:
+    """验证点阵图接口递归 Form，并按 CropBox、页面旋转裁剪为左上坐标。"""
+    with pdf_document.PDFDocument(_build_rotated_cropped_image_pdf()) as doc:
+        page_size = doc.page_size(0)
+        image_bboxes = doc.get_page_image_bboxes(0)
+
+    assert page_size == pytest.approx((180.0, 90.0))
+    assert image_bboxes == pytest.approx(
+        [
+            (160.0, 0.0, 180.0, 15.0),
+            (10.0, 5.0, 50.0, 35.0),
+            (76.0, 47.0, 88.0, 53.0),
+        ]
+    )
 
 
 def test_get_page_drawing_lines_skips_one_bad_path(monkeypatch: pytest.MonkeyPatch) -> None:
