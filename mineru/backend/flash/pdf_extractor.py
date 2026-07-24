@@ -8,7 +8,9 @@ from __future__ import annotations
 import math
 import re
 import statistics
+import unicodedata
 from dataclasses import dataclass, field, replace
+from difflib import SequenceMatcher
 from typing import Any, Literal, Sequence
 
 from loguru import logger
@@ -43,6 +45,21 @@ _FORMULA_NUMBER_SUFFIX_RE = re.compile(
 _PDF_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _MIN_RASTER_IMAGE_PAGE_AREA_RATIO = 0.005
 _IMAGE_CONTAINER_OVERLAP_THRESHOLD = 0.5
+_TEXT_SEMANTIC_TYPES = {
+    "doc_title",
+    "paragraph_title",
+    "header",
+    "footer",
+    "page_number",
+}
+_OUTPUT_BLOCK_TYPES = {"text", "table", "image", "equation"} | _TEXT_SEMANTIC_TYPES
+_PAGE_NUMBER_RE = re.compile(
+    r"^\s*(?:page\s*)?[\-\u2013\u2014\u00b7\u2022]*\s*(?:\u7b2c\s*)?"
+    r"(?P<value>\d{1,4}|[ivxlcdm]+|[\u3007\u96f6\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\u4e24]+)"
+    r"(?:\s*(?:/|of|\u5171)\s*(?:\d{1,4}|[ivxlcdm]+|[\u3007\u96f6\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\u4e24]+))?"
+    r"\s*(?:\u9875)?\s*[\-\u2013\u2014\u00b7\u2022]*\s*$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(slots=True)
@@ -59,7 +76,10 @@ class _LineItem:
     effective_height: float = 0.0
     font_signature: tuple[str, int] | None = None
     font_coverage: float = 0.0
+    dominant_font_weight: float | None = None
+    median_glyph_width: float | None = None
     split_from_row: bool = False
+    semantic_type: str | None = None
 
 
 @dataclass(slots=True)
@@ -153,6 +173,39 @@ class _PageSource:
     image_bboxes: list[BBox] = field(default_factory=list)
 
 
+@dataclass(slots=True)
+class _PreparedPage:
+    """保存容器认领完成后、等待跨页与文本类型判定的轻量页面。"""
+
+    page_size: tuple[float, float]
+    remaining_lines: list[_LineItem]
+    table_bboxes: list[BBox]
+    drawing_lines: list[_AxisLine]
+    fixed_blocks: list[dict[str, Any]]
+
+
+@dataclass(slots=True)
+class _MarginalCandidate:
+    """保存页眉页脚带中的单行候选及其正向归一化几何。"""
+
+    page_index: int
+    line: _LineItem
+    local_bbox: BBox
+    local_page_size: tuple[float, float]
+    region: Literal["header", "footer", "side"]
+
+
+@dataclass(slots=True)
+class _LaneBodyProfile:
+    """保存标题判定使用的栏带正文排版基线，不包含文本内容特征。"""
+
+    body_height: float
+    body_font: tuple[str, int] | None
+    body_weight: float | None
+    regular_gap: float
+    style_support: dict[tuple[str, int], float]
+
+
 def extract_pages_text(filepath: str, start_page: int = 0, end_page: int | None = None) -> list[str]:
     """Extract plain text from each PDF page, preserving empty pages."""
 
@@ -168,9 +221,9 @@ def extract_pages_text(filepath: str, start_page: int = 0, end_page: int | None 
 
 
 def _analyze_native_document(pdf_doc: PDFDocument) -> list[list[dict[str, Any]]]:
-    """逐页处理数字 PDF，同一页只读取一次原生字符。"""
+    """逐页读取数字 PDF，并在轻量页面上完成跨页文本类型判定。"""
 
-    model_list: list[list[dict[str, Any]]] = []
+    prepared_pages: list[_PreparedPage] = []
     for page_idx in range(pdf_doc.page_count):
         page_size = pdf_doc.page_size(page_idx)
         chars = pdf_doc.get_page_chars(page_idx)
@@ -187,8 +240,13 @@ def _analyze_native_document(pdf_doc: PDFDocument) -> list[list[dict[str, Any]]]
             drawing_lines=drawing_lines,
             image_bboxes=pdf_doc.get_page_image_bboxes(page_idx),
         )
-        model_list.append(_analyze_page_source(source))
-    return model_list
+        prepared_pages.append(_prepare_page_source(source))
+
+    _classify_repeated_page_marginals(prepared_pages)
+    return [
+        _finalize_prepared_page(prepared, page_index)
+        for page_index, prepared in enumerate(prepared_pages)
+    ]
 
 
 def _build_native_line_items(
@@ -353,7 +411,9 @@ def _fill_native_typography(line: _LineItem, page_size: tuple[float, float]) -> 
     """使用非空字符 bbox 高度和 dominant font 填充原生行排版特征。"""
 
     heights: list[float] = []
+    glyph_widths: list[float] = []
     font_counts: dict[tuple[str, int], int] = {}
+    font_weights: dict[tuple[str, int], list[float]] = {}
     valid_font_chars = 0
     for char in line.chars:
         raw_char = str(char.get("char") or "")
@@ -364,6 +424,7 @@ def _fill_native_typography(line: _LineItem, page_size: tuple[float, float]) -> 
             continue
         local_bbox = _rotate_bbox_to_upright(bbox, page_size, line.angle)
         heights.append(max(0.1, local_bbox[3] - local_bbox[1]))
+        glyph_widths.append(max(0.1, local_bbox[2] - local_bbox[0]))
         font = char.get("font") or {}
         font_name = str(font.get("name") or "")
         if not font_name:
@@ -374,16 +435,26 @@ def _fill_native_typography(line: _LineItem, page_size: tuple[float, float]) -> 
             font_flags = 0
         signature = (font_name, font_flags)
         font_counts[signature] = font_counts.get(signature, 0) + 1
+        try:
+            font_weight = float(font.get("weight"))
+        except (TypeError, ValueError):
+            font_weight = math.nan
+        if math.isfinite(font_weight):
+            font_weights.setdefault(signature, []).append(font_weight)
         valid_font_chars += 1
 
     local_bbox = _rotate_bbox_to_upright(line.bbox, page_size, line.angle)
     line.effective_height = statistics.median(heights) if heights else max(0.1, local_bbox[3] - local_bbox[1])
+    line.median_glyph_width = statistics.median(glyph_widths) if glyph_widths else None
     if font_counts and valid_font_chars:
         line.font_signature, dominant_count = max(font_counts.items(), key=lambda item: item[1])
         line.font_coverage = dominant_count / valid_font_chars
+        dominant_weights = font_weights.get(line.font_signature, [])
+        line.dominant_font_weight = statistics.median(dominant_weights) if dominant_weights else None
     else:
         line.font_signature = None
         line.font_coverage = 0.0
+        line.dominant_font_weight = None
 
 
 def _merge_native_inline_scripts(
@@ -535,11 +606,9 @@ def _get_pdf_drawing_lines(pdf_doc: PDFDocument, page_idx: int) -> list[_AxisLin
     return output
 
 
-def _analyze_page_source(source: _PageSource) -> list[dict[str, Any]]:
-    """按表格、图形、点阵图、公式、正文的优先级聚合单页内容并排序。"""
+def _prepare_page_source(source: _PageSource) -> _PreparedPage:
+    """先完成表格、图形和点阵图认领，留下可跨页比较的轻量文本行。"""
 
-    if not source.lines and not source.image_bboxes:
-        return []
     candidates = _detect_table_candidates(source)
     table_blocks, claimed_line_indices = _materialize_table_blocks(
         source,
@@ -562,27 +631,698 @@ def _analyze_page_source(source: _PageSource) -> list[dict[str, Any]]:
         source.page_size,
         table_bboxes,
     )
+    _compact_prepared_lines(remaining_lines, source.page_size)
+    return _PreparedPage(
+        page_size=source.page_size,
+        remaining_lines=remaining_lines,
+        table_bboxes=table_bboxes,
+        drawing_lines=source.drawing_lines,
+        fixed_blocks=table_blocks + graphic_blocks + raster_image_blocks,
+    )
+
+
+def _compact_prepared_lines(
+    lines: list[_LineItem],
+    page_size: tuple[float, float],
+) -> None:
+    """缓存后续仍需的字符尺度并释放字符字典，限制跨页阶段内存占用。"""
+
+    for line in lines:
+        if line.median_glyph_width is None:
+            line.median_glyph_width = _median_native_glyph_width(line, page_size)
+        line.chars.clear()
+
+
+def _finalize_prepared_page(
+    prepared: _PreparedPage,
+    page_index: int,
+) -> list[dict[str, Any]]:
+    """按边缘类型、公式、标题、正文的优先级完成单页文本并排序。"""
+
+    marginal_lines = [line for line in prepared.remaining_lines if line.semantic_type in {"header", "footer", "page_number"}]
+    formula_input = [line for line in prepared.remaining_lines if line.semantic_type is None]
     formula_blocks, remaining_lines = _build_formula_like_blocks(
-        remaining_lines,
-        table_bboxes,
-        source.page_size,
+        formula_input,
+        prepared.table_bboxes,
+        prepared.page_size,
     )
     remaining_lines = _restore_dense_split_visual_rows(
         remaining_lines,
-        source.page_size,
-        table_bboxes,
+        prepared.page_size,
+        prepared.table_bboxes,
+    )
+    _classify_page_titles(
+        remaining_lines,
+        prepared.page_size,
+        page_index=page_index,
+        container_bboxes=[block["bbox"] for block in prepared.fixed_blocks],
     )
     text_blocks = _build_text_blocks(
-        remaining_lines,
-        table_bboxes,
-        source.page_size,
-        source.drawing_lines,
+        marginal_lines + remaining_lines,
+        prepared.table_bboxes,
+        prepared.page_size,
+        prepared.drawing_lines,
     )
-    absolute_blocks = table_blocks + graphic_blocks + raster_image_blocks + formula_blocks + text_blocks
-    sorted_blocks = _sort_blocks_with_visual_row_groups(absolute_blocks, source.page_size)
+    absolute_blocks = prepared.fixed_blocks + formula_blocks + text_blocks
+    sorted_blocks = _sort_blocks_with_visual_row_groups(absolute_blocks, prepared.page_size)
     return [
-        normalized for block in sorted_blocks if (normalized := _normalize_output_block(block, source.page_size)) is not None
+        normalized
+        for block in sorted_blocks
+        if (normalized := _normalize_output_block(block, prepared.page_size)) is not None
     ]
+
+
+def _analyze_page_source(source: _PageSource) -> list[dict[str, Any]]:
+    """兼容单页测试入口；单页不凭边缘位置猜测页眉、页脚或页码。"""
+
+    if not source.lines and not source.image_bboxes:
+        return []
+    return _finalize_prepared_page(_prepare_page_source(source), page_index=0)
+
+
+def _classify_repeated_page_marginals(pages: list[_PreparedPage]) -> None:
+    """仅用相邻或同奇偶页的重复证据标注页码、页眉和页脚。"""
+
+    if len(pages) < 2:
+        return
+    candidates = [
+        candidate
+        for page_index, page in enumerate(pages)
+        for line in page.remaining_lines
+        if (candidate := _build_marginal_candidate(page_index, line, page.page_size)) is not None
+    ]
+
+    for left_index, left in enumerate(candidates):
+        left_value = _parse_page_number_value(left.line.text)
+        if left_value is None:
+            continue
+        for right in candidates[left_index + 1 :]:
+            page_delta = right.page_index - left.page_index
+            if page_delta > 2:
+                break
+            right_value = _parse_page_number_value(right.line.text)
+            if (
+                page_delta > 0
+                and right_value is not None
+                and right_value - left_value == page_delta
+                and _page_number_candidates_match(left, right)
+            ):
+                left.line.semantic_type = "page_number"
+                right.line.semantic_type = "page_number"
+
+    for left_index, left in enumerate(candidates):
+        if left.line.semantic_type == "page_number":
+            continue
+        for right in candidates[left_index + 1 :]:
+            page_delta = right.page_index - left.page_index
+            if page_delta > 2:
+                break
+            if (
+                page_delta > 0
+                and left.region != "side"
+                and right.region != "side"
+                and right.line.semantic_type != "page_number"
+                and _marginal_geometry_matches(left, right)
+                and _marginal_text_matches(left.line.text, right.line.text)
+            ):
+                left.line.semantic_type = left.region
+                right.line.semantic_type = right.region
+
+
+def _build_marginal_candidate(
+    page_index: int,
+    line: _LineItem,
+    page_size: tuple[float, float],
+) -> _MarginalCandidate | None:
+    """把页面上下百分之十五内的常规小行转换成跨页比较候选。"""
+
+    if line.semantic_type is not None:
+        return None
+    local_bbox = _rotate_bbox_to_upright(line.bbox, page_size, line.angle)
+    local_page_size = (page_size[1], page_size[0]) if line.angle in {90, 270} else page_size
+    local_page_width, local_page_height = local_page_size
+    if local_page_width <= 0 or local_page_height <= 0:
+        return None
+    normalized_center_y = _bbox_center_y(local_bbox) / local_page_height
+    normalized_center_x = _bbox_center_x(local_bbox) / local_page_width
+    if normalized_center_y <= 0.15:
+        region: Literal["header", "footer", "side"] = "header"
+    elif normalized_center_y >= 0.85:
+        region = "footer"
+    elif (
+        normalized_center_y <= 0.18
+        or normalized_center_y >= 0.82
+        or (
+            (normalized_center_x <= 0.15 or normalized_center_x >= 0.85)
+            and (normalized_center_y <= 0.3 or normalized_center_y >= 0.7)
+        )
+    ):
+        # 仅页码递增逻辑会消费 side；稳定文本不会被侧栏位置猜成页眉页脚。
+        region = "side"
+    else:
+        return None
+    if _line_effective_height(line, local_bbox) > 0.06 * local_page_height:
+        return None
+    return _MarginalCandidate(
+        page_index=page_index,
+        line=line,
+        local_bbox=local_bbox,
+        local_page_size=local_page_size,
+        region=region,
+    )
+
+
+def _page_number_candidates_match(
+    first: _MarginalCandidate,
+    second: _MarginalCandidate,
+) -> bool:
+    """校验连续页码的同边缘几何，横竖版切换时允许边缘位置随版面改变。"""
+
+    if _marginal_geometry_matches(first, second):
+        return True
+    first_landscape = first.local_page_size[0] > first.local_page_size[1]
+    second_landscape = second.local_page_size[0] > second.local_page_size[1]
+    if first_landscape == second_landscape or first.line.angle != second.line.angle:
+        return False
+    first_height = _line_effective_height(first.line, first.local_bbox) / first.local_page_size[1]
+    second_height = _line_effective_height(second.line, second.local_bbox) / second.local_page_size[1]
+    return min(first_height, second_height) > 0 and max(first_height, second_height) / min(
+        first_height,
+        second_height,
+    ) <= 1.5
+
+
+def _marginal_geometry_matches(
+    first: _MarginalCandidate,
+    second: _MarginalCandidate,
+) -> bool:
+    """比较边缘候选的方向、纵向带、字号以及同侧或镜像横向位置。"""
+
+    if first.region != second.region or first.line.angle != second.line.angle:
+        return False
+    first_width, first_height = first.local_page_size
+    second_width, second_height = second.local_page_size
+    first_y = _bbox_center_y(first.local_bbox) / first_height
+    second_y = _bbox_center_y(second.local_bbox) / second_height
+    if abs(first_y - second_y) > 0.025:
+        return False
+    first_line_height = _line_effective_height(first.line, first.local_bbox) / first_height
+    second_line_height = _line_effective_height(second.line, second.local_bbox) / second_height
+    if min(first_line_height, second_line_height) <= 0 or max(first_line_height, second_line_height) / min(
+        first_line_height,
+        second_line_height,
+    ) > 1.35:
+        return False
+    if (
+        first.line.font_signature is not None
+        and second.line.font_signature is not None
+        and first.line.font_coverage >= 0.75
+        and second.line.font_coverage >= 0.75
+        and first.line.font_signature != second.line.font_signature
+    ):
+        return False
+
+    first_normalized_bbox = (
+        first.local_bbox[0] / first_width,
+        first.local_bbox[1] / first_height,
+        first.local_bbox[2] / first_width,
+        first.local_bbox[3] / first_height,
+    )
+    second_normalized_bbox = (
+        second.local_bbox[0] / second_width,
+        second.local_bbox[1] / second_height,
+        second.local_bbox[2] / second_width,
+        second.local_bbox[3] / second_height,
+    )
+    same_side = (
+        _bbox_axis_overlap_ratio(first_normalized_bbox, second_normalized_bbox, axis="x") >= 0.4
+        or abs(_bbox_center_x(first_normalized_bbox) - _bbox_center_x(second_normalized_bbox)) <= 0.08
+    )
+    mirrored = abs(
+        _bbox_center_x(first_normalized_bbox) + _bbox_center_x(second_normalized_bbox) - 1.0
+    ) <= 0.12
+    return same_side or mirrored
+
+
+def _parse_page_number_value(text: str) -> int | None:
+    """解析整行阿拉伯、罗马或中文页码；混有稳定正文的行不作为纯页码。"""
+
+    normalized = unicodedata.normalize("NFKC", str(text or ""))
+    match = _PAGE_NUMBER_RE.fullmatch(normalized)
+    if match is None:
+        return None
+    value = match.group("value")
+    if value.isdecimal():
+        return int(value)
+    if re.fullmatch(r"[ivxlcdm]+", value, re.IGNORECASE):
+        return _roman_number_to_int(value)
+    return _chinese_page_number_to_int(value)
+
+
+def _roman_number_to_int(value: str) -> int | None:
+    """把页码中的规范罗马数字转换成整数，非法组合返回空。"""
+
+    roman_values = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
+    normalized = value.upper()
+    total = 0
+    previous = 0
+    for char in reversed(normalized):
+        current = roman_values.get(char)
+        if current is None:
+            return None
+        total += -current if current < previous else current
+        previous = max(previous, current)
+    if total <= 0 or total > 4999:
+        return None
+    return total
+
+
+def _chinese_page_number_to_int(value: str) -> int | None:
+    """把常见百位以内中文页码转换成整数，供跨页递增校验使用。"""
+
+    digits = {"〇": 0, "零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+    if all(char in digits for char in value):
+        try:
+            return int("".join(str(digits[char]) for char in value))
+        except ValueError:
+            return None
+    total = 0
+    current_digit = 0
+    for char in value:
+        if char in digits:
+            current_digit = digits[char]
+        elif char == "十":
+            total += (current_digit or 1) * 10
+            current_digit = 0
+        elif char == "百":
+            total += (current_digit or 1) * 100
+            current_digit = 0
+        else:
+            return None
+    return total + current_digit if total + current_digit > 0 else None
+
+
+def _marginal_text_matches(first_text: str, second_text: str) -> bool:
+    """在屏蔽变化数字后比较边缘稳定文本，短文本只接受完全一致。"""
+
+    first = _normalize_marginal_text(first_text)
+    second = _normalize_marginal_text(second_text)
+    if not first or not second:
+        return False
+    if first == second:
+        return True
+    if min(len(first), len(second)) < 8:
+        return False
+    return SequenceMatcher(a=first, b=second, autojunk=False).ratio() >= 0.92
+
+
+def _normalize_marginal_text(text: str) -> str:
+    """统一边缘重复文本的宽窄字符、大小写、空白和可变数字。"""
+
+    normalized = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    normalized = re.sub(r"\d+", "#", normalized)
+    return re.sub(r"\s+", "", normalized).strip()
+
+
+def _classify_page_titles(
+    lines: list[_LineItem],
+    page_size: tuple[float, float],
+    *,
+    page_index: int,
+    container_bboxes: list[BBox],
+) -> None:
+    """只用页面几何与字体排版标注首页文档标题和各页段落标题。"""
+
+    for angle in sorted({line.angle for line in lines if line.semantic_type is None}):
+        line_geometry = [
+            (line, _rotate_bbox_to_upright(line.bbox, page_size, angle))
+            for line in lines
+            if line.angle == angle and line.semantic_type is None
+        ]
+        if not line_geometry:
+            continue
+        median_height = statistics.median(
+            _line_effective_height(line, bbox) for line, bbox in line_geometry
+        )
+        local_page_width = page_size[1] if angle in {90, 270} else page_size[0]
+        local_page_height = page_size[0] if angle in {90, 270} else page_size[1]
+        lanes = _infer_text_lanes(line_geometry, local_page_width, median_height)
+        for lane in lanes:
+            lane.lines.sort(key=lambda item: (item[1][1], item[1][0], item[0].source_index))
+
+        document_title_bottom: float | None = None
+        if page_index == 0:
+            document_title_bottom = _classify_document_title(
+                lanes,
+                local_page_height,
+            )
+
+        local_container_bboxes = [
+            _rotate_bbox_to_upright(bbox, page_size, angle)
+            for bbox in container_bboxes
+        ]
+        for lane in lanes:
+            profile = _infer_lane_body_profile(lane)
+            _classify_paragraph_titles_in_lane(
+                lane,
+                profile,
+                local_page_height,
+                local_container_bboxes,
+                document_title_bottom=document_title_bottom,
+            )
+
+
+def _infer_lane_body_profile(lane: _TextLane) -> _LaneBodyProfile:
+    """从栏带的长行主体估计正文行高、主字体、字重、常规行距和样式占比。"""
+
+    available = [item for item in lane.lines if item[0].semantic_type is None]
+    if not available:
+        return _LaneBodyProfile(1.0, None, None, 0.35, {})
+    lane_width = max(0.1, lane.right - lane.left)
+    long_lines = [item for item in available if item[1][2] - item[1][0] >= 0.45 * lane_width]
+    body_rows = long_lines or available
+    body_line_ids = {id(line) for line, _bbox in body_rows}
+    body_height = statistics.median(_line_effective_height(line, bbox) for line, bbox in body_rows)
+
+    font_support: dict[tuple[str, int], float] = {}
+    style_support: dict[tuple[str, int], float] = {}
+    total_style_width = 0.0
+    for line, bbox in available:
+        if line.font_signature is None or line.font_coverage < 0.75:
+            continue
+        line_width = max(0.1, bbox[2] - bbox[0])
+        style_support[line.font_signature] = style_support.get(line.font_signature, 0.0) + line_width
+        total_style_width += line_width
+        if id(line) in body_line_ids and 0.75 <= _line_effective_height(line, bbox) / body_height <= 1.35:
+            font_support[line.font_signature] = font_support.get(line.font_signature, 0.0) + line_width
+    body_font = max(font_support, key=font_support.get) if font_support else None
+    if total_style_width > 0:
+        style_support = {signature: width / total_style_width for signature, width in style_support.items()}
+
+    body_weights = [
+        line.dominant_font_weight
+        for line, bbox in body_rows
+        if line.dominant_font_weight is not None
+        and (body_font is None or line.font_signature == body_font)
+        and 0.75 <= _line_effective_height(line, bbox) / body_height <= 1.35
+    ]
+    regular_gap, _gap_mad = _estimate_lane_gap(lane)
+    return _LaneBodyProfile(
+        body_height=max(0.1, body_height),
+        body_font=body_font,
+        body_weight=statistics.median(body_weights) if body_weights else None,
+        regular_gap=regular_gap,
+        style_support=style_support,
+    )
+
+
+def _classify_document_title(
+    lanes: list[_TextLane],
+    local_page_height: float,
+) -> float | None:
+    """从首页上部选取显著大字号锚点，并用同版式邻行扩展多行文档标题。"""
+
+    candidates: list[tuple[float, _TextLane, int, tuple[_LineItem, BBox]]] = []
+    lane_profiles = [(lane, _infer_lane_body_profile(lane)) for lane in lanes]
+    column_body_heights = [profile.body_height for lane, profile in lane_profiles if not lane.is_span]
+    document_body_height = (
+        statistics.median(column_body_heights)
+        if column_body_heights
+        else min((profile.body_height for _lane, profile in lane_profiles), default=1.0)
+    )
+    for lane, profile in lane_profiles:
+        lane_width = max(0.1, lane.right - lane.left)
+        available = [item for item in lane.lines if item[0].semantic_type is None]
+        for row_index, item in enumerate(available[:5]):
+            line, bbox = item
+            reference_height = min(profile.body_height, 1.25 * document_body_height)
+            height_ratio = _line_effective_height(line, bbox) / max(0.1, reference_height)
+            width_ratio = (bbox[2] - bbox[0]) / lane_width
+            centered = abs(_bbox_center_x(bbox) - (lane.left + lane.right) / 2.0) <= 0.15 * lane_width
+            if (
+                _bbox_center_y(bbox) > 0.45 * local_page_height
+                or height_ratio < 1.4
+                or width_ratio < 0.2
+                or (not centered and height_ratio < 1.7)
+            ):
+                continue
+            top_preference = max(0.0, 0.45 - _bbox_center_y(bbox) / local_page_height)
+            score = height_ratio + (0.75 if centered else 0.0) + top_preference - 0.05 * row_index
+            candidates.append((score, lane, row_index, item))
+    if not candidates:
+        return None
+
+    _score, lane, _row_index, anchor = max(candidates, key=lambda item: item[0])
+    anchor_line, anchor_bbox = anchor
+    anchor_height = _line_effective_height(anchor_line, anchor_bbox)
+    anchor_line.semantic_type = "doc_title"
+    selected = [anchor]
+    ordered = lane.lines
+    anchor_index = ordered.index(anchor)
+    for direction in (-1, 1):
+        index = anchor_index + direction
+        previous_bbox = anchor_bbox
+        while 0 <= index < len(ordered):
+            candidate_line, candidate_bbox = ordered[index]
+            if candidate_line.semantic_type is not None:
+                break
+            candidate_height = _line_effective_height(candidate_line, candidate_bbox)
+            if not 0.8 <= candidate_height / anchor_height <= 1.25:
+                break
+            if not _title_fonts_compatible(anchor_line, candidate_line):
+                break
+            vertical_gap = max(candidate_bbox[1] - previous_bbox[3], previous_bbox[1] - candidate_bbox[3], 0.0)
+            lane_width = max(0.1, lane.right - lane.left)
+            centered = abs(_bbox_center_x(candidate_bbox) - _bbox_center_x(anchor_bbox)) <= 0.18 * lane_width
+            aligned = abs(candidate_bbox[0] - anchor_bbox[0]) <= 0.75 * anchor_height
+            if vertical_gap > 1.1 * anchor_height or not (centered or aligned):
+                break
+            candidate_line.semantic_type = "doc_title"
+            selected.append((candidate_line, candidate_bbox))
+            previous_bbox = candidate_bbox
+            index += direction
+    return max(bbox[3] for _line, bbox in selected)
+
+
+def _classify_paragraph_titles_in_lane(
+    lane: _TextLane,
+    profile: _LaneBodyProfile,
+    local_page_height: float,
+    container_bboxes: list[BBox],
+    *,
+    document_title_bottom: float | None,
+) -> None:
+    """以字号、样式、留白、对齐、栏宽和容器邻接判定段落标题。"""
+
+    lane_width = max(0.1, lane.right - lane.left)
+    rows = lane.lines
+    selected_indices: set[int] = set()
+    front_matter_boundary = _infer_front_matter_boundary(
+        lane,
+        profile,
+        local_page_height,
+        document_title_bottom=document_title_bottom,
+    )
+    for index, (line, bbox) in enumerate(rows):
+        if line.semantic_type is not None:
+            continue
+        if not 0.07 * local_page_height <= _bbox_center_y(bbox) <= 0.93 * local_page_height:
+            continue
+        if front_matter_boundary is not None and _bbox_center_y(bbox) <= front_matter_boundary:
+            continue
+        if _line_near_visual_container(bbox, container_bboxes, profile.body_height):
+            continue
+
+        line_height = _line_effective_height(line, bbox)
+        height_ratio = line_height / profile.body_height
+        width_ratio = (bbox[2] - bbox[0]) / lane_width
+        centered = abs(_bbox_center_x(bbox) - (lane.left + lane.right) / 2.0) <= 0.12 * lane_width
+        left_aligned = abs(bbox[0] - lane.left) <= 0.65 * profile.body_height
+        style_differs = (
+            profile.body_font is not None
+            and line.font_signature is not None
+            and line.font_coverage >= 0.75
+            and line.font_signature != profile.body_font
+        )
+        style_support = profile.style_support.get(line.font_signature, 1.0) if line.font_signature is not None else 1.0
+        weight_emphasized = (
+            profile.body_weight is not None
+            and line.dominant_font_weight is not None
+            and line.dominant_font_weight >= max(profile.body_weight + 100.0, 1.15 * profile.body_weight)
+        )
+        gap_above = _normalized_title_gap(rows, index, direction=-1, body_height=profile.body_height)
+        gap_below = _normalized_title_gap(rows, index, direction=1, body_height=profile.body_height)
+        has_spacing_signal = gap_above >= 0.35
+
+        if width_ratio >= 0.9 and height_ratio < 1.15 and not (
+            style_differs and gap_above >= 0.65
+        ):
+            continue
+        score = 0.0
+        if style_differs:
+            score += 2.0
+            if style_support <= 0.2:
+                score += 0.75
+        if weight_emphasized:
+            score += 1.0
+        if height_ratio >= 1.18:
+            score += 2.0
+        elif height_ratio <= 0.9 and centered:
+            score += 0.75
+        if width_ratio <= 0.78:
+            score += 0.75
+        if centered and width_ratio <= 0.85:
+            score += 1.25
+        if gap_above >= 0.65:
+            score += 1.25
+        elif gap_above >= 0.35:
+            score += 0.5
+        if gap_below >= 0.35:
+            score += 0.75
+        if left_aligned:
+            score += 0.25
+
+        strong_layout_signal = (
+            height_ratio >= 1.18
+            or style_differs
+            or weight_emphasized
+            or (centered and width_ratio <= 0.7 and gap_above >= 0.35 and gap_below >= 0.2)
+        )
+        if score >= 4.0 and has_spacing_signal and strong_layout_signal:
+            line.semantic_type = "paragraph_title"
+            selected_indices.add(index)
+
+    _expand_paragraph_title_neighbors(
+        lane,
+        selected_indices,
+        profile,
+    )
+
+
+def _infer_front_matter_boundary(
+    lane: _TextLane,
+    profile: _LaneBodyProfile,
+    local_page_height: float,
+    *,
+    document_title_bottom: float | None,
+) -> float | None:
+    """用短行后衔接满栏正文的几何转折点界定首页作者等前置信息。"""
+
+    if document_title_bottom is None:
+        return None
+    default_boundary = max(
+        document_title_bottom + 2.5 * profile.body_height,
+        0.39 * local_page_height,
+    )
+    lane_width = max(0.1, lane.right - lane.left)
+    for index, (line, bbox) in enumerate(lane.lines[:-1]):
+        if bbox[1] <= document_title_bottom:
+            continue
+        next_line, next_bbox = lane.lines[index + 1]
+        width_ratio = (bbox[2] - bbox[0]) / lane_width
+        next_width_ratio = (next_bbox[2] - next_bbox[0]) / lane_width
+        left_aligned = abs(bbox[0] - lane.left) <= 0.65 * profile.body_height
+        next_height_ratio = _line_effective_height(next_line, next_bbox) / profile.body_height
+        gap_below = max(0.0, _effective_text_row_gap((line, bbox), (next_line, next_bbox)))
+        if (
+            width_ratio <= 0.35
+            and next_width_ratio >= 0.75
+            and left_aligned
+            and 0.75 <= next_height_ratio <= 1.35
+            and gap_below <= 1.5 * profile.body_height
+        ):
+            return min(default_boundary, bbox[1] - 0.1)
+    return default_boundary
+
+
+def _normalized_title_gap(
+    rows: list[tuple[_LineItem, BBox]],
+    index: int,
+    *,
+    direction: Literal[-1, 1],
+    body_height: float,
+) -> float:
+    """返回标题候选与相邻物理行之间按正文行高归一化的有效净空。"""
+
+    neighbor_index = index + direction
+    if not 0 <= neighbor_index < len(rows):
+        return 0.5
+    if direction < 0:
+        gap = _effective_text_row_gap(rows[neighbor_index], rows[index])
+    else:
+        gap = _effective_text_row_gap(rows[index], rows[neighbor_index])
+    return max(0.0, gap) / max(0.1, body_height)
+
+
+def _line_near_visual_container(
+    line_bbox: BBox,
+    container_bboxes: list[BBox],
+    body_height: float,
+) -> bool:
+    """检查短行是否紧邻图、表等容器，以纯几何方式抑制 caption 误判。"""
+
+    for container_bbox in container_bboxes:
+        if _bbox_axis_overlap_ratio(line_bbox, container_bbox, axis="x") < 0.35:
+            continue
+        vertical_gap = max(line_bbox[1] - container_bbox[3], container_bbox[1] - line_bbox[3], 0.0)
+        if vertical_gap <= 1.5 * body_height:
+            return True
+    return False
+
+
+def _title_fonts_compatible(first: _LineItem, second: _LineItem) -> bool:
+    """检查两行标题字体是否兼容；缺少高覆盖字体信息时允许几何兜底。"""
+
+    return not (
+        first.font_signature is not None
+        and second.font_signature is not None
+        and first.font_coverage >= 0.75
+        and second.font_coverage >= 0.75
+        and first.font_signature != second.font_signature
+    )
+
+
+def _expand_paragraph_title_neighbors(
+    lane: _TextLane,
+    selected_indices: set[int],
+    profile: _LaneBodyProfile,
+) -> None:
+    """用相邻行的字体、尺寸、对齐和紧凑净空补齐折行段落标题。"""
+
+    if not selected_indices:
+        return
+    rows = lane.lines
+    lane_width = max(0.1, lane.right - lane.left)
+    pending = list(selected_indices)
+    while pending:
+        selected_index = pending.pop()
+        selected_line, selected_bbox = rows[selected_index]
+        selected_height = _line_effective_height(selected_line, selected_bbox)
+        for candidate_index in (selected_index - 1, selected_index + 1):
+            if not 0 <= candidate_index < len(rows) or candidate_index in selected_indices:
+                continue
+            candidate_line, candidate_bbox = rows[candidate_index]
+            if candidate_line.semantic_type is not None:
+                continue
+            candidate_height = _line_effective_height(candidate_line, candidate_bbox)
+            if not 0.75 <= candidate_height / selected_height <= 1.25:
+                continue
+            if candidate_bbox[2] - candidate_bbox[0] > 0.8 * lane_width:
+                continue
+            if not _title_fonts_compatible(selected_line, candidate_line):
+                continue
+            vertical_gap = max(
+                candidate_bbox[1] - selected_bbox[3],
+                selected_bbox[1] - candidate_bbox[3],
+                0.0,
+            )
+            centers_align = abs(_bbox_center_x(candidate_bbox) - _bbox_center_x(selected_bbox)) <= 0.15 * lane_width
+            left_edges_align = abs(candidate_bbox[0] - selected_bbox[0]) <= 0.75 * profile.body_height
+            if vertical_gap > 0.65 * profile.body_height or not (centers_align or left_edges_align):
+                continue
+            candidate_line.semantic_type = "paragraph_title"
+            selected_indices.add(candidate_index)
+            pending.append(candidate_index)
 
 
 def _detect_table_candidates(source: _PageSource) -> list[_TableCandidate]:
@@ -1681,6 +2421,8 @@ def _can_merge_same_baseline_pair(
 
     if first.angle != second.angle:
         return False
+    if first.semantic_type != second.semantic_type:
+        return False
     if first.visual_row_id == second.visual_row_id and (first.split_from_row or second.split_from_row):
         return False
     if _connection_crosses_table(first.bbox, second.bbox, table_bboxes):
@@ -1797,7 +2539,22 @@ def _merge_same_baseline_group(
         effective_height=statistics.median(member.effective_height for member in members),
         font_signature=members[0].font_signature,
         font_coverage=min(member.font_coverage for member in members),
+        dominant_font_weight=statistics.median(
+            member.dominant_font_weight
+            for member in members
+            if member.dominant_font_weight is not None
+        )
+        if any(member.dominant_font_weight is not None for member in members)
+        else None,
+        median_glyph_width=statistics.median(
+            member.median_glyph_width
+            for member in members
+            if member.median_glyph_width is not None
+        )
+        if any(member.median_glyph_width is not None for member in members)
+        else None,
         split_from_row=any(member.split_from_row for member in members),
+        semantic_type=members[0].semantic_type,
     )
     if merged.chars:
         _fill_native_typography(merged, page_size)
@@ -1807,6 +2564,8 @@ def _merge_same_baseline_group(
 def _median_native_glyph_width(line: _LineItem, page_size: tuple[float, float]) -> float | None:
     """返回单个原生 run 的可见字符中位宽度，缺少字符时返回空。"""
 
+    if line.median_glyph_width is not None:
+        return line.median_glyph_width
     widths: list[float] = []
     for char in line.chars:
         raw_char = str(char.get("char") or "")
@@ -1815,7 +2574,8 @@ def _median_native_glyph_width(line: _LineItem, page_size: tuple[float, float]) 
             continue
         local_bbox = _rotate_bbox_to_upright(bbox, page_size, line.angle)
         widths.append(max(0.1, local_bbox[2] - local_bbox[0]))
-    return statistics.median(widths) if widths else None
+    line.median_glyph_width = statistics.median(widths) if widths else None
+    return line.median_glyph_width
 
 
 def _build_formula_like_blocks(
@@ -2297,7 +3057,7 @@ def _formula_members_to_block(
     if not content.strip():
         return None
     return {
-        "type": "text",
+        "type": "equation",
         "bbox": _bbox_union_many([line.bbox for line, _bbox in members]),
         "angle": angle,
         "content": content,
@@ -2405,6 +3165,8 @@ def _can_restore_dense_split_visual_row(
 
     if len(members) < 3 or not all(member.split_from_row for member in members):
         return False
+    if len({member.semantic_type for member in members}) != 1:
+        return False
     ordered = sorted(members, key=lambda member: member.run_index)
     if [member.run_index for member in ordered] != list(range(len(ordered))):
         return False
@@ -2489,7 +3251,22 @@ def _merge_dense_split_visual_row(
         ),
         font_signature=ordered_members[0].font_signature,
         font_coverage=min(member.font_coverage for member in ordered_members),
+        dominant_font_weight=statistics.median(
+            member.dominant_font_weight
+            for member in ordered_members
+            if member.dominant_font_weight is not None
+        )
+        if any(member.dominant_font_weight is not None for member in ordered_members)
+        else None,
+        median_glyph_width=statistics.median(
+            member.median_glyph_width
+            for member in ordered_members
+            if member.median_glyph_width is not None
+        )
+        if any(member.median_glyph_width is not None for member in ordered_members)
+        else None,
         split_from_row=False,
+        semantic_type=ordered_members[0].semantic_type,
     )
     if merged.chars:
         _fill_native_typography(merged, page_size)
@@ -2506,9 +3283,11 @@ def _build_hanging_indent_group_map(
     if lane.is_span or len(lane.lines) < 4:
         return {}
     rows = sorted(
-        lane.lines,
+        (item for item in lane.lines if item[0].semantic_type is None),
         key=lambda item: (item[1][1], item[1][0], item[0].source_index),
     )
+    if len(rows) < 4:
+        return {}
     median_height = statistics.median(
         _line_effective_height(line, bbox) for line, bbox in rows
     )
@@ -2650,7 +3429,7 @@ def _build_text_blocks(
     page_size: tuple[float, float],
     drawing_lines: list[_AxisLine] | None = None,
 ) -> list[dict[str, Any]]:
-    """将剩余文本行按局部栏带和自然段边界聚成统一 text block。"""
+    """按类型屏障、局部栏带和自然段边界聚合剩余文本行。"""
 
     blocks: list[dict[str, Any]] = []
     for angle in sorted({line.angle for line in lines}):
@@ -2677,20 +3456,34 @@ def _build_text_blocks(
             component: list[tuple[_LineItem, BBox]] = [lane.lines[0]]
             components: list[list[tuple[_LineItem, BBox]]] = []
             for previous, current in zip(lane.lines, lane.lines[1:]):
-                previous_group = hanging_indent_groups.get(previous[0].source_index)
-                current_group = hanging_indent_groups.get(current[0].source_index)
-                if previous_group is not None or current_group is not None:
-                    should_connect = previous_group is not None and previous_group == current_group
-                else:
-                    should_connect = _should_connect_text_rows(
+                previous_type = previous[0].semantic_type
+                current_type = current[0].semantic_type
+                if previous_type != current_type:
+                    should_connect = False
+                elif previous_type is not None:
+                    should_connect = _should_connect_semantic_rows(
                         previous,
                         current,
                         lane,
                         regular_gap,
-                        gap_mad,
                         table_bboxes,
                         local_axis_lines,
                     )
+                else:
+                    previous_group = hanging_indent_groups.get(previous[0].source_index)
+                    current_group = hanging_indent_groups.get(current[0].source_index)
+                    if previous_group is not None or current_group is not None:
+                        should_connect = previous_group is not None and previous_group == current_group
+                    else:
+                        should_connect = _should_connect_text_rows(
+                            previous,
+                            current,
+                            lane,
+                            regular_gap,
+                            gap_mad,
+                            table_bboxes,
+                            local_axis_lines,
+                        )
                 if should_connect:
                     component.append(current)
                 else:
@@ -2715,7 +3508,7 @@ def _build_text_blocks(
                 )
                 blocks.append(
                     {
-                        "type": "text",
+                        "type": component_lines[0].semantic_type or "text",
                         "bbox": _bbox_union_many([line.bbox for line in component_lines]),
                         "angle": angle,
                         "content": content,
@@ -2724,6 +3517,49 @@ def _build_text_blocks(
                     }
                 )
     return blocks
+
+
+def _should_connect_semantic_rows(
+    previous: tuple[_LineItem, BBox],
+    current: tuple[_LineItem, BBox],
+    lane: _TextLane,
+    regular_gap: float,
+    table_bboxes: list[BBox],
+    axis_lines: list[_LocalAxisLine],
+) -> bool:
+    """只用几何、字体和障碍连接同类型语义行，避免标题内容影响聚合。"""
+
+    previous_line, previous_bbox = previous
+    current_line, current_bbox = current
+    if previous_line.semantic_type != current_line.semantic_type:
+        return False
+    if _connection_crosses_table(previous_line.bbox, current_line.bbox, table_bboxes):
+        return False
+    if _horizontal_rule_separates_rows(previous_bbox, current_bbox, lane, axis_lines):
+        return False
+    previous_height = _line_effective_height(previous_line, previous_bbox)
+    current_height = _line_effective_height(current_line, current_bbox)
+    pair_height = max(previous_height, current_height)
+    if max(previous_height, current_height) / min(previous_height, current_height) > 1.35:
+        return False
+    vertical_gap = _effective_text_row_gap(previous, current)
+    if not -0.25 * pair_height <= vertical_gap <= max(1.25 * pair_height, regular_gap + 0.75 * pair_height):
+        return False
+    if (
+        previous_line.font_signature is not None
+        and current_line.font_signature is not None
+        and previous_line.font_coverage >= 0.75
+        and current_line.font_coverage >= 0.75
+        and previous_line.font_signature != current_line.font_signature
+    ):
+        return False
+    lane_width = max(0.1, lane.right - lane.left)
+    centered_pair = (
+        abs(_bbox_center_x(previous_bbox) - _bbox_center_x(current_bbox)) <= 0.15 * lane_width
+    )
+    aligned_pair = abs(previous_bbox[0] - current_bbox[0]) <= 0.75 * pair_height
+    overlapping_pair = _bbox_axis_overlap_ratio(previous_bbox, current_bbox, axis="x") >= 0.35
+    return centered_pair or aligned_pair or overlapping_pair
 
 
 def _line_effective_height(line: _LineItem, local_bbox: BBox) -> float:
@@ -3082,7 +3918,7 @@ def _normalize_output_block(
         return None
     content = _sanitize_pdf_control_text(content, preserve_newlines=True)
     block_type = block.get("type")
-    normalized_type = block_type if block_type in {"table", "image"} else "text"
+    normalized_type = block_type if block_type in _OUTPUT_BLOCK_TYPES else "text"
     if normalized_type != "image" and not content.strip():
         return None
     normalized_bbox = _normalize_bbox_to_thousandths(bbox, page_size)
