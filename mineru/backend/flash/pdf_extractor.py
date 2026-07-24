@@ -110,6 +110,15 @@ class _TableCandidate:
 
 
 @dataclass(slots=True)
+class _GraphicCandidate:
+    """保存由紧凑绘图线组件形成的图形文本容器候选。"""
+
+    core_bbox: BBox
+    lane_index: int
+    line_indices: set[int] = field(default_factory=set)
+
+
+@dataclass(slots=True)
 class _TextLane:
     """保存同一文本方向下的局部栏带与已归属文本行。"""
 
@@ -117,6 +126,15 @@ class _TextLane:
     right: float
     lines: list[tuple[_LineItem, BBox]] = field(default_factory=list)
     is_span: bool = False
+
+
+@dataclass(slots=True)
+class _FormulaAnchor:
+    """保存公式右缘锚点及其是否落在正文密集区下方。"""
+
+    line: _LineItem
+    bbox: BBox
+    detached_below_body: bool = False
 
 
 @dataclass(slots=True)
@@ -396,21 +414,25 @@ def _merge_native_inline_scripts(
             if center_offset < max(0.5, 0.12 * base.effective_height):
                 # 同基线居中的小字号文本更可能是表格相邻 cell，而不是上下标。
                 continue
+            gap_limit = max(1.5, 0.35 * base.effective_height)
+            edge_options: list[tuple[float, Literal["prefix", "suffix"], float]] = []
+            for position, gap in (
+                ("prefix", base_local_bbox[0] - small_local_bbox[2]),
+                ("suffix", small_local_bbox[0] - base_local_bbox[2]),
+            ):
+                if -0.35 * base.effective_height <= gap <= gap_limit:
+                    edge_options.append((abs(gap), position, gap))
+            if not edge_options:
+                continue
+            _edge_distance, position, gap = min(edge_options, key=lambda item: item[0])
+
             outside_offset = max(
                 base_local_bbox[1] - small_local_bbox[1],
                 small_local_bbox[3] - base_local_bbox[3],
             )
-            if outside_offset < max(0.5, 0.08 * base.effective_height):
-                # 普通小字号 cell 即使底边与主体对齐，也不能只凭中心偏移冒充上下标。
-                continue
-
-            if _bbox_center_x(small_local_bbox) < _bbox_center_x(base_local_bbox):
-                position: Literal["prefix", "suffix"] = "prefix"
-                gap = base_local_bbox[0] - small_local_bbox[2]
-            else:
-                position = "suffix"
-                gap = small_local_bbox[0] - base_local_bbox[2]
-            if not -0.25 * base.effective_height <= gap <= max(1.5, 0.35 * base.effective_height):
+            tightly_attached = abs(gap) <= max(1.0, 0.1 * base.effective_height)
+            if outside_offset < max(0.5, 0.08 * base.effective_height) and not tightly_attached:
+                # 紧贴边缘的小字号上下标可能完全落入高字形 bbox；其余内嵌小字仍按普通 cell 排除。
                 continue
             metric = abs(gap) + (1.0 - overlap_ratio) * base.effective_height
             candidates.append((metric, small_index, base_index, position))
@@ -507,7 +529,7 @@ def _get_pdf_drawing_lines(pdf_doc: PDFDocument, page_idx: int) -> list[_AxisLin
 
 
 def _analyze_page_source(source: _PageSource) -> list[dict[str, Any]]:
-    """在单页内先确认表格，再聚合剩余文本并排序。"""
+    """按表格、图形、公式、正文的优先级聚合单页文本并排序。"""
 
     if not source.lines:
         return []
@@ -517,6 +539,12 @@ def _analyze_page_source(source: _PageSource) -> list[dict[str, Any]]:
         candidates,
     )
     table_bboxes = [block["bbox"] for block in table_blocks]
+    graphic_blocks, claimed_graphic_line_indices = _build_graphic_like_blocks(
+        source,
+        table_bboxes,
+        claimed_line_indices,
+    )
+    claimed_line_indices = claimed_line_indices | claimed_graphic_line_indices
     remaining_lines = _merge_same_baseline_text_lines(
         [line for line in source.lines if line.source_index not in claimed_line_indices],
         source.page_size,
@@ -538,7 +566,7 @@ def _analyze_page_source(source: _PageSource) -> list[dict[str, Any]]:
         source.page_size,
         source.drawing_lines,
     )
-    absolute_blocks = table_blocks + formula_blocks + text_blocks
+    absolute_blocks = table_blocks + graphic_blocks + formula_blocks + text_blocks
     sorted_blocks = _sort_blocks_with_visual_row_groups(absolute_blocks, source.page_size)
     return [
         normalized for block in sorted_blocks if (normalized := _normalize_output_block(block, source.page_size)) is not None
@@ -1093,6 +1121,298 @@ def _materialize_table_blocks(
     return blocks, claimed
 
 
+def _build_graphic_like_blocks(
+    source: _PageSource,
+    table_bboxes: list[BBox],
+    claimed_line_indices: set[int],
+) -> tuple[list[dict[str, Any]], set[int]]:
+    """在表格认领后把紧凑绘图组件及其短标签聚成内部图形文本块。"""
+
+    lines = [line for line in source.lines if line.source_index not in claimed_line_indices]
+    if len(lines) < 2 or len(source.drawing_lines) < 4:
+        return [], set()
+
+    effective_heights = [
+        max(
+            0.1,
+            line.effective_height
+            or min(
+                max(0.1, line.bbox[2] - line.bbox[0]),
+                max(0.1, line.bbox[3] - line.bbox[1]),
+            ),
+        )
+        for line in lines
+    ]
+    median_height = statistics.median(effective_heights)
+    lanes = _infer_graphic_text_lanes(lines, source.page_size, median_height)
+    candidates = _detect_graphic_candidates(
+        source.drawing_lines,
+        source.page_size,
+        median_height,
+        lanes,
+        table_bboxes,
+    )
+    if not candidates:
+        return [], set()
+
+    row_groups: dict[tuple[int, int, int, int], list[_LineItem]] = {}
+    for line in lines:
+        lane_index = _graphic_lane_index(line.bbox, lanes)
+        if line.visual_row_id is None:
+            row_kind, row_identity = 1, line.source_index
+        else:
+            row_kind, row_identity = 0, line.visual_row_id
+        row_groups.setdefault(
+            (line.angle, row_kind, row_identity, lane_index),
+            [],
+        ).append(line)
+
+    for row_lines in row_groups.values():
+        row_lane_index = _graphic_lane_index(row_lines[0].bbox, lanes)
+        matches: list[tuple[int, float, int]] = []
+        for candidate_index, candidate in enumerate(candidates):
+            if candidate.lane_index != row_lane_index:
+                continue
+            member_flags = [
+                _is_graphic_label_member(line, candidate.core_bbox, median_height)
+                for line in row_lines
+            ]
+            # 同一 pdftext 视觉行必须整体归属或整体保留，避免只吞掉 caption 的短碎片。
+            if not all(member_flags):
+                continue
+            inside_count = sum(
+                _point_in_bbox(
+                    (_bbox_center_x(line.bbox), _bbox_center_y(line.bbox)),
+                    candidate.core_bbox,
+                )
+                for line in row_lines
+            )
+            mean_distance = statistics.fmean(
+                _bbox_distance(line.bbox, candidate.core_bbox) for line in row_lines
+            )
+            matches.append((-inside_count, mean_distance, candidate_index))
+        if not matches:
+            continue
+        candidate_index = min(matches)[2]
+        candidates[candidate_index].line_indices.update(line.source_index for line in row_lines)
+
+    blocks: list[dict[str, Any]] = []
+    claimed: set[int] = set()
+    lines_by_index = {line.source_index: line for line in lines}
+    for candidate in candidates:
+        members = [
+            lines_by_index[source_index]
+            for source_index in sorted(candidate.line_indices)
+            if source_index in lines_by_index
+        ]
+        if len(members) < 2:
+            continue
+        block = _graphic_members_to_block(candidate, members, source.page_size)
+        if block is None:
+            continue
+        blocks.append(block)
+        claimed.update(line.source_index for line in members)
+
+    blocks.sort(key=lambda block: (block["bbox"][1], block["bbox"][0]))
+    return blocks, claimed
+
+
+def _infer_graphic_text_lanes(
+    lines: list[_LineItem],
+    page_size: tuple[float, float],
+    median_height: float,
+) -> list[_TextLane]:
+    """用横排正文推断页内栏带，供不同角度的图形标签共享栏归属。"""
+
+    line_geometry = [(line, line.bbox) for line in lines if line.angle == 0]
+    if not line_geometry:
+        return [_TextLane(left=0.0, right=page_size[0])]
+    angle_heights = [_line_effective_height(line, bbox) for line, bbox in line_geometry]
+    angle_median_height = statistics.median(angle_heights) if angle_heights else median_height
+    lanes = [
+        lane
+        for lane in _infer_text_lanes(
+            line_geometry,
+            page_size[0],
+            angle_median_height,
+        )
+        if not lane.is_span
+    ]
+    return lanes or [_TextLane(left=0.0, right=page_size[0])]
+
+
+def _graphic_lane_index(bbox: BBox, lanes: list[_TextLane]) -> int:
+    """按中心点、水平覆盖和距离为 bbox 选择唯一栏带。"""
+
+    center_x = _bbox_center_x(bbox)
+    best_index = 0
+    best_score = (-1, -1.0, -math.inf)
+    for lane_index, lane in enumerate(lanes):
+        inside = int(lane.left <= center_x <= lane.right)
+        overlap = max(0.0, min(bbox[2], lane.right) - max(bbox[0], lane.left))
+        if inside:
+            distance = 0.0
+        else:
+            distance = min(abs(center_x - lane.left), abs(center_x - lane.right))
+        score = (inside, overlap, -distance)
+        if score > best_score:
+            best_score = score
+            best_index = lane_index
+    return best_index
+
+
+def _detect_graphic_candidates(
+    drawing_lines: list[_AxisLine],
+    page_size: tuple[float, float],
+    median_height: float,
+    lanes: list[_TextLane],
+    table_bboxes: list[BBox],
+) -> list[_GraphicCandidate]:
+    """从非表格绘图线连通分量中筛选尺寸受限的图形容器。"""
+
+    tolerance = max(2.0, 0.75 * median_height)
+    candidates: list[_GraphicCandidate] = []
+    for component in _connected_drawing_line_components(drawing_lines, tolerance):
+        horizontal_count = sum(line.orientation == "horizontal" for line in component)
+        vertical_count = len(component) - horizontal_count
+        core_bbox = _bbox_union_many([line.bbox for line in component])
+        width = core_bbox[2] - core_bbox[0]
+        height = core_bbox[3] - core_bbox[1]
+        if (
+            len(component) < 4
+            or horizontal_count < 2
+            or vertical_count < 2
+            or width < 4.0 * median_height
+            or height < 3.0 * median_height
+            or width > 0.5 * page_size[0]
+            or height > 0.5 * page_size[1]
+        ):
+            continue
+        if any(_bbox_overlap_in_smaller(core_bbox, table_bbox) >= 0.5 for table_bbox in table_bboxes):
+            continue
+        candidates.append(
+            _GraphicCandidate(
+                core_bbox=core_bbox,
+                lane_index=_graphic_lane_index(core_bbox, lanes),
+            )
+        )
+    return candidates
+
+
+def _connected_drawing_line_components(
+    drawing_lines: list[_AxisLine],
+    tolerance: float,
+) -> list[list[_AxisLine]]:
+    """按 bbox 间距连接相邻绘图线，并返回互不重叠的连通分量。"""
+
+    parents = list(range(len(drawing_lines)))
+
+    def find(index: int) -> int:
+        """查找绘图线连通分量的根节点。"""
+
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(first_index: int, second_index: int) -> None:
+        """合并两个距离满足条件的绘图线分量。"""
+
+        first_root = find(first_index)
+        second_root = find(second_index)
+        if first_root != second_root:
+            parents[second_root] = first_root
+
+    for first_index, first in enumerate(drawing_lines):
+        for second_index in range(first_index + 1, len(drawing_lines)):
+            if _bbox_distance(first.bbox, drawing_lines[second_index].bbox) <= tolerance:
+                union(first_index, second_index)
+
+    components: dict[int, list[_AxisLine]] = {}
+    for line_index, line in enumerate(drawing_lines):
+        components.setdefault(find(line_index), []).append(line)
+    return list(components.values())
+
+
+def _is_graphic_label_member(
+    line: _LineItem,
+    core_bbox: BBox,
+    median_height: float,
+) -> bool:
+    """判断短文本是否位于图形核心内部或对应轴向的邻近标签区。"""
+
+    center = (_bbox_center_x(line.bbox), _bbox_center_y(line.bbox))
+    if _point_in_bbox(center, core_bbox):
+        return True
+
+    line_height = max(
+        0.1,
+        line.effective_height
+        or min(
+            max(0.1, line.bbox[2] - line.bbox[0]),
+            max(0.1, line.bbox[3] - line.bbox[1]),
+        ),
+    )
+    if line.angle in {90, 270}:
+        primary_length = line.bbox[3] - line.bbox[1]
+        core_primary_length = core_bbox[3] - core_bbox[1]
+    else:
+        primary_length = line.bbox[2] - line.bbox[0]
+        core_primary_length = core_bbox[2] - core_bbox[0]
+    if primary_length > min(5.0 * line_height, 0.5 * core_primary_length):
+        return False
+
+    horizontal_gap = max(core_bbox[0] - line.bbox[2], line.bbox[0] - core_bbox[2], 0.0)
+    vertical_gap = max(core_bbox[1] - line.bbox[3], line.bbox[1] - core_bbox[3], 0.0)
+    if _bbox_axis_overlap_ratio(line.bbox, core_bbox, axis="x") >= 0.15:
+        return vertical_gap <= 2.5 * median_height
+    if _bbox_axis_overlap_ratio(line.bbox, core_bbox, axis="y") >= 0.15:
+        horizontal_limit = max(2.5 * median_height, 0.2 * (core_bbox[2] - core_bbox[0]))
+        return horizontal_gap <= horizontal_limit
+    return False
+
+
+def _graphic_members_to_block(
+    candidate: _GraphicCandidate,
+    members: list[_LineItem],
+    page_size: tuple[float, float],
+) -> dict[str, Any] | None:
+    """按视觉行生成图形标签 content，并用绘图核心和标签并集作为 text bbox。"""
+
+    row_groups: dict[tuple[int, int, int], list[_LineItem]] = {}
+    for line in members:
+        if line.visual_row_id is None:
+            row_kind, row_identity = 1, line.source_index
+        else:
+            row_kind, row_identity = 0, line.visual_row_id
+        row_groups.setdefault((line.angle, row_kind, row_identity), []).append(line)
+
+    rows: list[tuple[BBox, str]] = []
+    for row_lines in row_groups.values():
+        row_bbox = _bbox_union_many([line.bbox for line in row_lines])
+        angle = row_lines[0].angle
+        local_geometry = [
+            (line, _rotate_bbox_to_upright(line.bbox, page_size, angle))
+            for line in row_lines
+        ]
+        content = _join_formula_visual_row(local_geometry, page_size)
+        if content:
+            rows.append((row_bbox, content))
+    rows.sort(key=lambda item: (item[0][1], item[0][0]))
+    content = _sanitize_pdf_control_text(
+        "\n".join(row_content for _row_bbox, row_content in rows),
+        preserve_newlines=True,
+    ).strip()
+    if not content:
+        return None
+    return {
+        "type": "text",
+        "bbox": _bbox_union(candidate.core_bbox, _bbox_union_many([line.bbox for line in members])),
+        "angle": 0,
+        "content": content,
+    }
+
+
 def _candidate_projection_line_indices(
     source: _PageSource,
     candidate: _TableCandidate,
@@ -1272,24 +1592,53 @@ def _can_merge_same_baseline_pair(
         return False
     if first.visual_row_id == second.visual_row_id and (first.split_from_row or second.split_from_row):
         return False
-    if (
+    if _connection_crosses_table(first.bbox, second.bbox, table_bboxes):
+        return False
+    first_height = _line_effective_height(first, first_bbox)
+    second_height = _line_effective_height(second, second_bbox)
+    has_compatible_dominant_font = not (
         first.font_signature is None
         or second.font_signature is None
         or first.font_coverage < 0.75
         or second.font_coverage < 0.75
         or first.font_signature != second.font_signature
-    ):
-        return False
-    first_height = _line_effective_height(first, first_bbox)
-    second_height = _line_effective_height(second, second_bbox)
-    if not _same_baseline_geometry(
+    )
+    if has_compatible_dominant_font and _same_baseline_geometry(
         first_bbox,
         first_height,
         second_bbox,
         second_height,
     ):
+        return True
+    return _touching_same_baseline_geometry(
+        first_bbox,
+        first_height,
+        second_bbox,
+        second_height,
+    )
+
+
+def _touching_same_baseline_geometry(
+    first_bbox: BBox,
+    first_height: float,
+    second_bbox: BBox,
+    second_height: float,
+) -> bool:
+    """为低字体覆盖率 run 提供严格的紧贴同基线几何兜底。"""
+
+    pair_height = max(first_height, second_height)
+    y_overlap = max(0.0, min(first_bbox[3], second_bbox[3]) - max(first_bbox[1], second_bbox[1]))
+    smaller_bbox_height = max(
+        0.1,
+        min(first_bbox[3] - first_bbox[1], second_bbox[3] - second_bbox[1]),
+    )
+    if y_overlap / smaller_bbox_height < 0.7:
         return False
-    return not _connection_crosses_table(first.bbox, second.bbox, table_bboxes)
+    if abs(_bbox_center_y(first_bbox) - _bbox_center_y(second_bbox)) > 0.5 * pair_height:
+        return False
+    left_bbox, right_bbox = sorted((first_bbox, second_bbox), key=lambda bbox: bbox[0])
+    signed_gap = right_bbox[0] - left_bbox[2]
+    return -0.15 * pair_height <= signed_gap <= 0.75
 
 
 def _same_baseline_geometry(
@@ -1406,13 +1755,15 @@ def _build_formula_like_blocks(
             anchors = _find_formula_spatial_anchors(lane, median_height)
             if not anchors:
                 continue
-            anchor_centers = [_bbox_center_y(anchor_bbox) for _anchor, anchor_bbox in anchors]
-            for anchor_index, anchor_geometry in enumerate(anchors):
-                anchor_line, anchor_bbox = anchor_geometry
+            dominant_body_font = _infer_formula_body_font(lane, median_height)
+            anchor_centers = [_bbox_center_y(anchor.bbox) for anchor in anchors]
+            for anchor_index, anchor in enumerate(anchors):
+                anchor_line, anchor_bbox = anchor.line, anchor.bbox
                 if anchor_line.source_index in claimed_source_indices:
                     continue
                 anchor_height = _line_effective_height(anchor_line, anchor_bbox)
-                band_top = _bbox_center_y(anchor_bbox) - 2.25 * anchor_height
+                upward_extent = 4.75 if anchor.detached_below_body else 2.25
+                band_top = _bbox_center_y(anchor_bbox) - upward_extent * anchor_height
                 band_bottom = _bbox_center_y(anchor_bbox) + 2.25 * anchor_height
                 if anchor_index > 0:
                     band_top = max(
@@ -1426,11 +1777,13 @@ def _build_formula_like_blocks(
                     )
                 members = _grow_formula_spatial_component(
                     lane,
-                    anchor_geometry,
+                    anchor,
                     band_top,
                     band_bottom,
                     claimed_source_indices,
                     table_bboxes,
+                    dominant_body_font,
+                    median_height,
                 )
                 if len(members) < 2:
                     continue
@@ -1458,7 +1811,7 @@ def _build_formula_like_blocks(
 def _find_formula_spatial_anchors(
     lane: _TextLane,
     median_height: float,
-) -> list[tuple[_LineItem, BBox]]:
+) -> list[_FormulaAnchor]:
     """查找栏带右缘的孤立短块，并要求同高度左侧存在可连接短行。"""
 
     lane_width = max(0.1, lane.right - lane.left)
@@ -1466,7 +1819,7 @@ def _find_formula_spatial_anchors(
     if body_interval is None:
         return []
     body_top, body_bottom = body_interval
-    anchors: list[tuple[_LineItem, BBox]] = []
+    anchors: list[_FormulaAnchor] = []
     for line, bbox in lane.lines:
         line_height = _line_effective_height(line, bbox)
         line_width = bbox[2] - bbox[0]
@@ -1482,26 +1835,64 @@ def _find_formula_spatial_anchors(
         if len(same_row_fragments) >= 3:
             # 一条粗行被多个大空格拆成密集词组时更像普通排版行，不能把末词当作公式编号锚点。
             continue
-        if abs(lane.right - bbox[2]) > max(3.0, 0.04 * lane_width):
+        if abs(lane.right - bbox[2]) > max(3.0, 0.02 * lane_width):
             continue
         center_y = _bbox_center_y(bbox)
-        if not body_top <= center_y <= body_bottom:
+        detached_below_body = body_bottom < center_y <= body_bottom + 6.0 * median_height
+        if not body_top <= center_y <= body_bottom and not detached_below_body:
             continue
         has_left_peer = any(
             other_line.source_index != line.source_index
             and other_bbox[2] - other_bbox[0] <= 0.75 * lane_width
             and _bbox_center_x(other_bbox) < bbox[0]
-            and _formula_seed_vertical_match(
-                bbox,
-                line_height,
-                other_bbox,
-                _line_effective_height(other_line, other_bbox),
+            and (
+                _formula_detached_seed_vertical_match(
+                    bbox,
+                    line_height,
+                    other_bbox,
+                    _line_effective_height(other_line, other_bbox),
+                )
+                if detached_below_body
+                else _formula_seed_vertical_match(
+                    bbox,
+                    line_height,
+                    other_bbox,
+                    _line_effective_height(other_line, other_bbox),
+                )
             )
             for other_line, other_bbox in lane.lines
         )
         if has_left_peer:
-            anchors.append((line, bbox))
+            anchors.append(
+                _FormulaAnchor(
+                    line=line,
+                    bbox=bbox,
+                    detached_below_body=detached_below_body,
+                )
+            )
     return _deduplicate_formula_anchors(anchors, median_height)
+
+
+def _infer_formula_body_font(
+    lane: _TextLane,
+    median_height: float,
+) -> tuple[str, int] | None:
+    """从栏内常规宽正文行推断 dominant font，供公式扩张排除正文前缀。"""
+
+    lane_width = max(0.1, lane.right - lane.left)
+    font_counts: dict[tuple[str, int], int] = {}
+    for line, bbox in lane.lines:
+        line_height = _line_effective_height(line, bbox)
+        if bbox[2] - bbox[0] < 0.35 * lane_width:
+            continue
+        if not 0.8 * median_height <= line_height <= 1.25 * median_height:
+            continue
+        if line.font_signature is None or line.font_coverage < 0.75:
+            continue
+        font_counts[line.font_signature] = font_counts.get(line.font_signature, 0) + 1
+    if not font_counts:
+        return None
+    return max(font_counts.items(), key=lambda item: (item[1], item[0]))[0]
 
 
 def _formula_lane_body_interval(
@@ -1540,18 +1931,18 @@ def _formula_lane_body_interval(
 
 
 def _deduplicate_formula_anchors(
-    anchors: list[tuple[_LineItem, BBox]],
+    anchors: list[_FormulaAnchor],
     median_height: float,
-) -> list[tuple[_LineItem, BBox]]:
+) -> list[_FormulaAnchor]:
     """同一高度出现多个右缘短块时只保留最靠右的空间锚点。"""
 
     if not anchors:
         return []
-    output: list[tuple[_LineItem, BBox]] = []
+    output: list[_FormulaAnchor] = []
     tolerance = max(1.5, 0.35 * median_height)
-    for anchor in sorted(anchors, key=lambda item: (_bbox_center_y(item[1]), -item[1][2])):
-        if output and abs(_bbox_center_y(anchor[1]) - _bbox_center_y(output[-1][1])) <= tolerance:
-            if (anchor[1][2], -anchor[1][0]) > (output[-1][1][2], -output[-1][1][0]):
+    for anchor in sorted(anchors, key=lambda item: (_bbox_center_y(item.bbox), -item.bbox[2])):
+        if output and abs(_bbox_center_y(anchor.bbox) - _bbox_center_y(output[-1].bbox)) <= tolerance:
+            if (anchor.bbox[2], -anchor.bbox[0]) > (output[-1].bbox[2], -output[-1].bbox[0]):
                 output[-1] = anchor
             continue
         output.append(anchor)
@@ -1560,15 +1951,18 @@ def _deduplicate_formula_anchors(
 
 def _grow_formula_spatial_component(
     lane: _TextLane,
-    anchor_geometry: tuple[_LineItem, BBox],
+    anchor: _FormulaAnchor,
     band_top: float,
     band_bottom: float,
     claimed_source_indices: set[int],
     table_bboxes: list[BBox],
+    dominant_body_font: tuple[str, int] | None,
+    median_height: float,
 ) -> list[tuple[_LineItem, BBox]]:
     """从右缘锚点的左侧首批成员出发，按二维邻接扩展公式分量。"""
 
-    anchor_line, anchor_bbox = anchor_geometry
+    anchor_line, anchor_bbox = anchor.line, anchor.bbox
+    anchor_geometry = (anchor_line, anchor_bbox)
     lane_width = max(0.1, lane.right - lane.left)
     candidates = [
         item
@@ -1576,17 +1970,33 @@ def _grow_formula_spatial_component(
         if item[0].source_index not in claimed_source_indices
         and item[1][2] - item[1][0] <= 0.75 * lane_width
         and band_top <= _bbox_center_y(item[1]) <= band_bottom
+        and not _is_formula_body_prefix(
+            item,
+            lane,
+            anchor_geometry,
+            dominant_body_font,
+            median_height,
+        )
     ]
     seeds = [
         item
         for item in candidates
         if item[0].source_index != anchor_line.source_index
         and _bbox_center_x(item[1]) < anchor_bbox[0]
-        and _formula_seed_vertical_match(
-            anchor_bbox,
-            _line_effective_height(anchor_line, anchor_bbox),
-            item[1],
-            _line_effective_height(*item),
+        and (
+            _formula_detached_seed_vertical_match(
+                anchor_bbox,
+                _line_effective_height(anchor_line, anchor_bbox),
+                item[1],
+                _line_effective_height(*item),
+            )
+            if anchor.detached_below_body
+            else _formula_seed_vertical_match(
+                anchor_bbox,
+                _line_effective_height(anchor_line, anchor_bbox),
+                item[1],
+                _line_effective_height(*item),
+            )
         )
         and not _connection_crosses_table(anchor_line.bbox, item[0].bbox, table_bboxes)
     ]
@@ -1616,6 +2026,45 @@ def _grow_formula_spatial_component(
                 member_sources.add(candidate_line.source_index)
                 changed = True
     return members
+
+
+def _is_formula_body_prefix(
+    candidate: tuple[_LineItem, BBox],
+    lane: _TextLane,
+    anchor: tuple[_LineItem, BBox],
+    dominant_body_font: tuple[str, int] | None,
+    median_height: float,
+) -> bool:
+    """识别锚点上方左对齐的常规正文行，防止公式空间扩张越界认领。"""
+
+    if dominant_body_font is None:
+        return False
+    line, bbox = candidate
+    anchor_line, anchor_bbox = anchor
+    line_height = _line_effective_height(line, bbox)
+    anchor_height = _line_effective_height(anchor_line, anchor_bbox)
+    if _bbox_center_y(bbox) > _bbox_center_y(anchor_bbox) - 0.2 * max(line_height, anchor_height):
+        return False
+    if abs(bbox[0] - lane.left) > max(3.0, 0.75 * median_height):
+        return False
+    return (
+        line.font_signature == dominant_body_font
+        and line.font_coverage >= 0.75
+        and 0.8 * median_height <= line_height <= 1.25 * median_height
+    )
+
+
+def _formula_detached_seed_vertical_match(
+    anchor_bbox: BBox,
+    anchor_height: float,
+    candidate_bbox: BBox,
+    candidate_height: float,
+) -> bool:
+    """放宽正文密集区下方锚点的同高匹配，以接纳多行分段公式底部。"""
+
+    has_vertical_overlap = min(anchor_bbox[3], candidate_bbox[3]) > max(anchor_bbox[1], candidate_bbox[1])
+    center_difference = abs(_bbox_center_y(anchor_bbox) - _bbox_center_y(candidate_bbox))
+    return has_vertical_overlap or center_difference <= max(anchor_height, candidate_height)
 
 
 def _formula_seed_vertical_match(
@@ -2011,6 +2460,17 @@ def _line_effective_height(line: _LineItem, local_bbox: BBox) -> float:
     return max(0.1, line.effective_height or (local_bbox[3] - local_bbox[1]))
 
 
+def _effective_text_row_gap(
+    previous: tuple[_LineItem, BBox],
+    current: tuple[_LineItem, BBox],
+) -> float:
+    """按前一行顶边与有效行高计算净空，避免高数学字形拉长 bbox 底边。"""
+
+    previous_line, previous_bbox = previous
+    _current_line, current_bbox = current
+    return current_bbox[1] - (previous_bbox[1] + _line_effective_height(previous_line, previous_bbox))
+
+
 def _infer_text_lanes(
     line_geometry: list[tuple[_LineItem, BBox]],
     local_page_width: float,
@@ -2051,7 +2511,7 @@ def _infer_text_lanes(
             filtered_intervals.append(interval)
             continue
         previous = filtered_intervals[-1]
-        minimum_gutter = max(12.0, 2.0 * median_height)
+        minimum_gutter = max(6.0, 0.75 * median_height)
         if interval[0] - previous[1] >= minimum_gutter:
             filtered_intervals.append(interval)
         elif interval[2] > previous[2]:
@@ -2120,14 +2580,16 @@ def _estimate_lane_gap(lane: _TextLane) -> tuple[float, float]:
         current_height = _line_effective_height(current_line, current_bbox)
         if max(previous_height, current_height) / min(previous_height, current_height) > 1.35:
             continue
-        gap = current_bbox[1] - previous_bbox[3]
-        if gap < 0 or gap > 2.0 * max(previous_height, current_height):
+        pair_height = max(previous_height, current_height)
+        gap = _effective_text_row_gap(previous, current)
+        if gap < -0.25 * pair_height or gap > 2.0 * pair_height:
             continue
         if _bbox_axis_overlap_ratio(previous_bbox, current_bbox, axis="x") < 0.5 and abs(
             previous_bbox[0] - current_bbox[0]
         ) > 1.5 * median_height:
             continue
-        gaps.append(gap)
+        # PDF 字符框常在相邻基线间产生极小重叠；按零净空计入常规行距统计。
+        gaps.append(max(0.0, gap))
 
     if not gaps:
         return 0.35 * median_height, 0.0
@@ -2155,14 +2617,27 @@ def _should_connect_text_rows(
     previous_height = _line_effective_height(previous_line, previous_bbox)
     current_height = _line_effective_height(current_line, current_bbox)
     pair_height = max(previous_height, current_height)
+    lane_width = max(0.1, lane.right - lane.left)
+    previous_width = previous_bbox[2] - previous_bbox[0]
+    current_width = current_bbox[2] - current_bbox[0]
     if previous_line.visual_row_id == current_line.visual_row_id and (
         previous_line.split_from_row or current_line.split_from_row
     ):
         return False
-    if max(previous_height, current_height) / min(previous_height, current_height) > 1.35:
-        return False
+    height_ratio = max(previous_height, current_height) / min(previous_height, current_height)
+    if height_ratio > 1.35:
+        both_fill_lane = previous_width >= 0.8 * lane_width and current_width >= 0.8 * lane_width
+        aligned_left_edges = abs(previous_bbox[0] - current_bbox[0]) <= 0.5 * pair_height
+        font_style_changed = (
+            previous_line.font_signature is not None
+            and current_line.font_signature is not None
+            and previous_line.font_signature[1] != current_line.font_signature[1]
+        )
+        # 满栏混合字体可跨字号续接，但显式正体/斜体等样式边界仍保持原分段语义。
+        if not both_fill_lane or not aligned_left_edges or font_style_changed:
+            return False
 
-    vertical_gap = current_bbox[1] - previous_bbox[3]
+    vertical_gap = _effective_text_row_gap(previous, current)
     if vertical_gap < -0.25 * pair_height:
         return False
     if _bbox_axis_overlap_ratio(previous_bbox, current_bbox, axis="x") < 0.5 and abs(
@@ -2185,15 +2660,12 @@ def _should_connect_text_rows(
     if vertical_gap > gap_limit:
         return False
 
-    lane_width = max(0.1, lane.right - lane.left)
     next_indent = current_bbox[0] - lane.left
     previous_fill = max(0.0, previous_bbox[2] - lane.left) / lane_width
     terminal_previous = bool(re.search(r"[.!?。！？:：;；][\]\)}）】》”’'\"]*$", previous_line.text.rstrip()))
     if next_indent >= max(5.0, 0.65 * pair_height) and (previous_fill <= 0.8 or terminal_previous):
         return False
 
-    previous_width = previous_bbox[2] - previous_bbox[0]
-    current_width = current_bbox[2] - current_bbox[0]
     abnormal_gap = vertical_gap > regular_gap + 0.25 * pair_height
     if (
         previous_line.font_signature is not None
@@ -2507,6 +2979,14 @@ def _bbox_intersects(first: BBox, second: BBox) -> bool:
     return min(first[2], second[2]) > max(first[0], second[0]) and min(first[3], second[3]) > max(first[1], second[1])
 
 
+def _bbox_distance(first: BBox, second: BBox) -> float:
+    """返回两个 bbox 的欧氏净空距离，交叠或相接时为零。"""
+
+    horizontal_gap = max(first[0] - second[2], second[0] - first[2], 0.0)
+    vertical_gap = max(first[1] - second[3], second[1] - first[3], 0.0)
+    return math.hypot(horizontal_gap, vertical_gap)
+
+
 def _bbox_overlap_in_smaller(first: BBox, second: BBox) -> float:
     """计算交集面积占较小 bbox 面积的比例。"""
 
@@ -2585,7 +3065,7 @@ def doc_analyze(
 if __name__ == '__main__':
     # pdf_path = "/Users/myhloli/pdf/截断合并/demo1-3.pdf"
     # pdf_path = "/Users/myhloli/pdf/png/seal4.png"  # shubiao.png
-    pdf_path = "/Users/myhloli/pdf/demo1.pdf"
+    pdf_path = "/Users/myhloli/pdf/demo2.pdf"
     pdf_bytes = read_fn(pdf_path)
     model_list = doc_analyze(pdf_bytes, parse_mode="auto")
     logger.info(f"model_list: {model_list}")
