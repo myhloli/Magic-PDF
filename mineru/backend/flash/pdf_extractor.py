@@ -8,7 +8,7 @@ from __future__ import annotations
 import math
 import re
 import statistics
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Sequence
 
 from loguru import logger
@@ -36,6 +36,9 @@ _TABLE_NOTE_RE = re.compile(
 _TABLE_SPLIT_NUMBER_RE = re.compile(
     r"^(?:\d+|[ivxlcdm]+|[一二三四五六七八九十]+)[.:：]?$",
     re.IGNORECASE,
+)
+_FORMULA_NUMBER_SUFFIX_RE = re.compile(
+    r"^(?P<prefix>.*?)(?P<marker>[(（﹙][^()（）﹙﹚\r\n]+[)）﹚])\s*$"
 )
 _PDF_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
@@ -2138,6 +2141,15 @@ def _is_detached_formula_sidecar(
     )
 
 
+def _split_trailing_formula_number(text: str) -> tuple[str, str] | None:
+    """拆出右缘文本末尾的圆括号公式序号，并保留序号前的标点或正文。"""
+
+    match = _FORMULA_NUMBER_SUFFIX_RE.fullmatch(str(text or "").strip())
+    if match is None:
+        return None
+    return match.group("prefix").rstrip(), match.group("marker").strip()
+
+
 def _formula_members_to_block(
     members: list[tuple[_LineItem, BBox]],
     page_size: tuple[float, float],
@@ -2170,7 +2182,20 @@ def _formula_members_to_block(
         )
         if anchor_member is None:
             continue
-        if _is_detached_formula_sidecar(anchor_member, members, median_height):
+        formula_number_parts = _split_trailing_formula_number(anchor_member[0].text)
+        if formula_number_parts is not None:
+            prefix, marker = formula_number_parts
+            rows[row_index] = [
+                (
+                    (replace(member[0], text=prefix), member[1])
+                    if member[0].source_index == anchor_source_index and prefix
+                    else member
+                )
+                for member in row
+                if member[0].source_index != anchor_source_index or prefix
+            ]
+            trailing_sidecar_content = marker
+        elif _is_detached_formula_sidecar(anchor_member, members, median_height):
             rows[row_index] = [
                 member for member in row if member[0].source_index != anchor_source_index
             ]
@@ -2383,6 +2408,154 @@ def _merge_dense_split_visual_row(
     return merged
 
 
+def _build_hanging_indent_group_map(
+    lane: _TextLane,
+    table_bboxes: list[BBox],
+    axis_lines: list[_LocalAxisLine],
+) -> dict[int, int]:
+    """仅按重复的左突首行和稳定续行缩进识别悬挂缩进条目。"""
+
+    if lane.is_span or len(lane.lines) < 4:
+        return {}
+    rows = sorted(
+        lane.lines,
+        key=lambda item: (item[1][1], item[1][0], item[0].source_index),
+    )
+    median_height = statistics.median(
+        _line_effective_height(line, bbox) for line, bbox in rows
+    )
+    start_tolerance = max(5.0, 0.65 * median_height)
+    minimum_indent = max(7.0, 0.8 * median_height)
+    continuation_tolerance = max(4.0, 0.55 * median_height)
+
+    def rows_are_adjacent(
+        previous: tuple[_LineItem, BBox],
+        current: tuple[_LineItem, BBox],
+    ) -> bool:
+        """检查相邻行的净空和几何障碍是否允许组成同一缩进序列。"""
+
+        effective_gap = _effective_text_row_gap(previous, current)
+        if not -0.6 * median_height <= effective_gap <= 1.2 * median_height:
+            return False
+        if _connection_crosses_table(
+            previous[0].bbox,
+            current[0].bbox,
+            table_bboxes,
+        ):
+            return False
+        return not _horizontal_rule_separates_rows(
+            previous[1],
+            current[1],
+            lane,
+            axis_lines,
+        )
+
+    def consume_entry(
+        start_index: int,
+        start_left: float,
+        expected_continuation_left: float | None,
+        *,
+        require_next_start: bool,
+    ) -> tuple[int, float] | None:
+        """消费一个左突首行及其续行，并返回下一条首行位置。"""
+
+        continuation_index = start_index + 1
+        if continuation_index >= len(rows):
+            return None
+        first_continuation = rows[continuation_index]
+        if not rows_are_adjacent(rows[start_index], first_continuation):
+            return None
+        continuation_left = first_continuation[1][0]
+        if continuation_left < start_left + minimum_indent:
+            return None
+        if (
+            expected_continuation_left is not None
+            and abs(continuation_left - expected_continuation_left) > continuation_tolerance
+        ):
+            return None
+
+        continuation_index += 1
+        while continuation_index < len(rows):
+            previous = rows[continuation_index - 1]
+            current = rows[continuation_index]
+            current_left = current[1][0]
+            if not rows_are_adjacent(previous, current):
+                break
+            if current_left < start_left + minimum_indent:
+                break
+            if abs(current_left - continuation_left) > continuation_tolerance:
+                break
+            continuation_index += 1
+
+        if not require_next_start:
+            return continuation_index, continuation_left
+        if continuation_index >= len(rows):
+            return None
+        if not rows_are_adjacent(rows[continuation_index - 1], rows[continuation_index]):
+            return None
+        if abs(rows[continuation_index][1][0] - start_left) > start_tolerance:
+            return None
+        return continuation_index, continuation_left
+
+    group_map: dict[int, int] = {}
+    group_index = 0
+    row_index = 0
+    while row_index < len(rows) - 3:
+        start_left = rows[row_index][1][0]
+        first_entry = consume_entry(
+            row_index,
+            start_left,
+            None,
+            require_next_start=True,
+        )
+        if first_entry is None:
+            row_index += 1
+            continue
+
+        next_start_index, continuation_left = first_entry
+        start_indices = [row_index, next_start_index]
+        current_start_index = next_start_index
+        while True:
+            next_entry = consume_entry(
+                current_start_index,
+                start_left,
+                continuation_left,
+                require_next_start=True,
+            )
+            if next_entry is None:
+                break
+            next_start_index, _continuation_left = next_entry
+            start_indices.append(next_start_index)
+            current_start_index = next_start_index
+
+        final_entry = consume_entry(
+            start_indices[-1],
+            start_left,
+            continuation_left,
+            require_next_start=False,
+        )
+        if final_entry is None:
+            row_index += 1
+            continue
+        end_index, _continuation_left = final_entry
+
+        entry_ranges = [
+            (start, end)
+            for start, end in zip(
+                start_indices,
+                [*start_indices[1:], end_index],
+                strict=True,
+            )
+        ]
+        for start, end in entry_ranges:
+            for line, _bbox in rows[start:end]:
+                group_map[line.source_index] = group_index
+            group_index += 1
+        row_index = end_index
+
+    return group_map
+
+
 def _build_text_blocks(
     lines: list[_LineItem],
     table_bboxes: list[BBox],
@@ -2408,18 +2581,29 @@ def _build_text_blocks(
             if not lane.lines:
                 continue
             regular_gap, gap_mad = _estimate_lane_gap(lane)
+            hanging_indent_groups = _build_hanging_indent_group_map(
+                lane,
+                table_bboxes,
+                local_axis_lines,
+            )
             component: list[tuple[_LineItem, BBox]] = [lane.lines[0]]
             components: list[list[tuple[_LineItem, BBox]]] = []
             for previous, current in zip(lane.lines, lane.lines[1:]):
-                if _should_connect_text_rows(
-                    previous,
-                    current,
-                    lane,
-                    regular_gap,
-                    gap_mad,
-                    table_bboxes,
-                    local_axis_lines,
-                ):
+                previous_group = hanging_indent_groups.get(previous[0].source_index)
+                current_group = hanging_indent_groups.get(current[0].source_index)
+                if previous_group is not None or current_group is not None:
+                    should_connect = previous_group is not None and previous_group == current_group
+                else:
+                    should_connect = _should_connect_text_rows(
+                        previous,
+                        current,
+                        lane,
+                        regular_gap,
+                        gap_mad,
+                        table_bboxes,
+                        local_axis_lines,
+                    )
+                if should_connect:
                     component.append(current)
                 else:
                     components.append(component)
@@ -3065,7 +3249,7 @@ def doc_analyze(
 if __name__ == '__main__':
     # pdf_path = "/Users/myhloli/pdf/截断合并/demo1-3.pdf"
     # pdf_path = "/Users/myhloli/pdf/png/seal4.png"  # shubiao.png
-    pdf_path = "/Users/myhloli/pdf/demo2.pdf"
+    pdf_path = "/Users/myhloli/pdf/demo1.pdf"
     pdf_bytes = read_fn(pdf_path)
     model_list = doc_analyze(pdf_bytes, parse_mode="auto")
     logger.info(f"model_list: {model_list}")
