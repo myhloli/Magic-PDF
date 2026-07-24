@@ -197,11 +197,21 @@ def test_pdf_document_methods_keep_page_access_inside_pdfium_lock(monkeypatch: p
         events.append(f"image_bboxes:{lock.depth}:{page_bbox}:{page_rotation}")
         return []
 
+    def fake_extract_page_form_bboxes(
+        page: _FakePage,
+        page_bbox: tuple[float, float, float, float],
+        page_rotation: int,
+    ) -> list[tuple[float, float, float, float]]:
+        """记录 Form 遍历时仍由 PDFDocument 持有 PDFium 锁。"""
+        events.append(f"form_bboxes:{lock.depth}:{page_bbox}:{page_rotation}")
+        return []
+
     monkeypatch.setattr(pdf_document.pdfium, "PdfDocument", _FakeDoc)
     monkeypatch.setattr(pdf_document, "get_chars", fake_get_chars, raising=False)
     monkeypatch.setattr(pdf_document, "pdftext_get_chars", fake_get_chars, raising=False)
     monkeypatch.setattr(pdf_document, "_extract_page_drawing_lines", fake_extract_page_drawing_lines)
     monkeypatch.setattr(pdf_document, "_extract_page_image_bboxes", fake_extract_page_image_bboxes)
+    monkeypatch.setattr(pdf_document, "_extract_page_form_bboxes", fake_extract_page_form_bboxes)
 
     doc = pdf_document.PDFDocument(b"%PDF")
 
@@ -212,6 +222,7 @@ def test_pdf_document_methods_keep_page_access_inside_pdfium_lock(monkeypatch: p
     assert doc.get_page_chars(0)[0]["char"] == "A"
     assert doc.get_page_drawing_lines(0) == []
     assert doc.get_page_image_bboxes(0) == []
+    assert doc.get_page_form_bboxes(0) == []
 
     assert any(event.startswith("doc.open:") and not event.startswith("doc.open:0:") for event in events)
     assert any(event.startswith("doc.__getitem__:") and not event.startswith("doc.__getitem__:0:") for event in events)
@@ -225,6 +236,7 @@ def test_pdf_document_methods_keep_page_access_inside_pdfium_lock(monkeypatch: p
     assert "textpage.close:1" in events
     assert "drawing_lines:1:(0.0, 0.0, 20.0, 10.0):0" in events
     assert "image_bboxes:1:(0.0, 0.0, 20.0, 10.0):0" in events
+    assert "form_bboxes:1:(0.0, 0.0, 20.0, 10.0):0" in events
 
 
 def test_pdf_document_does_not_expose_legacy_compat_hooks() -> None:
@@ -293,6 +305,59 @@ def test_get_page_image_bboxes_applies_forms_crop_box_rotation_and_clipping() ->
             (76.0, 47.0, 88.0, 53.0),
         ]
     )
+
+
+def test_get_page_form_bboxes_reads_root_forms_and_nested_content_bounds() -> None:
+    """验证顶层 Form bbox 覆盖其嵌套绘图内容，且不重复输出内部对象。"""
+    with pdf_document.PDFDocument(_build_drawing_pdf()) as doc:
+        form_bboxes = doc.get_page_form_bboxes(0)
+
+    assert form_bboxes == pytest.approx([(28.0, 99.0, 72.0, 101.0)])
+
+
+def test_get_page_form_bboxes_applies_crop_box_rotation_and_clipping() -> None:
+    """验证 Form bbox 按 CropBox 与页面旋转转换，并裁剪为左上原点坐标。"""
+    with pdf_document.PDFDocument(_build_rotated_cropped_image_pdf()) as doc:
+        page_size = doc.page_size(0)
+        form_bboxes = doc.get_page_form_bboxes(0)
+
+    assert page_size == pytest.approx((180.0, 90.0))
+    assert form_bboxes == pytest.approx([(76.0, 47.0, 88.0, 53.0)])
+
+
+def test_extract_page_form_bboxes_skips_one_bad_object(monkeypatch: pytest.MonkeyPatch) -> None:
+    """验证单个损坏 Form 不会阻断同页其他有效 Form 的提取。"""
+    bad_object = object()
+    good_object = object()
+
+    def fake_form_bbox(
+        raw_object: object,
+        page_bbox: tuple[float, float, float, float],
+        page_rotation: int,
+    ) -> tuple[float, float, float, float]:
+        """首个对象抛错，第二个对象返回可验证 bbox。"""
+        assert page_bbox == (0.0, 0.0, 100.0, 200.0)
+        assert page_rotation == 0
+        if raw_object is bad_object:
+            raise RuntimeError("broken form")
+        return (10.0, 20.0, 30.0, 40.0)
+
+    def fake_root_forms(_page: object) -> Any:
+        """依次返回损坏对象与有效对象，验证逐对象异常隔离。"""
+        return iter((bad_object, good_object))
+
+    monkeypatch.setattr(
+        pdf_document,
+        "_iter_raw_root_form_objects",
+        fake_root_forms,
+    )
+    monkeypatch.setattr(pdf_document, "_form_bbox_from_object", fake_form_bbox)
+
+    assert pdf_document._extract_page_form_bboxes(
+        object(),
+        (0.0, 0.0, 100.0, 200.0),
+        0,
+    ) == [(10.0, 20.0, 30.0, 40.0)]
 
 
 def test_get_page_drawing_lines_skips_one_bad_path(monkeypatch: pytest.MonkeyPatch) -> None:

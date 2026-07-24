@@ -331,6 +331,16 @@ class PDFDocument:
                 page_rotation = 0
             return _extract_page_image_bboxes(page, page_bbox, page_rotation)
 
+    def get_page_form_bboxes(self, page_idx: int) -> list[BBox]:
+        """提取页面顶层 Form XObject bbox，并转换为页面左上原点坐标。"""
+        with self._open_page(page_idx) as page:
+            page_bbox = _normalize_pdf_page_bbox(page.get_bbox())
+            try:
+                page_rotation = int(page.get_rotation()) % 360
+            except Exception:
+                page_rotation = 0
+            return _extract_page_form_bboxes(page, page_bbox, page_rotation)
+
     # ------------------------------------------------------------------ #
     #  Classification
     # ------------------------------------------------------------------ #
@@ -573,6 +583,26 @@ def _iter_raw_image_objects(
         depth=0,
         target_type=pdfium_c.FPDF_PAGEOBJ_IMAGE,
     )
+
+
+def _iter_raw_root_form_objects(page: pdfium.PdfPage) -> Iterator[Any]:
+    """只遍历页面根层的 Form，避免把同一矢量图的嵌套子 Form 重复输出。"""
+
+    try:
+        object_count = int(pdfium_c.FPDFPage_CountObjects(page))
+    except Exception:
+        return
+    if object_count < 0:
+        return
+
+    for object_index in range(object_count):
+        try:
+            raw_obj = pdfium_c.FPDFPage_GetObject(page, object_index)
+            if raw_obj and int(pdfium_c.FPDFPageObj_GetType(raw_obj)) == pdfium_c.FPDF_PAGEOBJ_FORM:
+                yield raw_obj
+        except Exception:
+            # 单个损坏对象不能阻断同页其他顶层 Form 的提取。
+            continue
 
 
 def _get_raw_object_alpha(raw_obj: Any, color_getter: Any) -> int:
@@ -974,6 +1004,52 @@ def _image_bbox_from_matrix(
     return left, top, right, bottom
 
 
+def _form_bbox_from_object(
+    raw_obj: Any,
+    page_bbox: BBox,
+    page_rotation: int,
+) -> BBox | None:
+    """读取顶层 Form 的页面坐标边界，并转换、裁剪到视觉页面范围。"""
+
+    left = ctypes.c_float()
+    bottom = ctypes.c_float()
+    right = ctypes.c_float()
+    top = ctypes.c_float()
+    try:
+        ok = pdfium_c.FPDFPageObj_GetBounds(
+            raw_obj,
+            ctypes.byref(left),
+            ctypes.byref(bottom),
+            ctypes.byref(right),
+            ctypes.byref(top),
+        )
+    except Exception:
+        return None
+    if not ok:
+        return None
+
+    raw_bbox = (float(left.value), float(bottom.value), float(right.value), float(top.value))
+    if not all(math.isfinite(value) for value in raw_bbox):
+        return None
+    page_points = [
+        _transform_drawing_point(point, page_bbox, page_rotation)
+        for point in (
+            (raw_bbox[0], raw_bbox[1]),
+            (raw_bbox[0], raw_bbox[3]),
+            (raw_bbox[2], raw_bbox[1]),
+            (raw_bbox[2], raw_bbox[3]),
+        )
+    ]
+    page_width, page_height = _drawing_page_size(page_bbox, page_rotation)
+    visual_left = max(0.0, min(point[0] for point in page_points))
+    visual_top = max(0.0, min(point[1] for point in page_points))
+    visual_right = min(page_width, max(point[0] for point in page_points))
+    visual_bottom = min(page_height, max(point[1] for point in page_points))
+    if visual_right <= visual_left or visual_bottom <= visual_top:
+        return None
+    return visual_left, visual_top, visual_right, visual_bottom
+
+
 def _extract_page_image_bboxes(
     page: pdfium.PdfPage,
     page_bbox: BBox,
@@ -990,6 +1066,25 @@ def _extract_page_image_bboxes(
         if image_bbox is not None:
             image_bboxes.append(image_bbox)
     return sorted(image_bboxes, key=lambda bbox: (bbox[1], bbox[0], bbox[3], bbox[2]))
+
+
+def _extract_page_form_bboxes(
+    page: pdfium.PdfPage,
+    page_bbox: BBox,
+    page_rotation: int,
+) -> list[BBox]:
+    """在调用方持有 PDFium 锁时提取顶层 Form bbox，并隔离单对象异常。"""
+
+    form_bboxes: list[BBox] = []
+    for raw_obj in _iter_raw_root_form_objects(page):
+        try:
+            form_bbox = _form_bbox_from_object(raw_obj, page_bbox, page_rotation)
+        except Exception:
+            # PDFium 遇到个别损坏 Form 时，保留同页其他有效结果。
+            continue
+        if form_bbox is not None:
+            form_bboxes.append(form_bbox)
+    return sorted(form_bboxes, key=lambda bbox: (bbox[1], bbox[0], bbox[3], bbox[2]))
 
 
 def _extract_page_drawing_lines(
