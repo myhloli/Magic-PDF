@@ -884,7 +884,7 @@ def build_gradio_app(
                     if _is_office(source_path) or suffix in {"ofd", "epub"} or suffix in HTML_EXTENSIONS | MHTML_EXTENSIONS:
                         result_preview_updates = tuple(gr.skip() for _ in range(4))
                     run.artifacts = artifacts.as_state()
-                    logger.info(
+                    logger.debug(
                         "WebUI output ready run_id={} artifacts={} elapsed={:.3f}s html_bytes={} json_bytes={} ready_at={:.3f}",
                         run.run_id,
                         artifacts.root.name,

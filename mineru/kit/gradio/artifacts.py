@@ -50,7 +50,7 @@ def _output_stage(stage: str, artifacts: RunArtifacts) -> Iterator[None]:
     try:
         yield
     finally:
-        logger.info(
+        logger.debug(
             "WebUI output stage={} artifacts={} elapsed={:.3f}s", stage, artifacts.root.name, time.monotonic() - started
         )
 
