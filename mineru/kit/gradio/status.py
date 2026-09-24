@@ -1,14 +1,12 @@
-"""Gradio 步骤卡片、单次任务计时与流式状态等待。"""
+"""Gradio 步骤卡片与单次任务的真实阶段计时。"""
 
 from __future__ import annotations
 
-import asyncio
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Any
 
 from .i18n import localized_message, localized_text as _localized_text
 
@@ -63,16 +61,12 @@ class StatusPanelState:
             self.processing_elapsed = 0.0
         self.message = message
         self.phase_id += 1
+        self.sequence += 1
         # 本地排队结束后可以重新准备请求，高亮必须与实际阶段一致。
         self.step_index = _MESSAGE_STEPS.get(message, self.step_index)
         if message.startswith("Failed:"):
             self.step_index = len(_STEPS) - 1
         return True
-
-    def snapshot(self) -> str:
-        """为周期同步生成新序号，确保静态阶段也能重新应用到浏览器。"""
-        self.sequence += 1
-        return self.render()
 
     def render(self) -> str:
         """按 3.4.5 的两列卡片结构渲染当前状态，并转义外部错误文本。"""
@@ -131,44 +125,6 @@ def status_html(message: str = DEFAULT_STATUS) -> str:
     return state.render()
 
 
-async def stream_status_updates(
-    task: asyncio.Task[Any],
-    events: asyncio.Queue[tuple[str, float]],
-    state: StatusPanelState,
-) -> AsyncIterator[str]:
-    """阶段变化立即发送，长任务每秒同步快照；浏览器独立绘制动画。"""
-    loop = asyncio.get_running_loop()
-    next_refresh = loop.time() + 1.0
-    while True:
-        while not events.empty():
-            message, at = events.get_nowait()
-            if state.append(message, at=at):
-                next_refresh = loop.time() + 1.0
-                yield state.snapshot()
-        if task.done():
-            return
-        waiter = asyncio.create_task(events.get())
-        updated_html: str | None = None
-        try:
-            done, _ = await asyncio.wait(
-                {task, waiter}, timeout=max(0.0, next_refresh - loop.time()), return_when=asyncio.FIRST_COMPLETED
-            )
-            if waiter in done:
-                message, at = waiter.result()
-                if state.append(message, at=at):
-                    updated_html = state.snapshot()
-            if updated_html is None and not task.done() and loop.time() >= next_refresh:
-                updated_html = state.snapshot()
-        finally:
-            if not waiter.done():
-                waiter.cancel()
-            await asyncio.gather(waiter, return_exceptions=True)
-        # 向 Gradio 交回控制权前已回收临时 waiter，避免暂停在 yield 时残留后台等待。
-        if updated_html is not None:
-            next_refresh = loop.time() + 1.0
-            yield updated_html
-
-
 __all__ = [
     "DEFAULT_STATUS",
     "STATUS_CHECKING_SERVER",
@@ -182,5 +138,4 @@ __all__ = [
     "STATUS_SUBMITTING_TASK",
     "StatusPanelState",
     "status_html",
-    "stream_status_updates",
 ]
