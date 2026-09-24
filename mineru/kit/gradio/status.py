@@ -35,6 +35,14 @@ _MESSAGE_STEPS = {
 }
 
 
+@dataclass(frozen=True)
+class ParseStatusUpdate:
+    """在现有阶段通知中携带可选的服务端文件处理耗时，单位为毫秒。"""
+
+    message: str
+    duration_ms: float | None = None
+
+
 @dataclass
 class StatusPanelState:
     """保存一次转换的阶段和单调时钟，不在会话之间共享状态。"""
@@ -43,15 +51,25 @@ class StatusPanelState:
     message: str = DEFAULT_STATUS
     step_index: int = -1
     processing_elapsed: float | None = None
+    server_elapsed: float | None = None
     _processing_started: float | None = None
     run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     phase_id: int = 0
     sequence: int = 0
 
-    def append(self, message: str, *, at: float | None = None) -> bool:
-        """接收真实阶段变化；重复通知不会重置解析计时。"""
+    def append(self, message: str | ParseStatusUpdate, *, at: float | None = None) -> bool:
+        """阶段通知维持本地计时；服务端耗时只更新完成数值，不重启同阶段动画。"""
+        duration_changed = False
+        if isinstance(message, ParseStatusUpdate):
+            if message.duration_ms is not None:
+                elapsed = message.duration_ms / 1000
+                duration_changed = elapsed != self.server_elapsed
+                self.server_elapsed = elapsed
+            message = message.message
         if not message or message == self.message:
-            return False
+            if duration_changed:
+                self.sequence += 1
+            return duration_changed
         now = self.clock() if at is None else at
         if self._processing_started is not None:
             self.processing_elapsed = max(0.0, now - self._processing_started)
@@ -100,8 +118,11 @@ class StatusPanelState:
             queue_key = "queued_locally" if self.message == STATUS_QUEUED_LOCALLY else "queued_on_server"
             timer_attributes = f' data-mineru-queue-key="{queue_key}"'
         elif completed:
-            display_elapsed = Decimal(str(self.processing_elapsed or 0.0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-            latest = f"{STATUS_COMPLETED} ({display_elapsed:.2f}s)"
+            elapsed = self.server_elapsed if self.server_elapsed is not None else self.processing_elapsed
+            if elapsed is not None:
+                # API 优先使用含打包的文件耗时；HF 等直接调用方继续使用阶段间隔，极短任务显示下限为 0.01 秒。
+                display_elapsed = max(Decimal("0.01"), Decimal(str(elapsed)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+                latest = f"{STATUS_COMPLETED} ({display_elapsed:.2f}s)"
         if self.message == DEFAULT_STATUS:
             title = _localized_text("status_idle_title")
             latest_html = _localized_text("status_idle_hint")
@@ -136,6 +157,7 @@ __all__ = [
     "STATUS_QUEUED_LOCALLY",
     "STATUS_QUEUED_ON_SERVER",
     "STATUS_SUBMITTING_TASK",
+    "ParseStatusUpdate",
     "StatusPanelState",
     "status_html",
 ]

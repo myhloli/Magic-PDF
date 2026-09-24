@@ -13,6 +13,7 @@ from mineru.kit.gradio.status import (
     STATUS_PROCESSING_OUTPUT,
     STATUS_QUEUED_LOCALLY,
     STATUS_QUEUED_ON_SERVER,
+    ParseStatusUpdate,
     StatusPanelState,
     status_html,
 )
@@ -59,14 +60,19 @@ def test_queued_status_stays_stable_without_timer_updates(message: str) -> None:
         assert f'data-mineru-i18n-en="{message}"' in state.render()
 
 
-def test_fast_completion_shows_zero_elapsed_time_and_reset_has_eight_pending_steps() -> None:
-    """验证未观察到解析阶段时完成状态显示 0.00 秒，重置后仍保留完整双语步骤。"""
+@pytest.mark.parametrize("queued", [False, True])
+def test_fast_completion_uses_server_duration_without_running(queued: bool) -> None:
+    """直接完成或轮询漏过 running 时仍显示服务端亚秒耗时，重置后保留完整双语步骤。"""
     state = StatusPanelState()
-    state.append(STATUS_QUEUED_ON_SERVER)
-    state.append(STATUS_DOWNLOADING_RESULT)
+    if queued:
+        state.append(STATUS_QUEUED_ON_SERVER)
+    state.append(ParseStatusUpdate(STATUS_DOWNLOADING_RESULT, 250))
     state.append(STATUS_COMPLETED)
-    assert 'data-mineru-i18n-en="Completed (0.00s)"' in state.render()
-    assert 'data-mineru-i18n-zh="已完成（0.00 秒）"' in state.render()
+    assert state.processing_elapsed is None
+    assert 'data-mineru-i18n-en="Completed (0.25s)"' in state.render()
+    assert 'data-mineru-i18n-zh="已完成（0.25 秒）"' in state.render()
+    assert "data-mineru-processing-start" not in state.render()
+    assert state.render().count("status-step is-done") == 8
     idle = status_html()
     assert idle.count("status-step is-pending") == 8
     assert 'data-mineru-i18n-en="Waiting"' in idle
@@ -76,16 +82,60 @@ def test_fast_completion_shows_zero_elapsed_time_and_reset_has_eight_pending_ste
 
 @pytest.mark.parametrize(
     ("elapsed", "expected"),
-    [(0.0, "0.00"), (0.004, "0.00"), (0.005, "0.01"), (0.04, "0.04"), (0.05, "0.05"), (0.125, "0.13")],
+    [
+        (0.0, "0.01"),
+        (0.004, "0.01"),
+        (0.005, "0.01"),
+        (0.04, "0.04"),
+        (0.05, "0.05"),
+        (0.125, "0.13"),
+        (0.25, "0.25"),
+        (0.999, "1.00"),
+        (1.25, "1.25"),
+    ],
 )
 def test_completed_duration_uses_decimal_half_up_rounding(elapsed: float, expected: str) -> None:
-    """验证完成耗时保留两位小数，并在 0.005 秒等边界按四舍五入显示。"""
+    """直接函数调用的阶段计时保留两位小数，极短任务按 0.01 秒显示下限处理。"""
     state = StatusPanelState(clock=lambda: 0.0)
     state.append(STATUS_PROCESSING_ON_SERVER, at=0.0)
     state.append(STATUS_DOWNLOADING_RESULT, at=elapsed)
     state.append(STATUS_COMPLETED)
     assert state.processing_elapsed == pytest.approx(elapsed)
     assert f'data-mineru-i18n-en="Completed ({expected}s)"' in state.render()
+
+
+@pytest.mark.parametrize(("duration_ms", "expected"), [(0, "0.01"), (1, "0.01"), (125, "0.13"), (1750, "1.75")])
+def test_server_duration_overrides_observed_polling_time(duration_ms: float, expected: str) -> None:
+    """最终数值来自服务端，长轮询间隔和下载等待不会覆盖它。"""
+    state = StatusPanelState(clock=lambda: 1000.0)
+    state.append(STATUS_PROCESSING_ON_SERVER, at=10.0)
+    state.append(ParseStatusUpdate(STATUS_DOWNLOADING_RESULT, duration_ms), at=20.0)
+    state.append(STATUS_PROCESSING_OUTPUT, at=900.0)
+    state.append(STATUS_COMPLETED, at=1000.0)
+    assert state.processing_elapsed == 10.0
+    assert f"Completed ({expected}s)" in state.render()
+
+
+def test_duration_only_snapshot_preserves_phase_and_rejects_late_updates() -> None:
+    """仅补齐耗时也增加快照序号；重复、终态和取消后的通知不能覆盖当前结果。"""
+    run = ConversionRun("timed")
+    run.publish(STATUS_DOWNLOADING_RESULT)
+    phase, sequence = run.state.phase_id, json.loads(run.snapshot)["sequence"]
+    run.publish(ParseStatusUpdate(STATUS_DOWNLOADING_RESULT, 250))
+    assert run.state.phase_id == phase
+    assert json.loads(run.snapshot)["sequence"] == sequence + 1
+    snapshot = run.snapshot
+    run.publish(ParseStatusUpdate(STATUS_DOWNLOADING_RESULT, 250))
+    assert run.snapshot == snapshot
+    run.publish(STATUS_COMPLETED)
+    final = run.snapshot
+    run.publish(ParseStatusUpdate(STATUS_DOWNLOADING_RESULT, 9000))
+    assert run.snapshot == final
+    assert "Completed (0.25s)" in final
+    canceled = ConversionRun("canceled")
+    canceled.cancel()
+    canceled.publish(ParseStatusUpdate(STATUS_DOWNLOADING_RESULT, 250))
+    assert canceled.state.server_elapsed is None
 
 
 @pytest.mark.parametrize("error", ["server task failed", "server task canceled", '<script>alert("x")</script>'])

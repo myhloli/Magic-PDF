@@ -39,6 +39,7 @@ from mineru.kit.gradio.client import (
     normalize_v1_base_url,
 )
 from mineru.kit.main import app
+from mineru.kit.gradio.status import STATUS_COMPLETED, ParseStatusUpdate, StatusPanelState
 from mineru.parser import api_client as parser_api_client
 from mineru.parser import api_server as parser_api_server
 from mineru.parser.base import ParseResult
@@ -436,11 +437,17 @@ def test_v1_client_checks_requested_tier_after_first_discovery(tmp_path: Path) -
     assert error.value.code == "tier_unavailable"
 
 
+@pytest.mark.parametrize("export_seconds", [0.0, 1.5])
 def test_v1_client_full_asgi_upload_job_poll_and_zip(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    export_seconds: float,
 ) -> None:
-    """通过真实 V1 ASGI 路由验证上传、任务、轮询、ZIP 与 API Key 链路。"""
+    """贯通真实 V1 与显示层，验证 250ms 解析及可选 1500ms 打包都计入既有文件耗时。"""
+    clock = [10.0]
+    monkeypatch.setattr(
+        parser_api_server, "time", SimpleNamespace(time=parser_api_server.time.time, monotonic=lambda: clock[0])
+    )
     source = tmp_path / "demo.pdf"
     source.write_bytes(_pdf_bytes())
     parse_calls: list[dict[str, Any]] = []
@@ -448,9 +455,19 @@ def test_v1_client_full_asgi_upload_job_poll_and_zip(
     async def fake_parse_async(path: str, **kwargs: Any) -> ParseResult:
         """替代模型推理，同时保留 server 的真实 job 和打包流程。"""
         parse_calls.append({"path": path, **kwargs})
+        clock[0] += 0.25
         return ParseResult(middle_json=_middle_json(with_image=False), _model_output=_model_json())
 
+    original_zip = parser_api_server._build_self_contained_zip_output
+
+    def export(result: ParseResult) -> bytes:
+        """真实生成 ZIP，仅用确定性时钟模拟结果打包耗时。"""
+        payload = original_zip(result)
+        clock[0] += export_seconds
+        return payload
+
     monkeypatch.setattr(parser_api_server, "parse_async", fake_parse_async)
+    monkeypatch.setattr(parser_api_server, "_build_self_contained_zip_output", export)
     api = parser_api_server.create_app(
         upload_dir=str(tmp_path / "api"),
         tier="flash",
@@ -462,7 +479,11 @@ def test_v1_client_full_asgi_upload_job_poll_and_zip(
         monkeypatch.setattr(gradio_client, "httpx", proxy)
         monkeypatch.setattr(parser_api_client, "httpx", proxy)
         client = V1ArtifactClient(api_url="http://testserver", api_key="secret")
-        result = asyncio.run(client.parse_file(source, tier="flash", page_range="1"))
+        state = StatusPanelState()
+        result = asyncio.run(client.parse_file(source, tier="flash", page_range="1", status_callback=state.append))
+        state.append(STATUS_COMPLETED)
+        assert state.server_elapsed == pytest.approx(0.25 + export_seconds)
+        assert f"Completed ({0.25 + export_seconds:.2f}s)" in state.render()
 
     paths = [path for _method, path, _authorization in request_log]
     assert "/v1/health" in paths
@@ -675,7 +696,9 @@ def test_v1_client_preserves_v1_error_code(monkeypatch: pytest.MonkeyPatch, tmp_
         def __init__(self, **_kwargs: Any) -> None:
             """忽略构造参数。"""
 
-        async def parse_async(self, _path: Path, *, page_range: str, status_callback: Any = None) -> ParseResult:
+        async def parse_async(
+            self, _path: Path, *, page_range: str, status_callback: Any = None, duration_callback: Any = None
+        ) -> ParseResult:
             """抛出与正式 API client 一致的错误形态。"""
             error = RuntimeError(f"bad range: {page_range}")
             error.code = "page_range_invalid"  # type: ignore[attr-defined]
@@ -690,7 +713,10 @@ def test_v1_client_preserves_v1_error_code(monkeypatch: pytest.MonkeyPatch, tmp_
 
 
 @pytest.mark.parametrize("ocr_mode", ["auto", "txt", "ocr"])
-def test_v1_client_parse_uses_api_parser_zip_contract(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ocr_mode: str) -> None:
+@pytest.mark.parametrize("observe_running", [False, True])
+def test_v1_client_parse_uses_api_parser_zip_contract(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ocr_mode: str, observe_running: bool
+) -> None:
     """验证 Gradio client 固定请求带图片和模型输出的 V1 ZIP 结果。"""
     source = tmp_path / "demo.pdf"
     source.write_bytes(_pdf_bytes())
@@ -703,16 +729,21 @@ def test_v1_client_parse_uses_api_parser_zip_contract(monkeypatch: pytest.Monkey
             """保存构造参数，供断言 V1 ZIP 契约。"""
             calls.update(kwargs)
 
-        async def parse_async(self, path: Path, *, page_range: str, status_callback: Any = None) -> ParseResult:
+        async def parse_async(
+            self, path: Path, *, page_range: str, status_callback: Any = None, duration_callback: Any = None
+        ) -> ParseResult:
             """返回最小解析结果。"""
             calls["path"] = path
             calls["page_range"] = page_range
             assert statuses == ["Preparing request...", "Submitting task..."]
             assert status_callback is not None
             status_callback("queued")
-            status_callback("running")
+            if observe_running:
+                status_callback("running")
             status_callback("completed")
             assert statuses[-1] == STATUS_DOWNLOADING_RESULT
+            assert duration_callback is not None
+            duration_callback(250)
             return ParseResult(middle_json=_middle_json(with_image=False))
 
     monkeypatch.setattr("mineru.kit.gradio.client.MinerUApiParser", FakeParser)
@@ -723,7 +754,7 @@ def test_v1_client_parse_uses_api_parser_zip_contract(monkeypatch: pytest.Monkey
         ("zip",),
         ("file_id",),
     )
-    statuses: list[str] = []
+    statuses: list[str | ParseStatusUpdate] = []
     result = asyncio.run(
         client.parse_file(source, tier="standard", page_range="1-2", ocr_mode=ocr_mode, status_callback=statuses.append)
     )
@@ -734,8 +765,14 @@ def test_v1_client_parse_uses_api_parser_zip_contract(monkeypatch: pytest.Monkey
     assert calls["ocr_mode"] == ocr_mode
     assert calls["page_range"] == "1-2"
     assert statuses[0] == "Preparing request..."
-    assert statuses[-1] == STATUS_DOWNLOADING_RESULT
-    assert statuses[2:4] == ["Queued on server", "Processing on server..."]
+    assert statuses[-1] == ParseStatusUpdate(STATUS_DOWNLOADING_RESULT, 250)
+    assert statuses[2] == "Queued on server"
+    assert ("Processing on server..." in statuses) == observe_running
+    state = StatusPanelState()
+    for status in statuses:
+        state.append(status)
+    state.append(STATUS_COMPLETED)
+    assert "Completed (0.25s)" in state.render()
 
 
 def test_managed_local_api_command_uses_kit_entrypoint() -> None:

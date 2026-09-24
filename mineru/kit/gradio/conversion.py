@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, ParamSpec, TypeVar
 
-from .status import STATUS_COMPLETED, STATUS_PREPARING_REQUEST, StatusPanelState
+from .status import STATUS_COMPLETED, STATUS_PREPARING_REQUEST, ParseStatusUpdate, StatusPanelState
 
 P = ParamSpec("P")
 T = TypeVar("T")
@@ -31,15 +31,15 @@ class ConversionRun:
         self.state = StatusPanelState(run_id=self.run_id)
         self.publish(STATUS_PREPARING_REQUEST)
 
-    def publish(self, message: str, *, at: float | None = None) -> None:
-        """仅真实阶段变化生成新快照，终态拒绝迟到的后台通知。"""
+    def publish(self, message: str | ParseStatusUpdate, *, at: float | None = None) -> None:
+        """阶段或耗时变化生成新快照，终态拒绝迟到的后台通知。"""
         if self.cancelled or self.terminal or not self.state.append(message, at=at):
             return
-        self.terminal = message == STATUS_COMPLETED or message.startswith("Failed:")
+        self.terminal = self.state.message == STATUS_COMPLETED or self.state.message.startswith("Failed:")
         self.snapshot = json.dumps(
             {
                 "run_id": self.run_id,
-                "sequence": self.state.phase_id,
+                "sequence": self.state.sequence,
                 "terminal": self.terminal,
                 "html": self.state.render(),
             },

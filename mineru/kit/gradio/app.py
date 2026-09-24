@@ -49,6 +49,7 @@ from .status import (
     STATUS_PREPARING_REQUEST,
     STATUS_PROCESSING_OUTPUT,
     STATUS_QUEUED_LOCALLY,
+    ParseStatusUpdate,
     status_html as _status_html,
 )
 
@@ -841,7 +842,7 @@ def build_gradio_app(
                 selected_tier = "flash"
             loop = asyncio.get_running_loop()
 
-            def emit(message: str) -> None:
+            def emit(message: str | ParseStatusUpdate) -> None:
                 """在通知发生时记录时间，再由事件循环串行更新会话状态。"""
                 at = time.monotonic()
                 loop.call_soon_threadsafe(lambda: run.publish(message, at=at))
@@ -1043,7 +1044,7 @@ def build_gradio_app(
             return json.dumps(
                 {
                     "run_id": run_id,
-                    "sequence": run.state.phase_id,
+                    "sequence": run.state.sequence,
                     "ready_at": time.time(),
                     "outputs": values[:6] + values[7:],
                 },
