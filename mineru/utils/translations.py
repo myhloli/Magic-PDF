@@ -453,6 +453,7 @@ ZH_MESSAGES: dict[str, str] = {
     "When input is multiple files or directories, --output must be a directory path.": (
         "当输入为多个文件或目录时,--output 必须是目录路径。"
     ),
+    "Output path must not be the same as the input file: {path}": "输出路径不能与输入文件相同: {path}",
     "Failed to parse {path}: {error}": "解析 {path} 失败: {error}",
     "Parsed {count} input(s).": "已解析 {count} 个输入。",
     # ------------------------------------------------------------ kit webui

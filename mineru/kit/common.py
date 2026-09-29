@@ -66,24 +66,19 @@ def resolve_single_output_path(source: Path, output: Path, format: KitFormat) ->
 def resolve_batch_output_paths(paths: list[Path], output: Path, format: KitFormat) -> dict[Path, Path]:
     if any(path.parent == path for path in paths):
         raise ValueError(t("Invalid input path."))
-    multi_input = len(paths) > 1
-    has_directory_input = False
-    if multi_input or has_directory_input:
-        if is_output_path_file_like(output):
-            raise ValueError(t("When input is multiple files or directories, --output must be a directory path."))
-
-    output_dir = output
-    if output.exists() and output.is_file():
+    if len(paths) > 1 and is_output_path_file_like(output):
         raise ValueError(t("When input is multiple files or directories, --output must be a directory path."))
 
     destinations: dict[Path, Path] = {}
     seen: dict[Path, Path] = {}
     for source in paths:
         dest = (
-            resolve_single_output_path(source, output_dir, format)
+            resolve_single_output_path(source, output, format)
             if len(paths) == 1
-            else output_dir / f"{source.stem}{OUTPUT_FILE_SUFFIXES[format]}"
+            else output / f"{source.stem}{OUTPUT_FILE_SUFFIXES[format]}"
         )
+        if dest.resolve() == source.resolve():
+            raise ValueError(t("Output path must not be the same as the input file: {path}", path=source))
         existing = seen.get(dest)
         if existing is not None:
             raise ValueError(

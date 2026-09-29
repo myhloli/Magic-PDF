@@ -900,6 +900,64 @@ def test_parse_single_file_markdown(monkeypatch: Any, tmp_path: Path) -> None:
     assert output.read_text(encoding="utf-8") == "# demo\n"
 
 
+def test_parse_single_file_overwrites_existing_output(monkeypatch: Any, tmp_path: Path) -> None:
+    """单文件输入时,已存在的输出文件应被覆盖而非误报批量输出错误。"""
+    source = tmp_path / "demo.pdf"
+    output = tmp_path / "out.md"
+    source.write_bytes(b"%PDF-1.7\n")
+    output.write_text("stale", encoding="utf-8")
+
+    class _Result:
+        def markdown(self) -> str:
+            return "# demo\n"
+
+        def to_json(self) -> str:
+            return '{"pages":[]}'
+
+        def images(self) -> dict[str, bytes]:
+            return {}
+
+        def save(self, writer: Any) -> None:
+            writer.write_string("markdown.md", self.markdown())
+            writer.write_string("middle_json.json", self.to_json())
+
+    monkeypatch.setattr(parse, "local_parse", lambda *args, **kwargs: _Result())
+
+    result = runner.invoke(app, ["parse", str(source), "-o", str(output)])
+
+    assert result.exit_code == 0
+    assert "multiple files" not in " ".join(result.output.split())
+    assert output.read_text(encoding="utf-8") == "# demo\n"
+
+
+def test_parse_rejects_output_path_equal_to_input(tmp_path: Path) -> None:
+    """-o 指向输入文件本身时应在解析前报错,不得覆盖输入。"""
+    source = tmp_path / "demo.pdf"
+    source.write_bytes(b"%PDF-1.7\n")
+
+    result = runner.invoke(app, ["parse", str(source), "-o", str(source)])
+
+    assert result.exit_code == 1
+    assert "must not be the same as the input file" in " ".join(result.output.split())
+    assert source.read_bytes() == b"%PDF-1.7\n"
+
+
+def test_parse_multi_input_rejects_existing_suffixless_output_file(tmp_path: Path) -> None:
+    """多文件输入指向已存在的无后缀输出文件时,仍要求 --output 为目录路径。"""
+    first = tmp_path / "a.pdf"
+    second = tmp_path / "b.pdf"
+    output = tmp_path / "out"
+    first.write_bytes(b"%PDF-1.7\n")
+    second.write_bytes(b"%PDF-1.7\n")
+    output.write_text("existing", encoding="utf-8")
+
+    result = runner.invoke(app, ["parse", str(first), str(second), "-o", str(output)])
+
+    assert result.exit_code == 1
+    assert "directory path" in " ".join(result.output.split())
+    assert output.read_text(encoding="utf-8") == "existing"
+
+
 @pytest.mark.parametrize(
     "backend", ["pipeline", "hybrid-engine", "hybrid-auto-engine", "flash", "vlm-auto-engine", "hybrid-http-client"]
 )
