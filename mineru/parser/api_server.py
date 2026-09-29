@@ -311,6 +311,14 @@ class HealthResponse(BaseModel):
 
 # ── Models API ───────────────────────────────────────────────────────
 
+# /v1/models 只广告一个虚拟模型：id 随服务版本走，解析质量由请求 tier 选择，
+# 不对应任何可单独调用的引擎。
+_VIRTUAL_MODEL_ID = f"mineru-{__version__}"
+_VIRTUAL_MODEL_DESCRIPTION = (
+    "MinerU virtual model. Quality is selected per request via tier (flash|basic|standard|advanced); "
+    "this id identifies the server version, not a specific engine."
+)
+
 
 class ModelInfo(BaseModel):
     model_config = _PYDANTIC_CONFIG
@@ -1652,9 +1660,9 @@ async def list_models(request: Request) -> ModelListResponse:
     """List all available parsing models."""
     _require_model_preload_ready(request)
     model_ids: list[str] = request.app.state.model_ids
-    now = int(time.time())
+    registered_at: int = request.app.state.model_registered_at
     return ModelListResponse(
-        data=[ModelInfo(id=mid, created=now) for mid in model_ids],
+        data=[ModelInfo(id=mid, created=registered_at, description=_VIRTUAL_MODEL_DESCRIPTION) for mid in model_ids],
     )
 
 
@@ -1679,8 +1687,7 @@ async def get_model(
             code="model_not_found",
             message=f"Model '{model}' not found",
         )
-    now = int(time.time())
-    return ModelInfo(id=model, created=now)
+    return ModelInfo(id=model, created=request.app.state.model_registered_at, description=_VIRTUAL_MODEL_DESCRIPTION)
 
 
 # ── Tiers ────────────────────────────────────────────────────────────
@@ -2107,52 +2114,45 @@ def _runtime_options_for_server_tiers(tiers: list[Tier]) -> dict[Tier, ParserRun
     return {tier: runtime_options_for_tier(tier) for tier in tiers}
 
 
-def _model_ids_and_tiers_for_server_tier(tier: Tier) -> tuple[list[str], list[TierInfoData]]:
+def _tiers_for_server_tier(tier: Tier) -> list[TierInfoData]:
+    """单档请求 tier 的展示 metadata；current_model 统一指向唯一虚拟模型。"""
     if tier == "flash":
-        return ["MinerU-Flash"], [
+        return [
             {
                 "id": "flash",
                 "description": "Fast local text extraction.",
-                "current_model": "flash",
+                "current_model": _VIRTUAL_MODEL_ID,
             },
         ]
     if tier == "basic":
-        return ["Hybrid-Basic", "MinerU-HTML"], [
+        return [
             {
                 "id": "basic",
                 "description": "Basic parsing with local lightweight models.",
-                "current_model": "hybrid-basic",
+                "current_model": _VIRTUAL_MODEL_ID,
             },
         ]
     if tier == "advanced":
-        return ["MinerU2.5-Pro-2605-1.2B", "MinerU-HTML"], [
+        return [
             {
                 "id": "advanced",
                 "description": "Advanced parsing for difficult documents.",
-                "current_model": "MinerU2.5-Pro-2605-1.2B",
+                "current_model": _VIRTUAL_MODEL_ID,
             },
         ]
 
-    return ["MinerU2.5-Pro-2605-1.2B", "MinerU-HTML"], [
+    return [
         {
             "id": "standard",
             "description": "Standard parsing for most documents.",
-            "current_model": "MinerU2.5-Pro-2605-1.2B",
+            "current_model": _VIRTUAL_MODEL_ID,
         },
     ]
 
 
-def _model_ids_and_tiers_for_server_tiers(tiers: list[Tier]) -> tuple[list[str], list[TierInfoData]]:
-    """聚合展开后的请求 tier metadata，并对重复 model id 保序去重。"""
-    model_ids: list[str] = []
-    tier_infos: list[TierInfoData] = []
-    for tier in tiers:
-        tier_model_ids, single_tier_infos = _model_ids_and_tiers_for_server_tier(tier)
-        for model_id in tier_model_ids:
-            if model_id not in model_ids:
-                model_ids.append(model_id)
-        tier_infos.extend(single_tier_infos)
-    return model_ids, tier_infos
+def _tiers_for_server_tiers(tiers: list[Tier]) -> list[TierInfoData]:
+    """展开后的请求 tier metadata。"""
+    return [tier_info for tier in tiers for tier_info in _tiers_for_server_tier(tier)]
 
 
 def _preflight_tier_dependencies(tier: ServerTier, vlm_config: VlmConfig | None = None) -> None:
@@ -2321,7 +2321,8 @@ def create_app(
     if max_url_bytes < 0:
         raise ValueError("max_url_bytes must be non-negative")
 
-    _model_ids, _tiers = _model_ids_and_tiers_for_server_tiers(server_tiers)
+    _tiers = _tiers_for_server_tiers(server_tiers)
+    _model_registered_at = int(time.time())
     _preload_tier: DeploymentTier | None = None
     if preload_models and tier != "flash":
         _preload_tier = tier
@@ -2333,7 +2334,8 @@ def create_app(
         application.state.default_tier = default_tier
         application.state.flash_enabled = not no_flash
         application.state.tier_runtime_options = tier_runtime_options
-        application.state.model_ids = _model_ids
+        application.state.model_ids = [_VIRTUAL_MODEL_ID]
+        application.state.model_registered_at = _model_registered_at
         application.state.tiers = _tiers
         application.state.concurrency = concurrency
         application.state.url_timeout = url_timeout
@@ -2397,7 +2399,8 @@ def create_app(
     application.state.default_tier = default_tier
     application.state.flash_enabled = not no_flash
     application.state.tier_runtime_options = tier_runtime_options
-    application.state.model_ids = _model_ids
+    application.state.model_ids = [_VIRTUAL_MODEL_ID]
+    application.state.model_registered_at = _model_registered_at
     application.state.tiers = _tiers
     application.state.concurrency = concurrency
     application.state.url_timeout = url_timeout

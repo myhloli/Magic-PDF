@@ -222,7 +222,7 @@ OCR 策略和图片分析能力由 `tier` 与服务端实际引擎自动决定�
       "page_range": "1-12",
       "status": "completed",
       "parse": {
-        "model_used": "MinerU2.5-Pro-2605-1.2B",
+        "model_used": "mineru-4.0.11",
         "duration_ms": 8234,
         "parser_version": "3.1.14"
       },

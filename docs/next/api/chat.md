@@ -17,7 +17,7 @@ Chat Completions 和 Responses 面向细粒度文档理解场景，例如单张�
 
 ```json
 {
-  "model": "MinerU2.5-Pro-2605-1.2B",
+  "model": "mineru-4.0.11",
   "messages": [
     {
       "role": "user",
@@ -48,7 +48,8 @@ Chat Completions 和 Responses 面向细粒度文档理解场景，例如单张�
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|:--:|------|
 | `messages` | array | 是 | 消息列表。 |
-| `model` | string | 是 | 模型 ID，来自 `GET /v1/models`。 |
+| `model` | string | 是 | 虚拟模型 ID（`mineru-<服务版本>`），来自 `GET /v1/models`，精确匹配当前部署广告值；不用于选择引擎。 |
+| `tier` | string | 否 | MinerU 扩展字段：解析质量档（`flash`/`basic`/`standard`/`advanced`），内部复用 parse job 的 tier 路由与默认选择策略。OpenAI SDK 通过 `extra_body` 传入。 |
 | `stream` | bool | 否 | 是否流式输出，默认 `false`。 |
 | `stream_options.include_usage` | bool | 否 | `stream=true` 时，最终 chunk 是否包含 usage。 |
 | `temperature` | number | 否 | 采样温度，范围 `[0, 2]`。 |
@@ -97,7 +98,7 @@ Chat Completions 和 Responses 面向细粒度文档理解场景，例如单张�
   "id": "chatcmpl-B9MBs8CjcvOU2jLn4n570S5qMJKcT",
   "object": "chat.completion",
   "created": 1741569952,
-  "model": "MinerU2.5-Pro-2605-1.2B",
+  "model": "mineru-4.0.11",
   "system_fingerprint": "fp_44709d6fcb",
   "choices": [
     {
@@ -137,9 +138,9 @@ Chat Completions 和 Responses 面向细粒度文档理解场景，例如单张�
 `stream=true` 时返回 SSE，每行 `data:` 后是一个 `chat.completion.chunk` JSON 对象，最后以 `data: [DONE]` 结束。
 
 ```text
-data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1694268190,"model":"MinerU2.5-Pro-2605-1.2B","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1694268190,"model":"mineru-4.0.11","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1694268190,"model":"MinerU2.5-Pro-2605-1.2B","choices":[{"index":0,"delta":{"content":"# 文本"},"finish_reason":null}]}
+data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1694268190,"model":"mineru-4.0.11","choices":[{"index":0,"delta":{"content":"# 文本"},"finish_reason":null}]}
 
 data: [DONE]
 ```
@@ -178,7 +179,7 @@ Chat 错误:
 
 ```json
 {
-  "model": "MinerU2.5-Pro-2605-1.2B",
+  "model": "mineru-4.0.11",
   "input": [
     {
       "role": "user",
@@ -236,7 +237,7 @@ Content part:
   "object": "response",
   "created_at": 1741476542,
   "status": "completed",
-  "model": "MinerU2.5-Pro-2605-1.2B",
+  "model": "mineru-4.0.11",
   "output": [
     {
       "type": "message",

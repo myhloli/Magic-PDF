@@ -63,46 +63,31 @@ GET /v1/models HTTP/1.1
   "object": "list",
   "data": [
     {
-      "id": "MinerU-Flash",
-      "object": "model",
-      "created": 1700000000,
-      "owned_by": "mineru"
-    },
-    {
-      "id": "Hybrid-Basic",
-      "object": "model",
-      "created": 1700000000,
-      "owned_by": "mineru"
-    },
-    {
-      "id": "MinerU-HTML",
-      "object": "model",
-      "created": 1700000000,
-      "owned_by": "mineru"
-    },
-    {
-      "id": "MinerU2.5-Pro-2605-1.2B",
+      "id": "mineru-4.0.11",
       "object": "model",
       "created": 1700000000,
       "owned_by": "mineru",
-      "description": null
+      "description": "MinerU virtual model. Quality is selected per request via tier (flash|basic|standard|advanced); this id identifies the server version, not a specific engine."
     }
   ]
 }
 ```
 
-- 描述性 tier 文案（如 `Standard parsing for most documents.`）属于 `/v1/tiers` 返回的 tier info；`/v1/models` 的 `description` 当前为 `null`。
-Local Parse Server 默认（`--tier standard`）按上述顺序返回 `MinerU-Flash`、`Hybrid-Basic`、`MinerU-HTML`、`MinerU2.5-Pro-2605-1.2B`；实际模型列表由启动 `--tier` 与 tier 禁用开关决定。禁用 Advanced 后，Standard 仍需使用的共享模型不会从列表移除。
+- `/v1/models` 只广告一个**虚拟模型**：id 为 `mineru-<服务版本>`，标识服务端版本，不对应任何可单独调用的引擎。解析质量始终通过 parse job 的 `tier` 字段选择，模型 id 不参与路由。
+- `created` 为该部署的注册时间（本地 server 取进程启动时刻），同一部署内多次请求返回相同值。
+- 模型列表与启动 `--tier`、tier 禁用开关无关：档位增减只反映在 `/v1/tiers`，虚拟模型恒在列表中。
+- 服务端升级后 id 随版本变化（如 `mineru-4.0.11` → `mineru-4.0.12`）。客户端应重新发现，不要缓存 id 硬编码进请求。
+- 历史上广告过的 `MinerU-Flash`、`Hybrid-Basic`、`MinerU-HTML`、`MinerU2.5-Pro-2605-1.2B` 已从列表移除；这些名字从来不是可传入的参数。其中 `MinerU2.5-Pro-2605-1.2B` 仍是 standard/advanced 档背后的真实 VLM 权重仓库名，只是不再出现在本 endpoint。
 
 模型对象字段:
 
 | 字段 | 类型 | 必带 | 说明 |
 |------|------|:--:|------|
-| `id` | string | 是 | 模型 ID。 |
+| `id` | string | 是 | 虚拟模型 ID，`mineru-<服务版本>`。 |
 | `object` | string | 是 | 固定为 `"model"`。 |
-| `created` | integer | 是 | Unix 秒级时间戳，表示模型首次上线或被当前部署注册的时间。 |
+| `created` | integer | 是 | Unix 秒级时间戳，表示被当前部署注册的时间。 |
 | `owned_by` | string | 是 | 官方 API 固定为 `"mineru"`；自部署可使用组织名。 |
-| `description` | string | 否 | 模型说明。 |
+| `description` | string | 否 | 模型说明，注明虚拟模型语义与 tier 路由方式。 |
 
 ## GET `/v1/models/{model}`
 
@@ -111,20 +96,22 @@ Local Parse Server 默认（`--tier standard`）按上述顺序返回 `MinerU-Fl
 请求:
 
 ```http
-GET /v1/models/MinerU2.5-Pro-2605-1.2B HTTP/1.1
+GET /v1/models/mineru-4.0.11 HTTP/1.1
 ```
 
 响应:
 
 ```json
 {
-  "id": "MinerU2.5-Pro-2605-1.2B",
+  "id": "mineru-4.0.11",
   "object": "model",
   "created": 1700000000,
   "owned_by": "mineru",
-  "description": null
+  "description": "MinerU virtual model. Quality is selected per request via tier (flash|basic|standard|advanced); this id identifies the server version, not a specific engine."
 }
 ```
+
+仅接受当前部署广告的虚拟模型 id（精确匹配），其余一律 404；服务端升级后旧版本 id 同样返回 404，客户端应重新发现。
 
 错误:
 
@@ -151,7 +138,7 @@ GET /v1/tiers HTTP/1.1
     {
       "id": "standard",
       "description": null,
-      "current_model": "MinerU2.5-Pro-2605-1.2B"
+      "current_model": "mineru-4.0.11"
     }
   ]
 }
@@ -163,7 +150,7 @@ Tier 对象字段:
 |------|------|:--:|------|
 | `id` | string | 是 | 当前服务提供的真实质量 tier，例如 `basic`、`standard` 或 `advanced`。 |
 | `description` | string | 是 | 档位说明。 |
-| `current_model` | string 或 null | 是 | 当前 tier 背后的模型 ID。 |
+| `current_model` | string 或 null | 是 | 当前 tier 背后的模型 ID，与 `/v1/models` 广告的虚拟模型一致：各档共用同一 id，差异由 `id`（档位）表达。 |
 
 ## Tier 选择语义
 
@@ -205,6 +192,8 @@ Local Parse Server 的 `health` 通常返回:
 | `--tier standard --no-flash --no-advanced` | `basic`、`standard` |
 
 本地或兼容服务应以 `/v1/tiers` 返回值作为能力发现事实。客户端不应根据启动参数猜测具体能力。
+
+本地 `GET /v1/models` 恒返回当前版本的单一虚拟模型。经 Router 聚合多 worker 时，不同版本的 worker 会各自贡献 `mineru-<version>` 条目：Router 的 `/v1/models` 出现多个 `mineru-*` id 表示集群内存在版本漂移（滚动升级未完成），属预期诊断信号而非错误。
 
 如果本地 server 支持 `flash`，它可以用于显式 `flash`、仅支持 flash tier 的输入归一化、watch 或索引机制，但不应出现在 PDF/image 面向用户质量解析的默认选择候选中。
 

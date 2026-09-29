@@ -2495,7 +2495,8 @@ def test_api_server_standard_no_flash_state_and_metadata(tmp_path: Path, monkeyp
     assert app.state.effort == "high"
     assert app.state.flash_enabled is False
     assert [tier["id"] for tier in app.state.tiers] == ["basic", "standard", "advanced"]
-    assert app.state.model_ids == ["Hybrid-Basic", "MinerU-HTML", "MinerU2.5-Pro-2605-1.2B"]
+    assert app.state.model_ids == [api_server._VIRTUAL_MODEL_ID]
+    assert api_server._VIRTUAL_MODEL_ID == f"mineru-{api_server.__version__}"
     assert app.state.tier_runtime_options["basic"].effort == "medium"
     assert app.state.tier_runtime_options["standard"].effort == "high"
     assert app.state.tier_runtime_options["advanced"].effort == "xhigh"
@@ -2541,6 +2542,7 @@ def test_api_server_standard_http_metadata(tmp_path: Path, monkeypatch: pytest.M
         health_response = client.get("/v1/health")
         tiers_response = client.get("/v1/tiers")
         models_response = client.get("/v1/models")
+        model_detail_response = client.get(f"/v1/models/{api_server._VIRTUAL_MODEL_ID}")
 
     assert health_response.status_code == 200
     assert health_response.json()["status"] == "ok"
@@ -2549,20 +2551,47 @@ def test_api_server_standard_http_metadata(tmp_path: Path, monkeypatch: pytest.M
     assert "runtime" not in health_response.json()
     assert tiers_response.status_code == 200
     assert [tier["id"] for tier in tiers_response.json()["data"]] == ["flash", "basic", "standard", "advanced"]
+    assert all(tier["current_model"] == api_server._VIRTUAL_MODEL_ID for tier in tiers_response.json()["data"])
     assert models_response.status_code == 200
-    assert [model["id"] for model in models_response.json()["data"]] == [
-        "MinerU-Flash",
-        "Hybrid-Basic",
-        "MinerU-HTML",
-        "MinerU2.5-Pro-2605-1.2B",
-    ]
+    assert [model["id"] for model in models_response.json()["data"]] == [api_server._VIRTUAL_MODEL_ID]
+    assert models_response.json()["data"][0]["description"] == api_server._VIRTUAL_MODEL_DESCRIPTION
+    assert model_detail_response.status_code == 200
+    assert model_detail_response.json()["id"] == api_server._VIRTUAL_MODEL_ID
+    assert model_detail_response.json()["created"] == app.state.model_registered_at
+
+
+def test_api_server_models_created_is_stable_across_requests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """回归：created 是部署注册时间，两次请求之间不随墙钟跳动。"""
+    _stub_api_server_dependency_preflight(monkeypatch)
+    app = create_app(upload_dir=str(tmp_path), tier="standard")
+
+    with TestClient(app) as client:
+        first = client.get("/v1/models").json()["data"][0]["created"]
+        second = client.get("/v1/models").json()["data"][0]["created"]
+
+    assert first == second == app.state.model_registered_at
+
+
+def test_api_server_model_detail_rejects_unknown_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """非虚拟模型 id 一律 404，包括历史上的引擎品牌名。"""
+    _stub_api_server_dependency_preflight(monkeypatch)
+    app = create_app(upload_dir=str(tmp_path), tier="standard")
+
+    with TestClient(app) as client:
+        response = client.get("/v1/models/MinerU2.5-Pro-2605-1.2B")
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "model_not_found"
 
 
 def test_api_server_no_advanced_http_metadata_keeps_shared_models(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """验证能力接口隐藏 Advanced，同时保留 Standard 仍需使用的共享模型。"""
+    """验证能力接口隐藏 Advanced；虚拟模型 id 不随档位开关变化。"""
     _stub_api_server_dependency_preflight(monkeypatch)
     app = create_app(upload_dir=str(tmp_path), tier="standard", no_advanced=True)
 
@@ -2573,12 +2602,7 @@ def test_api_server_no_advanced_http_metadata_keeps_shared_models(
     assert tiers_response.status_code == 200
     assert [tier["id"] for tier in tiers_response.json()["data"]] == ["flash", "basic", "standard"]
     assert models_response.status_code == 200
-    assert [model["id"] for model in models_response.json()["data"]] == [
-        "MinerU-Flash",
-        "Hybrid-Basic",
-        "MinerU-HTML",
-        "MinerU2.5-Pro-2605-1.2B",
-    ]
+    assert [model["id"] for model in models_response.json()["data"]] == [api_server._VIRTUAL_MODEL_ID]
 
 
 def test_api_server_model_preload_failure_keeps_health_diagnostics_and_rejects_capabilities(
