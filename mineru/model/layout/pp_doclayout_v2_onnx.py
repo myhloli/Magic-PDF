@@ -39,7 +39,7 @@ class PPDocLayoutV2LayoutModelONNX(PPDocLayoutV2PostProcessor):
 
     差异：
     - 构造函数接收 onnx 文件路径（单个 ``.onnx``），而非 HF 模型目录
-    - 不依赖 transformers / torch，仅用 onnxruntime + numpy + cv2
+    - 不依赖 transformers / torch，使用 onnxruntime、numpy 及 DocVortex 公共图像接口
     - 预处理固定为 800x800 BICUBIC + /255（与 PaddlePaddle 官方 inference.yml 一致）
     - 阅读顺序直接来自 ONNX 输出的第 6/7 列（lexsort），无需 reading_order head
     """

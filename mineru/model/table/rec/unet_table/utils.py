@@ -229,12 +229,11 @@ def imresize(img, size, return_scale=False, interpolation="bilinear", out=None, 
         size (tuple[int]): Target size (w, h).
         return_scale (bool): Whether to return `w_scale` and `h_scale`.
         interpolation (str): Interpolation method, accepted values are
-            "nearest", "bilinear", "bicubic", "area", "lanczos" for 'cv2'
+            "nearest", "bilinear", "bicubic", "area", "lanczos" for 'numeric'
             backend, "nearest", "bilinear" for 'pillow' backend.
         out (ndarray): The output destination.
-        backend (str | None): The image resize backend type. Options are `cv2`,
-            `pillow`, `None`. If backend is None, the global imread_backend
-            specified by ``mmcv.use_backend()`` will be used. Default: None.
+        backend (str | None): The image resize backend type. Options are
+            `numeric`, `pillow`, `None`. None selects the shared numeric kernel.
 
     Returns:
         tuple | ndarray: (`resized_img`, `w_scale`, `h_scale`) or
@@ -243,7 +242,7 @@ def imresize(img, size, return_scale=False, interpolation="bilinear", out=None, 
     h, w = img.shape[:2]
     if backend is None:
         backend = "numeric"
-    if backend not in ["numeric", "cv2", "pillow"]:
+    if backend not in ["numeric", "pillow"]:
         raise ValueError(f"backend: {backend} is not supported for resize.Supported backends are 'numeric', 'pillow'")
 
     if backend == "pillow":

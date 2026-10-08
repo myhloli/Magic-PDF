@@ -1,6 +1,6 @@
 # Copyright (c) Opendatalab. All rights reserved.
 
-from docvortex.image import decode_image, resize_image
+from docvortex.image import resize_image
 import os
 import math
 from pathlib import Path
@@ -210,15 +210,6 @@ def str_count(s):
         else:
             count_pu += 1
     return s_len - math.ceil(en_dg_count / 2)
-
-
-def base64_to_cv2(b64str):
-
-    import base64
-    data = base64.b64decode(b64str.encode('utf8'))
-    data = np.fromstring(data, np.uint8)
-    data = decode_image(data.tobytes(), color=True, apply_orientation=True)
-    return data
 
 
 def get_arch_config(model_path):

@@ -38,7 +38,7 @@ class PPFormulaNetPlusMONNX:
 
     差异：
     - 构造函数接收 onnx 文件路径 + yml 配置路径，而非 HF 模型目录
-    - 不依赖 torch / transformers，仅用 onnxruntime + numpy + cv2
+    - 不依赖 torch / transformers，使用 onnxruntime、numpy 及共享图像预处理
     - 模型输出 token IDs（非 logits），自回归循环已 bake 进 ONNX 图
     """
 

@@ -1,6 +1,41 @@
 # OpenCV 按需加载与使用验收
 
-2026-10-08。第二轮已从 MinerU 基础直接依赖中移除 OpenCV；下方第一轮章节保留此前按需加载阶段的历史记录。
+2026-10-08。第三轮已完全移除 MinerU 自身的 OpenCV 导入和调用。下方第二轮及第一轮章节保留历史验收记录。
+
+## 第三轮：调用代码完全移除
+
+生产目录 `mineru/` 中已无 `cv2` 标识、导入或调用；基础依赖不包含 OpenCV，Torch/full 等 extra
+保持原样，其他依赖自行引入 OpenCV 的行为仍不在清理范围。DocVortex 公共 API 和内核无需继续修改。
+
+正常印章裁剪一直显式使用 `mode="homography"`。本轮删除没有产品调用方的相机标定支路：
+`PlanB`、虚拟相机、畸变投影、`Rodrigues`、`remap`、两处 `calibrateCamera` 以及损失阈值重试。
+`CurveTextRectifier`、`AutoRectifier` 默认改为 homography，保留原分段展开、短多边形外接框裁图、
+几何异常回退和诊断绘图。显式请求 calibration 模式会抛出 `ValueError`，不静默更换算法；
+内部 `loss_thresh` 参数不再提供。公共 Parser、产品参数和九种输出契约保持原样。
+
+同时移除未使用的 `base64_to_cv2` 内部辅助函数、`imresize` 的旧 `backend="cv2"` 别名，
+修正三处过时模块注释。旧标定白名单改为全生产目录禁止 OpenCV 的静态守卫。
+
+测试对照在删除前冻结为 `tests/fixtures/model_image_reference.json`：29 个模型数组来自原 OpenCV
+对照，15 组印章裁图及诊断图来自原显式 homography 路径。记录基准提交 `e6d89a6a`、原测试
+源码摘要及参考库版本。测试代码也不再导入或调用 OpenCV，只保留导入阻断、静态审计和元数据检查。
+
+| 验收 | 结果 |
+| --- | --- |
+| 静态生产及测试调用审计 | OpenCV 导入和直接调用均为 0；生产源码 `cv2` 文本匹配为 0 |
+| 针对数值与跨库边界 | 77 项通过；包括 Python/Rust 两后端的横竖曲线、四点、短多边形和退化回退 |
+| 整组回归阻断 OpenCV | 同一 77 项通过，冻结参考测试无需安装 OpenCV |
+| 普通宿主回归 | 3043 passed、4 skipped；范围为 `not remote and not full_stack` |
+| 实际 Flash OCR | demo1 第 5–6 页，候选阻断 cv2；完整 ModelJson、MiddleJson、九种输出和实际模型输入摘要与第二轮候选相同 |
+| Ruff / 补丁 | 核心印章模块与修改后边界测试 E/F/W/ANN、格式检查通过；`git diff --check` 通过 |
+
+宿主回归有 63 条警告，包含此前出现过的 Gradio 页范围测试事件循环析构告警。
+该文件按 `PytestUnraisableExceptionWarning` 作为错误重跑，59 passed、3 skipped，未复现；
+原始告警和重跑日志均保留，不过滤它。
+
+原始证据位于 `/tmp/mineru-opencv-zero-20261008`，归档为
+[output/opencv-zero-20261008/evidence.tar.gz](../../output/opencv-zero-20261008/evidence.tar.gz)。
+本轮修改提交并合并到本地 dev，未推送或发布。第二轮归档保持原样。
 
 ## 第二轮：基础依赖移除
 

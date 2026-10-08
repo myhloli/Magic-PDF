@@ -12,25 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from docvortex.image import perspective_matrix, warp_image
-
 import copy
 
 import numpy as np
+from docvortex.image import perspective_matrix, warp_image
 from loguru import logger
+from numpy import sqrt
 from PIL import Image, ImageDraw
-from numpy import arctan, cos, sin, sqrt
 
 
 def Homography(
-    image,
-    img_points,
-    world_width,
-    world_height,
-    interpolation=None,
-    ratio_width=1.0,
-    ratio_height=1.0,
-):
+    image: np.ndarray,
+    img_points: np.ndarray,
+    world_width: float,
+    world_height: float,
+    interpolation: str | int | None = None,
+    ratio_width: float = 1.0,
+    ratio_height: float = 1.0,
+) -> np.ndarray:
+    """按既有四点单应矩阵采样，保留插值、扩边和目标尺寸规则。"""
     if interpolation is None:
         interpolation = "cubic"
 
@@ -58,129 +58,11 @@ def Homography(
     return dst_img
 
 
-class PlanB:
-    def __call__(
-        self,
-        image,
-        points,
-        curveTextRectifier,
-        interpolation=None,
-        ratio_width=1.0,
-        ratio_height=1.0,
-        loss_thresh=5.0,
-        square=False,
-    ):
-        if interpolation is None:
-            interpolation = "linear"
-        h, w = image.shape[:2]
-        _points = np.array(points).reshape(-1, 2).astype(np.float32)
-        x_min = int(np.min(_points[:, 0]))
-        y_min = int(np.min(_points[:, 1]))
-        x_max = int(np.max(_points[:, 0]))
-        y_max = int(np.max(_points[:, 1]))
-        dx = x_max - x_min
-        dy = y_max - y_min
-        max_d = max(dx, dy)
-        mean_pt = np.mean(_points, 0)
-
-        expand_x = (ratio_width - 1.0) * 0.5 * max_d
-        expand_y = (ratio_height - 1.0) * 0.5 * max_d
-
-        if square:
-            x_min = np.clip(int(mean_pt[0] - max_d - expand_x), 0, w - 1)
-            y_min = np.clip(int(mean_pt[1] - max_d - expand_y), 0, h - 1)
-            x_max = np.clip(int(mean_pt[0] + max_d + expand_x), 0, w - 1)
-            y_max = np.clip(int(mean_pt[1] + max_d + expand_y), 0, h - 1)
-        else:
-            x_min = np.clip(int(x_min - expand_x), 0, w - 1)
-            y_min = np.clip(int(y_min - expand_y), 0, h - 1)
-            x_max = np.clip(int(x_max + expand_x), 0, w - 1)
-            y_max = np.clip(int(y_max + expand_y), 0, h - 1)
-
-        new_image = image[y_min:y_max, x_min:x_max, :].copy()
-        new_points = _points.copy()
-        new_points[:, 0] -= x_min
-        new_points[:, 1] -= y_min
-
-        dst_img, loss = curveTextRectifier(
-            new_image,
-            new_points,
-            interpolation,
-            ratio_width,
-            ratio_height,
-            mode="calibration",
-        )
-
-        return dst_img, loss
-
-
 class CurveTextRectifier:
-    def __init__(self):
-        self.get_virtual_camera_parameter()
-
-    def get_virtual_camera_parameter(self):
-        vcam_thz = 0
-        vcam_thx1 = 180
-        vcam_thy = 180
-        vcam_thx2 = 0
-
-        vcam_x = 0
-        vcam_y = 0
-        vcam_z = 100
-
-        radian = np.pi / 180
-
-        angle_z = radian * vcam_thz
-        angle_x1 = radian * vcam_thx1
-        angle_y = radian * vcam_thy
-        angle_x2 = radian * vcam_thx2
-
-        optic_x = vcam_x
-        optic_y = vcam_y
-        optic_z = vcam_z
-
-        fu = 100
-        fv = 100
-
-        matT = np.zeros((4, 4))
-        matT[0, 0] = cos(angle_z) * cos(angle_y) - sin(angle_z) * sin(angle_x1) * sin(angle_y)
-        matT[0, 1] = cos(angle_z) * sin(angle_y) * sin(angle_x2) - sin(angle_z) * (
-            cos(angle_x1) * cos(angle_x2) - sin(angle_x1) * cos(angle_y) * sin(angle_x2)
-        )
-        matT[0, 2] = cos(angle_z) * sin(angle_y) * cos(angle_x2) + sin(angle_z) * (
-            cos(angle_x1) * sin(angle_x2) + sin(angle_x1) * cos(angle_y) * cos(angle_x2)
-        )
-        matT[0, 3] = optic_x
-        matT[1, 0] = sin(angle_z) * cos(angle_y) + cos(angle_z) * sin(angle_x1) * sin(angle_y)
-        matT[1, 1] = sin(angle_z) * sin(angle_y) * sin(angle_x2) + cos(angle_z) * (
-            cos(angle_x1) * cos(angle_x2) - sin(angle_x1) * cos(angle_y) * sin(angle_x2)
-        )
-        matT[1, 2] = sin(angle_z) * sin(angle_y) * cos(angle_x2) - cos(angle_z) * (
-            cos(angle_x1) * sin(angle_x2) + sin(angle_x1) * cos(angle_y) * cos(angle_x2)
-        )
-        matT[1, 3] = optic_y
-        matT[2, 0] = -cos(angle_x1) * sin(angle_y)
-        matT[2, 1] = cos(angle_x1) * cos(angle_y) * sin(angle_x2) + sin(angle_x1) * cos(angle_x2)
-        matT[2, 2] = cos(angle_x1) * cos(angle_y) * cos(angle_x2) - sin(angle_x1) * sin(angle_x2)
-        matT[2, 3] = optic_z
-        matT[3, 0] = 0
-        matT[3, 1] = 0
-        matT[3, 2] = 0
-        matT[3, 3] = 1
-
-        matS = np.zeros((4, 4))
-        matS[2, 3] = 0.5
-        matS[3, 2] = 0.5
-
-        self.ifu = 1 / fu
-        self.ifv = 1 / fv
-
-        self.matT = matT
-        self.matS = matS
-        self.K = np.dot(matT.T, matS)
-        self.K = np.dot(self.K, matT)
-
-    def vertical_text_process(self, points, org_size):
+    def vertical_text_process(
+        self, points: np.ndarray | list[float] | list[list[float]], org_size: tuple[int, int]
+    ) -> tuple[np.ndarray, np.ndarray, tuple[int, int]]:
+        """竖排点序转入原横排展开逻辑，再恢复单应变换使用的坐标。"""
         org_w, org_h = org_size
         _points = np.array(points).reshape(-1).tolist()
         _points = np.array(_points[2:] + _points[:2]).reshape(-1, 2)
@@ -200,7 +82,10 @@ class CurveTextRectifier:
 
         return image_coord, world_coord, new_image_size
 
-    def horizontal_text_process(self, points):
+    def horizontal_text_process(
+        self, points: np.ndarray | list[float] | list[list[float]]
+    ) -> tuple[np.ndarray, np.ndarray, tuple[int, int]]:
+        """沿上下边界的既有距离计算展开尺寸和对应平面坐标。"""
         poly = np.array(points).reshape(-1)
 
         dx_list = []
@@ -258,7 +143,8 @@ class CurveTextRectifier:
 
         return image_coord, world_coord, new_image_size
 
-    def horizontal_text_estimate(self, points):
+    def horizontal_text_estimate(self, points: np.ndarray | list[float] | list[list[float]]) -> bool:
+        """沿用原外接框宽高比判定横竖方向。"""
         pts = np.array(points).reshape(-1, 2)
         x_min = int(np.min(pts[:, 0]))
         y_min = int(np.min(pts[:, 1]))
@@ -271,196 +157,17 @@ class CurveTextRectifier:
             is_horizontal_text = False
         return is_horizontal_text
 
-    def virtual_camera_to_world(self, size):
-        ifu, ifv = self.ifu, self.ifv
-        K, matT = self.K, self.matT
-
-        ppu = size[0] / 2 + 1e-6
-        ppv = size[1] / 2 + 1e-6
-
-        P = np.zeros((size[1], size[0], 3))
-
-        lu = np.array([i for i in range(size[0])])
-        lv = np.array([i for i in range(size[1])])
-        u, v = np.meshgrid(lu, lv)
-
-        yp = (v - ppv) * ifv
-        xp = (u - ppu) * ifu
-        angle_a = arctan(sqrt(xp * xp + yp * yp))
-        angle_b = arctan(yp / xp)
-
-        D0 = sin(angle_a) * cos(angle_b)
-        D1 = sin(angle_a) * sin(angle_b)
-        D2 = cos(angle_a)
-
-        D0[xp <= 0] = -D0[xp <= 0]
-        D1[xp <= 0] = -D1[xp <= 0]
-
-        ratio_a = (
-            K[0, 0] * D0 * D0
-            + K[1, 1] * D1 * D1
-            + K[2, 2] * D2 * D2
-            + (K[0, 1] + K[1, 0]) * D0 * D1
-            + (K[0, 2] + K[2, 0]) * D0 * D2
-            + (K[1, 2] + K[2, 1]) * D1 * D2
-        )
-        ratio_b = (K[0, 3] + K[3, 0]) * D0 + (K[1, 3] + K[3, 1]) * D1 + (K[2, 3] + K[3, 2]) * D2
-        ratio_c = K[3, 3] * np.ones(ratio_b.shape)
-
-        delta = ratio_b * ratio_b - 4 * ratio_a * ratio_c
-        t = np.zeros(delta.shape)
-        t[ratio_a == 0] = -ratio_c[ratio_a == 0] / ratio_b[ratio_a == 0]
-        t[ratio_a != 0] = (-ratio_b[ratio_a != 0] + sqrt(delta[ratio_a != 0])) / (2 * ratio_a[ratio_a != 0])
-        t[delta < 0] = 0
-
-        P[:, :, 0] = matT[0, 3] + t * (matT[0, 0] * D0 + matT[0, 1] * D1 + matT[0, 2] * D2)
-        P[:, :, 1] = matT[1, 3] + t * (matT[1, 0] * D0 + matT[1, 1] * D1 + matT[1, 2] * D2)
-        P[:, :, 2] = matT[2, 3] + t * (matT[2, 0] * D0 + matT[2, 1] * D1 + matT[2, 2] * D2)
-
-        return P
-
-    def world_to_image(self, image_size, world, intrinsic, distCoeffs, rotation, tvec):
-        r11 = rotation[0, 0]
-        r12 = rotation[0, 1]
-        r13 = rotation[0, 2]
-        r21 = rotation[1, 0]
-        r22 = rotation[1, 1]
-        r23 = rotation[1, 2]
-        r31 = rotation[2, 0]
-        r32 = rotation[2, 1]
-        r33 = rotation[2, 2]
-
-        t1 = tvec[0]
-        t2 = tvec[1]
-        t3 = tvec[2]
-
-        k1 = distCoeffs[0]
-        k2 = distCoeffs[1]
-        p1 = distCoeffs[2]
-        p2 = distCoeffs[3]
-        k3 = distCoeffs[4]
-        k4 = distCoeffs[5]
-        k5 = distCoeffs[6]
-        k6 = distCoeffs[7]
-
-        if len(distCoeffs) > 8:
-            s1 = distCoeffs[8]
-            s2 = distCoeffs[9]
-            s3 = distCoeffs[10]
-            s4 = distCoeffs[11]
-        else:
-            s1 = s2 = s3 = s4 = 0
-
-        if len(distCoeffs) > 12:
-            tx = distCoeffs[12]
-            ty = distCoeffs[13]
-        else:
-            tx = ty = 0
-
-        fu = intrinsic[0, 0]
-        fv = intrinsic[1, 1]
-        ppu = intrinsic[0, 2]
-        ppv = intrinsic[1, 2]
-
-        cos_tx = cos(tx)
-        cos_ty = cos(ty)
-        sin_tx = sin(tx)
-        sin_ty = sin(ty)
-
-        tao11 = cos_ty * cos_tx * cos_ty + sin_ty * cos_tx * sin_ty
-        tao12 = cos_ty * cos_tx * sin_ty * sin_tx - sin_ty * cos_tx * cos_ty * sin_tx
-        tao13 = -cos_ty * cos_tx * sin_ty * cos_tx + sin_ty * cos_tx * cos_ty * cos_tx
-        tao21 = -sin_tx * sin_ty
-        tao22 = cos_ty * cos_tx * cos_tx + sin_tx * cos_ty * sin_tx
-        tao23 = cos_ty * cos_tx * sin_tx - sin_tx * cos_ty * cos_tx
-
-        P = np.zeros((image_size[1], image_size[0], 2))
-
-        c3 = r31 * world[:, :, 0] + r32 * world[:, :, 1] + r33 * world[:, :, 2] + t3
-        c1 = r11 * world[:, :, 0] + r12 * world[:, :, 1] + r13 * world[:, :, 2] + t1
-        c2 = r21 * world[:, :, 0] + r22 * world[:, :, 1] + r23 * world[:, :, 2] + t2
-
-        x1 = c1 / c3
-        y1 = c2 / c3
-        x12 = x1 * x1
-        y12 = y1 * y1
-        x1y1 = 2 * x1 * y1
-        r2 = x12 + y12
-        r4 = r2 * r2
-        r6 = r2 * r4
-
-        radial_distortion = (1 + k1 * r2 + k2 * r4 + k3 * r6) / (1 + k4 * r2 + k5 * r4 + k6 * r6)
-        x2 = x1 * radial_distortion + p1 * x1y1 + p2 * (r2 + 2 * x12) + s1 * r2 + s2 * r4
-        y2 = y1 * radial_distortion + p2 * x1y1 + p1 * (r2 + 2 * y12) + s3 * r2 + s4 * r4
-
-        x3 = tao11 * x2 + tao12 * y2 + tao13
-        y3 = tao21 * x2 + tao22 * y2 + tao23
-
-        P[:, :, 0] = fu * x3 + ppu
-        P[:, :, 1] = fv * y3 + ppv
-        P[c3 <= 0] = 0
-
-        return P
-
-    def spatial_transform(self, image_data, new_image_size, mtx, dist, rvecs, tvecs, interpolation):
-        import cv2
-
-        rotation, _ = cv2.Rodrigues(rvecs)
-        world_map = self.virtual_camera_to_world(new_image_size)
-        image_map = self.world_to_image(new_image_size, world_map, mtx, dist, rotation, tvecs)
-        image_map = image_map.astype(np.float32)
-        if isinstance(interpolation, str):
-            interpolation = {"nearest": 0, "linear": 1, "cubic": 2, "area": 3, "lanczos4": 4}[interpolation]
-        dst = cv2.remap(image_data, image_map[:, :, 0], image_map[:, :, 1], interpolation)
-        return dst
-
-    def calibrate(self, org_size, image_coord, world_coord):
-        """只在明确选择旧相机标定时按需使用 OpenCV，保留历史标定参数。"""
-        import cv2
-
-        flag = cv2.CALIB_RATIONAL_MODEL
-        flag2 = cv2.CALIB_RATIONAL_MODEL | cv2.CALIB_TILTED_MODEL
-        flag3 = cv2.CALIB_RATIONAL_MODEL | cv2.CALIB_THIN_PRISM_MODEL
-        flag4 = cv2.CALIB_RATIONAL_MODEL | cv2.CALIB_ZERO_TANGENT_DIST | cv2.CALIB_FIX_ASPECT_RATIO
-        flag5 = cv2.CALIB_RATIONAL_MODEL | cv2.CALIB_TILTED_MODEL | cv2.CALIB_ZERO_TANGENT_DIST
-        flag6 = cv2.CALIB_RATIONAL_MODEL | cv2.CALIB_FIX_ASPECT_RATIO
-        flag_list = [flag2, flag3, flag4, flag5, flag6]
-
-        ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(
-            world_coord.astype(np.float32),
-            image_coord.astype(np.float32),
-            org_size,
-            None,
-            None,
-            flags=flag,
-        )
-        if ret > 2:
-            min_ret = ret
-            for flag in flag_list:
-                _ret, _mtx, _dist, _rvecs, _tvecs = cv2.calibrateCamera(
-                    world_coord.astype(np.float32),
-                    image_coord.astype(np.float32),
-                    org_size,
-                    None,
-                    None,
-                    flags=flag,
-                )
-                if _ret < min_ret:
-                    min_ret = _ret
-                    ret, mtx, dist, rvecs, tvecs = _ret, _mtx, _dist, _rvecs, _tvecs
-
-        return ret, mtx, dist, rvecs, tvecs
-
     def dc_homo(
         self,
-        img,
-        img_points,
-        obj_points,
-        is_horizontal_text,
-        interpolation=None,
-        ratio_width=1.0,
-        ratio_height=1.0,
-    ):
+        img: np.ndarray,
+        img_points: np.ndarray,
+        obj_points: np.ndarray,
+        is_horizontal_text: bool,
+        interpolation: str | int | None = None,
+        ratio_width: float = 1.0,
+        ratio_height: float = 1.0,
+    ) -> np.ndarray:
+        """逐段单应展开后按原高度拼接，竖排结果保留原旋转方向。"""
         if interpolation is None:
             interpolation = "linear"
 
@@ -516,58 +223,50 @@ class CurveTextRectifier:
 
     def __call__(
         self,
-        image_data,
-        points,
-        interpolation=None,
-        ratio_width=1.0,
-        ratio_height=1.0,
-        mode="calibration",
-    ):
+        image_data: np.ndarray,
+        points: np.ndarray | list[float] | list[list[float]],
+        interpolation: str | int | None = None,
+        ratio_width: float = 1.0,
+        ratio_height: float = 1.0,
+        mode: str = "homography",
+    ) -> tuple[np.ndarray, float]:
+        """只执行既有分段单应变换，旧相机标定模式明确拒绝。"""
+        if mode.lower() != "homography":
+            raise ValueError(f'Only mode="homography" is supported, got {mode!r}')
         if interpolation is None:
             interpolation = "linear"
-
         org_h, org_w = image_data.shape[:2]
-        org_size = (org_w, org_h)
-        self.image = image_data
-
         is_horizontal_text = self.horizontal_text_estimate(points)
         if is_horizontal_text:
-            image_coord, world_coord, new_image_size = self.horizontal_text_process(points)
+            image_coord, world_coord, _ = self.horizontal_text_process(points)
         else:
-            image_coord, world_coord, new_image_size = self.vertical_text_process(points, org_size)
-
-        if mode.lower() == "calibration":
-            ret, mtx, dist, rvecs, tvecs = self.calibrate(org_size, image_coord, world_coord)
-
-            st_size = (
-                int(new_image_size[0] * ratio_width),
-                int(new_image_size[1] * ratio_height),
-            )
-            dst = self.spatial_transform(image_data, st_size, mtx, dist[0], rvecs[0], tvecs[0], interpolation)
-        elif mode.lower() == "homography":
-            ret = 0.01
-            dst = self.dc_homo(
-                image_data,
-                image_coord,
-                world_coord,
-                is_horizontal_text,
-                interpolation=interpolation,
-                ratio_width=1.0,
-                ratio_height=1.0,
-            )
-        else:
-            raise ValueError('mode must be ["calibration", "homography"], but got {}'.format(mode))
-
-        return dst, ret
+            image_coord, world_coord, _ = self.vertical_text_process(points, (org_w, org_h))
+        dst = self.dc_homo(
+            image_data,
+            image_coord,
+            world_coord,
+            is_horizontal_text,
+            interpolation=interpolation,
+            ratio_width=1.0,
+            ratio_height=1.0,
+        )
+        return dst, 0.01
 
 
 class AutoRectifier:
-    def __init__(self):
+    def __init__(self) -> None:
+        """保留曲线文字点数阈值，初始化不再创建虚拟相机。"""
         self.npoints = 10
-        self.curveTextRectifier = CurveTextRectifier()
 
     @staticmethod
-    def get_rotate_crop_image(img, points, interpolation=None, ratio_width=1.0, ratio_height=1.0):
+    def get_rotate_crop_image(
+        img: np.ndarray,
+        points: np.ndarray | list[float] | list[list[float]],
+        interpolation: str | int | None = None,
+        ratio_width: float = 1.0,
+        ratio_height: float = 1.0,
+    ) -> np.ndarray:
+        """四点使用既有透视裁图，其他点数保留独立外接矩形裁片。"""
         if interpolation is None:
             interpolation = "cubic"
         h, w = img.shape[:2]
@@ -614,7 +313,7 @@ class AutoRectifier:
 
         return dst_img
 
-    def visualize(self, image_data, points_list):
+    def visualize(self, image_data: np.ndarray, points_list: list[list[float] | list[list[float]]]) -> np.ndarray:
         """使用 Pillow 标注印章矫正点，返回与输入同通道顺序的诊断图。"""
         with Image.fromarray(image_data[:, :, ::-1]) as canvas:
             draw = ImageDraw.Draw(canvas)
@@ -627,78 +326,40 @@ class AutoRectifier:
 
     def __call__(
         self,
-        image_data,
-        points,
-        interpolation=None,
-        ratio_width=1.0,
-        ratio_height=1.0,
-        loss_thresh=5.0,
-        mode="calibration",
-    ):
+        image_data: np.ndarray,
+        points: np.ndarray | list[float] | list[list[float]],
+        interpolation: str | int | None = None,
+        ratio_width: float = 1.0,
+        ratio_height: float = 1.0,
+        mode: str = "homography",
+    ) -> np.ndarray:
+        """默认使用曲线单应矫正，几何异常保留原有外接矩形裁图回退。"""
+        if mode.lower() != "homography":
+            raise ValueError(f'Only mode="homography" is supported, got {mode!r}')
         if interpolation is None:
             interpolation = "linear"
         _points = np.array(points).reshape(-1, 2)
         if len(_points) >= self.npoints and len(_points) % 2 == 0:
             try:
-                curveTextRectifier = CurveTextRectifier()
-
-                dst_img, loss = curveTextRectifier(image_data, points, interpolation, ratio_width, ratio_height, mode)
-                if loss >= 2:
-                    img_list, loss_list = [dst_img], [loss]
-                    _dst_img, _loss = PlanB()(
-                        image_data,
-                        points,
-                        curveTextRectifier,
-                        interpolation,
-                        ratio_width,
-                        ratio_height,
-                        loss_thresh=loss_thresh,
-                        square=True,
-                    )
-                    img_list += [_dst_img]
-                    loss_list += [_loss]
-
-                    _dst_img, _loss = PlanB()(
-                        image_data,
-                        points,
-                        curveTextRectifier,
-                        interpolation,
-                        ratio_width,
-                        ratio_height,
-                        loss_thresh=loss_thresh,
-                        square=False,
-                    )
-                    img_list += [_dst_img]
-                    loss_list += [_loss]
-
-                    min_loss = min(loss_list)
-                    dst_img = img_list[loss_list.index(min_loss)]
-
-                    if min_loss >= loss_thresh:
-                        logger.warning(
-                            "calibration loss: {} is too large for spatial transformer. It is failed. Using get_rotate_crop_image".format(
-                                loss
-                            )
-                        )
-                        dst_img = self.get_rotate_crop_image(image_data, points, interpolation, ratio_width, ratio_height)
+                curve_text_rectifier = CurveTextRectifier()
+                dst_img, _ = curve_text_rectifier(image_data, points, interpolation, ratio_width, ratio_height, mode)
             except Exception as e:
                 logger.warning(f"Exception caught: {e}")
                 dst_img = self.get_rotate_crop_image(image_data, points, interpolation, ratio_width, ratio_height)
         else:
             dst_img = self.get_rotate_crop_image(image_data, _points, interpolation, ratio_width, ratio_height)
-
         return dst_img
 
     def run(
         self,
-        image_data,
-        points_list,
-        interpolation=None,
-        ratio_width=1.0,
-        ratio_height=1.0,
-        loss_thresh=5.0,
-        mode="calibration",
-    ):
+        image_data: np.ndarray,
+        points_list: list[list[float] | list[list[float]]],
+        interpolation: str | int | None = None,
+        ratio_width: float = 1.0,
+        ratio_height: float = 1.0,
+        mode: str = "homography",
+    ) -> tuple[list[np.ndarray], np.ndarray]:
+        """批量单应矫正并返回诊断图，不再提供相机标定或损失阈值参数。"""
         if image_data is None:
             raise ValueError
         if not isinstance(points_list, list):
@@ -708,23 +369,19 @@ class AutoRectifier:
                 raise ValueError
         if interpolation is None:
             interpolation = "linear"
-
         if ratio_width < 1.0 or ratio_height < 1.0:
             raise ValueError(
                 "ratio_width and ratio_height cannot be smaller than 1, but got {}",
                 (ratio_width, ratio_height),
             )
-
-        if mode.lower() != "calibration" and mode.lower() != "homography":
-            raise ValueError('mode must be ["calibration", "homography"], but got {}'.format(mode))
-
+        if mode.lower() != "homography":
+            raise ValueError(f'Only mode="homography" is supported, got {mode!r}')
         if mode.lower() == "homography" and ratio_width != 1.0 and ratio_height != 1.0:
             raise ValueError(
                 "ratio_width and ratio_height must be 1.0 when mode is homography, but got mode:{}, ratio:({},{})".format(
                     mode, ratio_width, ratio_height
                 )
             )
-
         res = []
         for points in points_list:
             rectified_img = self(
@@ -733,11 +390,8 @@ class AutoRectifier:
                 interpolation,
                 ratio_width,
                 ratio_height,
-                loss_thresh=loss_thresh,
                 mode=mode,
             )
             res.append(rectified_img)
-
         visualized_image = self.visualize(image_data, points_list)
-
         return res, visualized_image

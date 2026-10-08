@@ -1,7 +1,7 @@
 # Copyright (c) Opendatalab. All rights reserved.
 """PP-DocLayoutV2 的后处理与可视化逻辑（与推理引擎无关）。
 
-本模块只依赖 numpy / cv2 / PIL，不依赖 torch / transformers，
+本模块使用 numpy / PIL 和 DocVortex 公共几何接口，不依赖 torch / transformers，
 供 transformers 版（`pp_doclayoutv2.py`）和 ONNX 版（`pp_doclayout_v2_onnx.py`）
 共同复用，保证两个后端的输出后处理完全一致。
 """
