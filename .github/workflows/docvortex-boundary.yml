@@ -259,6 +259,7 @@ jobs:
             tests/unittest/test_pdf_window_snapshots.py \
             tests/unittest/test_native_span_assignment.py \
             tests/unittest/test_flash_pdf_render_scheduling.py \
+            tests/unittest/test_opencv_boundaries.py \
             tests/unittest/test_process_heap_memory.py
       - name: Retain exact wheel and installation evidence
         if: ${{ always() }}

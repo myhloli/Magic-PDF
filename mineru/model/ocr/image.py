@@ -2,10 +2,11 @@
 """OCR 输入图像解码、遮罩与旋转裁剪。"""
 
 from __future__ import annotations
+from docvortex.image import decode_image, perspective_matrix, resize_image, warp_image
+
 
 from typing import Any
 
-import cv2
 import numpy as np
 from docvortex.geometry import normalize_to_int_bbox
 
@@ -14,10 +15,23 @@ from .geometry import is_bbox_aligned_rect
 TEXT_REC_ROTATE_RATIO = 1.5
 
 
+def rgb_to_bgr(img: np.ndarray) -> np.ndarray:
+    """为模型输入交换 RGB/BGR 通道，忽略 alpha 并返回独立连续数组。"""
+    if img.dtype not in (np.uint8, np.uint16, np.float32) or img.size == 0:
+        raise ValueError("Model input expects a non-empty uint8, uint16 or float32 image")
+    if img.ndim == 2:
+        return np.repeat(img[:, :, None], 3, axis=2)
+    if img.ndim == 3 and img.shape[2] == 1:
+        return np.repeat(img, 3, axis=2)
+    if img.ndim == 3 and img.shape[2] in (3, 4):
+        return img[:, :, 2::-1].copy(order="C")
+    raise ValueError(f"Unsupported model input image shape: {img.shape}")
+
+
 def img_decode(content: bytes) -> Any:
-    """把编码图片字节解码为 OpenCV 数组。"""
-    np_arr = np.frombuffer(content, dtype=np.uint8)
-    return cv2.imdecode(np_arr, cv2.IMREAD_UNCHANGED)
+    """通过共享图像接口解码字节，保留 BGR、alpha 和原始位深。"""
+
+    return decode_image(content)
 
 
 def check_img(img: bytes | np.ndarray) -> Any:
@@ -25,19 +39,19 @@ def check_img(img: bytes | np.ndarray) -> Any:
     if isinstance(img, bytes):
         img = img_decode(img)
     if isinstance(img, np.ndarray) and len(img.shape) == 2:
-        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        img = np.repeat(img[:, :, None], 3, axis=2)
     return img
 
 
 def alpha_to_color(img: np.ndarray, alpha_color: tuple[int, int, int] = (255, 255, 255)) -> np.ndarray:
     """把带透明通道的图像合成到指定纯色背景。"""
     if len(img.shape) == 3 and img.shape[2] == 4:
-        blue, green, red, alpha_channel = cv2.split(img)
+        blue, green, red, alpha_channel = (img[:, :, index] for index in range(4))
         alpha = alpha_channel / 255
         red = (alpha_color[0] * (1 - alpha) + red * alpha).astype(np.uint8)
         green = (alpha_color[1] * (1 - alpha) + green * alpha).astype(np.uint8)
         blue = (alpha_color[2] * (1 - alpha) + blue * alpha).astype(np.uint8)
-        img = cv2.merge((blue, green, red))
+        img = np.stack((blue, green, red), axis=2)
     return img
 
 
@@ -83,14 +97,10 @@ def get_rotate_crop_image(img: np.ndarray, points: np.ndarray) -> np.ndarray:
     img_crop_width = int(max(np.linalg.norm(points[0] - points[1]), np.linalg.norm(points[2] - points[3])))
     img_crop_height = int(max(np.linalg.norm(points[0] - points[3]), np.linalg.norm(points[1] - points[2])))
     pts_std = np.float32([[0, 0], [img_crop_width, 0], [img_crop_width, img_crop_height], [0, img_crop_height]])
-    matrix = cv2.getPerspectiveTransform(points, pts_std)
-    dst_img = cv2.warpPerspective(
-        img,
-        matrix,
-        (img_crop_width, img_crop_height),
-        borderMode=cv2.BORDER_REPLICATE,
-        flags=cv2.INTER_CUBIC,
-    )
+    # 四边形裁图调用共享数值内核，轴对齐区域继续直接复制。
+
+    matrix = perspective_matrix(points, pts_std)
+    dst_img = warp_image(img, matrix, (img_crop_width, img_crop_height), border="replicate", interpolation="cubic")
     dst_img_height, dst_img_width = dst_img.shape[:2]
     if dst_img_height / dst_img_width >= TEXT_REC_ROTATE_RATIO:
         dst_img = np.rot90(dst_img)
@@ -126,7 +136,8 @@ def resize_text_recognition_image(
     ratio = max(max_wh_ratio, width / height)
     width = max(min(int(height * ratio), max_width), min_width)
     resized_width = min(width, max(int(np.ceil(height * img.shape[1] / img.shape[0])), min_width))
-    resized = cv2.resize(img, (resized_width, height)) / 127.5 - 1
+
+    resized = resize_image(img, (resized_width, height)) / 127.5 - 1
     padded = np.zeros((channels, height, width), dtype=np.float32)
     padded[:, :, :resized_width] = resized.transpose(2, 0, 1)
     return padded
@@ -147,5 +158,6 @@ __all__ = [
     "mask_formula_regions_for_ocr_det",
     "preprocess_image",
     "resize_text_recognition_image",
+    "rgb_to_bgr",
     "rotate_vertical_crop_if_needed",
 ]

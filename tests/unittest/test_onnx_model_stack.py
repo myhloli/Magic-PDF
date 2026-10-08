@@ -253,6 +253,9 @@ def test_light_standard_does_not_probe_platform_engines(monkeypatch: pytest.Monk
 def test_light_table_models_use_only_the_onnx_bundle(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """三种表格模型从 Light 仓库取文件，并把相同 small_backend 传给共享 OCR。"""
     from mineru.model.runtime import hybrid
+    from mineru.model.table.cls import paddle_table_cls
+    from mineru.model.table.rec.slanet_plus import main as slanet
+    from mineru.model.table.rec.unet_table import main as unet
 
     resources = []
 
@@ -265,9 +268,9 @@ def test_light_table_models_use_only_the_onnx_bundle(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(download.ModelPath, "ensure", ensure)
     ocr_factory = Mock(return_value=object())
     monkeypatch.setattr(hybrid.AtomModelSingleton, "get_atom_model", ocr_factory)
-    monkeypatch.setattr(hybrid, "PaddleTableModel", Mock())
-    monkeypatch.setattr(hybrid, "UnetTableModel", Mock())
-    monkeypatch.setattr(hybrid, "PaddleTableClsModel", Mock())
+    monkeypatch.setattr(slanet, "PaddleTableModel", Mock())
+    monkeypatch.setattr(unet, "UnetTableModel", Mock())
+    monkeypatch.setattr(paddle_table_cls, "PaddleTableClsModel", Mock())
     hybrid.wireless_table_model_init(small_backend="onnx", device="cpu")
     hybrid.wired_table_model_init(small_backend="onnx", device="cpu")
     hybrid.table_cls_model_init(small_backend="onnx")

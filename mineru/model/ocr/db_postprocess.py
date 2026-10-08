@@ -5,11 +5,20 @@ https://github.com/WenmuZhou/DBNet.pytorch/blob/master/post_processing/seg_detec
 """
 
 from __future__ import annotations
+from docvortex.image import (
+    morphology,
+    rasterize_polygons,
+    trace_contours,
+    contour_length,
+    minimum_rectangle,
+    rectangle_corners,
+    simplify_contour,
+)
+
 
 from typing import Any, Literal
 
 import numpy as np
-import cv2
 from shapely.geometry import Polygon
 import pyclipper
 
@@ -52,11 +61,11 @@ class DBPostProcess(object):
         boxes = []
         scores = []
 
-        contours, _ = cv2.findContours((bitmap * 255).astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        contours = trace_contours((bitmap * 255).astype(np.uint8))
 
         for contour in contours[: self.max_candidates]:
-            epsilon = 0.002 * cv2.arcLength(contour, True)
-            approx = cv2.approxPolyDP(contour, epsilon, True)
+            epsilon = 0.002 * contour_length(contour, closed=True)
+            approx = simplify_contour(contour, epsilon, closed=True)
             points = approx.reshape((-1, 2))
             if points.shape[0] < 4:
                 continue
@@ -95,11 +104,7 @@ class DBPostProcess(object):
         bitmap = _bitmap
         height, width = bitmap.shape
 
-        outs = cv2.findContours((bitmap * 255).astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        if len(outs) == 3:
-            contours = outs[1]
-        elif len(outs) == 2:
-            contours, _ = outs[0], outs[1]
+        contours = trace_contours((bitmap * 255).astype(np.uint8))
 
         num_contours = min(len(contours), self.max_candidates)
 
@@ -144,8 +149,9 @@ class DBPostProcess(object):
 
     def get_mini_boxes(self, contour: np.ndarray) -> tuple[list[np.ndarray], float]:
         """返回轮廓的有序最小外接矩形与短边长度。"""
-        bounding_box = cv2.minAreaRect(contour)
-        points = sorted(cv2.boxPoints(bounding_box), key=lambda x: x[0])
+
+        bounding_box = minimum_rectangle(contour)
+        points = sorted(rectangle_corners(bounding_box), key=lambda x: x[0])
 
         index_1, index_2, index_3, index_4 = 0, 1, 2, 3
         if points[1][1] > points[0][1]:
@@ -166,6 +172,7 @@ class DBPostProcess(object):
 
     def box_score_fast(self, bitmap: np.ndarray, _box: np.ndarray) -> float:
         """计算外接框覆盖区域的平均检测分数。"""
+
         h, w = bitmap.shape[:2]
         box = _box.copy()
         xmin = np.clip(np.floor(box[:, 0].min()).astype(np.int32), 0, w - 1)
@@ -176,11 +183,12 @@ class DBPostProcess(object):
         mask = np.zeros((ymax - ymin + 1, xmax - xmin + 1), dtype=np.uint8)
         box[:, 0] = box[:, 0] - xmin
         box[:, 1] = box[:, 1] - ymin
-        cv2.fillPoly(mask, box.reshape(1, -1, 2).astype(np.int32), 1)
-        return cv2.mean(bitmap[ymin : ymax + 1, xmin : xmax + 1], mask)[0]
+        mask = rasterize_polygons(mask.shape, [box.astype(np.int32)])
+        return self._masked_mean(bitmap[ymin : ymax + 1, xmin : xmax + 1], mask)
 
     def box_score_slow(self, bitmap: np.ndarray, contour: np.ndarray) -> float:
         """计算原始轮廓覆盖区域的平均检测分数。"""
+
         h, w = bitmap.shape[:2]
         contour = contour.copy()
         contour = np.reshape(contour, (-1, 2))
@@ -195,11 +203,18 @@ class DBPostProcess(object):
         contour[:, 0] = contour[:, 0] - xmin
         contour[:, 1] = contour[:, 1] - ymin
 
-        cv2.fillPoly(mask, contour.reshape(1, -1, 2).astype(np.int32), 1)
-        return cv2.mean(bitmap[ymin : ymax + 1, xmin : xmax + 1], mask)[0]
+        mask = rasterize_polygons(mask.shape, [contour.astype(np.int32)])
+        return self._masked_mean(bitmap[ymin : ymax + 1, xmin : xmax + 1], mask)
+
+    @staticmethod
+    def _masked_mean(bitmap: np.ndarray, mask: np.ndarray) -> float:
+        """按非零掩码取平均，double 累计保持检测阈值原有数值语义。"""
+        pixels = bitmap[mask != 0]
+        return float(pixels.sum(dtype=np.float64) / pixels.size) if pixels.size else 0.0
 
     def __call__(self, outs_dict: dict[str, np.ndarray], shape_list: np.ndarray) -> list[dict[str, Any]]:
         """逐项恢复原图坐标，保留普通文字与印章各自的点序和轮廓。"""
+
         pred = outs_dict["maps"]
         pred = pred[:, 0, :, :]
         segmentation = pred > self.thresh
@@ -208,7 +223,7 @@ class DBPostProcess(object):
         for batch_index in range(pred.shape[0]):
             src_h, src_w, ratio_h, ratio_w = shape_list[batch_index]
             if self.dilation_kernel is not None:
-                mask = cv2.dilate(np.array(segmentation[batch_index]).astype(np.uint8), self.dilation_kernel)
+                mask = morphology(np.array(segmentation[batch_index]).astype(np.uint8), self.dilation_kernel.shape[::-1])
             else:
                 mask = segmentation[batch_index]
             if self.box_type == "poly":

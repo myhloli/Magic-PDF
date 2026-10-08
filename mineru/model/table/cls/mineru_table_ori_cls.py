@@ -4,10 +4,11 @@ from collections import defaultdict
 import inspect
 from typing import List, Dict
 
-import cv2
 import numpy as np
 from loguru import logger
 from PIL import Image
+
+from ...ocr.image import rgb_to_bgr
 
 
 # 旋转候选门控回到旧规则，先尽量召回疑似旋转表，再由 OCR rec 评分决定最终角度。
@@ -45,7 +46,7 @@ class MineruTableOrientationClsModel:
     def _to_bgr_table_image(cls, table_info: Dict) -> np.ndarray:
         """从表格信息中读取 table_img，并转换为 OCR detector 使用的 BGR 图像。"""
         table_img = cls._to_numpy_image(table_info["table_img"])
-        return cv2.cvtColor(table_img, cv2.COLOR_RGB2BGR)
+        return rgb_to_bgr(table_img)
 
     @staticmethod
     def _ceil_to_stride(value: int, stride: int) -> int:
@@ -93,9 +94,9 @@ class MineruTableOrientationClsModel:
     def _rotate_image_by_label(img: np.ndarray, label: str) -> np.ndarray:
         """按候选角度旋转图像，0 度返回副本以避免后续误改原图。"""
         if label == "270":
-            return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+            return np.rot90(img, k=-1).copy(order="C")
         if label == "90":
-            return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            return np.rot90(img, k=1).copy(order="C")
         return img.copy()
 
     @staticmethod

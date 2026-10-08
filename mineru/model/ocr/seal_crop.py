@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from docvortex.image import minimum_rectangle, perspective_matrix, rectangle_corners, warp_image
+
 import copy
 from typing import List, Tuple
 
-import cv2
 import numpy as np
 from numpy.linalg import norm
 from shapely.geometry import Polygon
@@ -64,8 +65,8 @@ class CropByPolys:
         return output_list
 
     def get_minarea_rect_crop(self, img: np.ndarray, points: np.ndarray) -> np.ndarray:
-        bounding_box = cv2.minAreaRect(np.array(points).astype(np.int32))
-        points = sorted(list(cv2.boxPoints(bounding_box)), key=lambda x: x[0])
+        bounding_box = minimum_rectangle(np.array(points).astype(np.int32))
+        points = sorted(list(rectangle_corners(bounding_box)), key=lambda x: x[0])
 
         index_a, index_b, index_c, index_d = 0, 1, 2, 3
         if points[1][1] > points[0][1]:
@@ -107,22 +108,14 @@ class CropByPolys:
                 [0, img_crop_height],
             ]
         )
-        M = cv2.getPerspectiveTransform(points, pts_std)
-        dst_img = cv2.warpPerspective(
-            img,
-            M,
-            (img_crop_width, img_crop_height),
-            borderMode=cv2.BORDER_REPLICATE,
-            flags=cv2.INTER_CUBIC,
-        )
+        M = perspective_matrix(points, pts_std)
+        dst_img = warp_image(img, M, (img_crop_width, img_crop_height), border="replicate", interpolation="cubic")
         dst_img_height, dst_img_width = dst_img.shape[0:2]
         if dst_img_height * 1.0 / dst_img_width >= 1.5:
             dst_img = np.rot90(dst_img)
         return dst_img
 
-    def reorder_poly_edge(
-        self, points: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def reorder_poly_edge(self, points: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         assert points.ndim == 2
         assert points.shape[0] >= 4
         assert points.shape[1] == 2
@@ -143,9 +136,7 @@ class CropByPolys:
         assert len(vec) == 2
         return abs(vec[1] / (vec[0] + 1e-8))
 
-    def find_head_tail(
-        self, points: np.ndarray, orientation_thr: float
-    ) -> Tuple[list, list]:
+    def find_head_tail(self, points: np.ndarray, orientation_thr: float) -> Tuple[list, list]:
         assert points.ndim == 2
         assert points.shape[0] >= 4
         assert points.shape[1] == 2
@@ -161,9 +152,7 @@ class CropByPolys:
                 adjacent_ind = [x % len(edge_vec) for x in [i - 1, i + 1]]
                 adjacent_edge_vec = edge_vec[adjacent_ind]
                 temp_theta_sum = np.sum(self.vector_angle(edge_vec1, adjacent_edge_vec))
-                temp_adjacent_theta = self.vector_angle(
-                    adjacent_edge_vec[0], adjacent_edge_vec[1]
-                )
+                temp_adjacent_theta = self.vector_angle(adjacent_edge_vec[0], adjacent_edge_vec[1])
                 theta_sum.append(temp_theta_sum)
                 adjacent_vec_theta.append(temp_adjacent_theta)
             theta_sum_score = np.array(theta_sum) / np.pi
@@ -184,21 +173,12 @@ class CropByPolys:
             pad_score = np.concatenate([score, score])
             score_matrix = np.zeros((len(score), len(score) - 3))
             x = np.arange(len(score) - 3) / float(len(score) - 4)
-            gaussian = (
-                1.0
-                / (np.sqrt(2.0 * np.pi) * 0.5)
-                * np.exp(-np.power((x - 0.5) / 0.5, 2.0) / 2)
-            )
+            gaussian = 1.0 / (np.sqrt(2.0 * np.pi) * 0.5) * np.exp(-np.power((x - 0.5) / 0.5, 2.0) / 2)
             gaussian = gaussian / np.max(gaussian)
             for i in range(len(score)):
-                score_matrix[i, :] = (
-                    score[i]
-                    + pad_score[(i + 2) : (i + len(score) - 1)] * gaussian * 0.3
-                )
+                score_matrix[i, :] = score[i] + pad_score[(i + 2) : (i + len(score) - 1)] * gaussian * 0.3
 
-            head_start, tail_increment = np.unravel_index(
-                score_matrix.argmax(), score_matrix.shape
-            )
+            head_start, tail_increment = np.unravel_index(score_matrix.argmax(), score_matrix.shape)
             tail_start = (head_start + tail_increment + 2) % len(points)
             head_end = (head_start + 1) % len(points)
             tail_end = (tail_start + 1) % len(points)
@@ -209,25 +189,19 @@ class CropByPolys:
             head_inds = [head_start, head_end]
             tail_inds = [tail_start, tail_end]
         else:
-            if self.vector_slope(points[1] - points[0]) + self.vector_slope(
-                points[3] - points[2]
-            ) < self.vector_slope(points[2] - points[1]) + self.vector_slope(
-                points[0] - points[3]
-            ):
+            if self.vector_slope(points[1] - points[0]) + self.vector_slope(points[3] - points[2]) < self.vector_slope(
+                points[2] - points[1]
+            ) + self.vector_slope(points[0] - points[3]):
                 horizontal_edge_inds = [[0, 1], [2, 3]]
                 vertical_edge_inds = [[3, 0], [1, 2]]
             else:
                 horizontal_edge_inds = [[3, 0], [1, 2]]
                 vertical_edge_inds = [[0, 1], [2, 3]]
 
-            vertical_len_sum = norm(
-                points[vertical_edge_inds[0][0]] - points[vertical_edge_inds[0][1]]
-            ) + norm(
+            vertical_len_sum = norm(points[vertical_edge_inds[0][0]] - points[vertical_edge_inds[0][1]]) + norm(
                 points[vertical_edge_inds[1][0]] - points[vertical_edge_inds[1][1]]
             )
-            horizontal_len_sum = norm(
-                points[horizontal_edge_inds[0][0]] - points[horizontal_edge_inds[0][1]]
-            ) + norm(
+            horizontal_len_sum = norm(points[horizontal_edge_inds[0][0]] - points[horizontal_edge_inds[0][1]]) + norm(
                 points[horizontal_edge_inds[1][0]] - points[horizontal_edge_inds[1][1]]
             )
 
@@ -251,11 +225,9 @@ class CropByPolys:
             unit_vec2 = vec2 / (norm(vec2, axis=-1) + 1e-8)
         return np.arccos(np.clip(np.sum(unit_vec1 * unit_vec2, axis=-1), -1.0, 1.0))
 
-    def get_minarea_rect(
-        self, img: np.ndarray, points: np.ndarray
-    ) -> Tuple[np.ndarray, list]:
-        bounding_box = cv2.minAreaRect(points)
-        points = sorted(list(cv2.boxPoints(bounding_box)), key=lambda x: x[0])
+    def get_minarea_rect(self, img: np.ndarray, points: np.ndarray) -> Tuple[np.ndarray, list]:
+        bounding_box = minimum_rectangle(points)
+        points = sorted(list(rectangle_corners(bounding_box)), key=lambda x: x[0])
 
         index_a, index_b, index_c, index_d = 0, 1, 2, 3
         if points[1][1] > points[0][1]:
@@ -291,20 +263,13 @@ class CropByPolys:
 
         for i in range(1, n):
             current_line_len = i * delta_length
-            while (
-                current_edge_ind + 1 < len(length_cumsum)
-                and current_line_len >= length_cumsum[current_edge_ind + 1]
-            ):
+            while current_edge_ind + 1 < len(length_cumsum) and current_line_len >= length_cumsum[current_edge_ind + 1]:
                 current_edge_ind += 1
             current_edge_end_shift = current_line_len - length_cumsum[current_edge_ind]
             if current_edge_ind >= len(length_list):
                 break
             end_shift_ratio = current_edge_end_shift / length_list[current_edge_ind]
-            current_point = (
-                line[current_edge_ind]
-                + (line[current_edge_ind + 1] - line[current_edge_ind])
-                * end_shift_ratio
-            )
+            current_point = line[current_edge_ind] + (line[current_edge_ind + 1] - line[current_edge_ind]) * end_shift_ratio
             resampled_line.append(current_point)
         resampled_line.append(line[-1])
         resampled_line = np.array(resampled_line)
@@ -387,9 +352,7 @@ class CropByPolys:
         resample_top_line = self.sample_points_on_bbox_bp(top_line, 15)
         resample_bot_line = self.sample_points_on_bbox_bp(bot_line, 15)
 
-        sideline_mean_shift = np.mean(resample_top_line, axis=0) - np.mean(
-            resample_bot_line, axis=0
-        )
+        sideline_mean_shift = np.mean(resample_top_line, axis=0) - np.mean(resample_bot_line, axis=0)
         if sideline_mean_shift[1] > 0:
             resample_bot_line, resample_top_line = resample_top_line, resample_bot_line
         rectifier = AutoRectifier()

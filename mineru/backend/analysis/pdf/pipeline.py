@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from docvortex.document.pdf import PDFDocument
 from loguru import logger
@@ -16,12 +16,15 @@ from ....config import VlmConfig
 from ....model.runtime.execution import acquire_document, release_document
 from ....utils.async_utils import run_sync
 from ....model.vlm.contracts import VlmPredictor
-from ....model.runtime.hybrid import HybridLocalModelContext, HybridLocalModelContextSingleton
 from ....model.runtime.memory import clean_memory, trim_process_heap
 from ....model.vlm.client import get_vlm_predictor
 from ..contracts import AnalysisResult, AnalyzeEffort, ParseMode, ResolvedParseMode
 from .normalization import _normalize_pdf_model_list
 from .window import aio_process_pdf_windows, process_pdf_windows
+
+if TYPE_CHECKING:
+    from ....model.runtime.hybrid import HybridLocalModelContext
+
 
 _SUPPORTED_PDF_EFFORTS = {"flash", "medium", "high", "xhigh"}
 
@@ -58,6 +61,8 @@ def _prepare_analysis(
     state.parse_mode = cast(ResolvedParseMode, parse_mode)
     state.flash_txt_mode = effort == "flash" and state.parse_mode == "txt"
     if not state.flash_txt_mode:
+        from ....model.runtime.hybrid import HybridLocalModelContextSingleton
+
         state.hybrid_model = HybridLocalModelContextSingleton().get_model()
         acquire_document(state.hybrid_model.device)
         if effort in {"high", "xhigh"}:

@@ -10,7 +10,6 @@ import statistics
 import unicodedata
 from typing import Any, Callable, cast
 
-import cv2
 import numpy as np
 from docvortex.analyzers.pdf import PDF_NATIVE_SCRIPT_MARKUP_KEY, ScriptRole, classify_char_script_roles
 from docvortex.analyzers.pdf import join_tight_text, needs_tight_space
@@ -19,6 +18,7 @@ from docvortex.document.pdf import Char, PDFPage, get_lines_from_chars
 from docvortex.geometry import calculate_overlap_area_in_bbox1_area_ratio
 from loguru import logger
 
+from .....model.ocr.image import rgb_to_bgr
 from .....types import BBox, BlockType, ContentType
 from ..images import get_crop_img
 from .models import _AnalyzeSpan
@@ -294,7 +294,7 @@ def _prepare_post_ocr_spans(
     for span in need_ocr_spans:
         # 对span的bbox截图再ocr
         span_pil_img = get_crop_img(span.bbox, pil_img, scale)
-        span_img = cv2.cvtColor(np.array(span_pil_img), cv2.COLOR_RGB2BGR)
+        span_img = rgb_to_bgr(np.array(span_pil_img))
         # 计算span的对比度，低于0.17的span不进行ocr，等于0.17的临界框保留给后置OCR。
         if calculate_contrast(span_img, img_mode="bgr") < 0.17:
             if _restore_post_ocr_fallback(span):

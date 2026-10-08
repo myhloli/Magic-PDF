@@ -1,13 +1,13 @@
 # Copyright (c) Opendatalab. All rights reserved.
+
+from docvortex.image import gray_image, resize_image
 from PIL import Image, ImageOps
 from transformers.image_processing_utils import BaseImageProcessor
 import numpy as np
-import cv2
 import torch
 from torchvision.transforms.functional import resize
 
 
-# TODO: dereference cv2 if possible
 class UnimerSwinImageProcessor(BaseImageProcessor):
     def __init__(
             self,
@@ -28,7 +28,8 @@ class UnimerSwinImageProcessor(BaseImageProcessor):
         elif image.ndim == 3 and image.shape[2] == 1:
             gray = image[:, :, 0]
         elif image.ndim == 3 and image.shape[2] == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+
+            gray = gray_image(image, color_order='rgb')
         else:
             raise ValueError(f"Unsupported image shape for UnimerSwinImageProcessor: {image.shape}")
 
@@ -46,16 +47,18 @@ class UnimerSwinImageProcessor(BaseImageProcessor):
         data = (data - min_val) / (max_val - min_val) * 255
         gray = 255 * (data < 200).astype(np.uint8)
 
-        coords = cv2.findNonZero(gray)  # Find all non-zero points (text)
-        a, b, w, h = cv2.boundingRect(coords)  # Find minimum spanning bounding box
-        return img.crop((a, b, w + a, h + b))
+        ys, xs = np.nonzero(gray)
+        if xs.size == 0:
+            return img.crop((0, 0, 0, 0))
+        return img.crop((int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1))
 
     @staticmethod
     def crop_margin_numpy(img: np.ndarray) -> np.ndarray:
         """Crop margins of image using NumPy operations"""
         # Convert to grayscale if it's a color image
         if len(img.shape) == 3 and img.shape[2] == 3:
-            gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+            gray = gray_image(img, color_order='rgb')
         else:
             gray = img.copy()
 
@@ -67,11 +70,11 @@ class UnimerSwinImageProcessor(BaseImageProcessor):
         binary = 255 * (normalized < 200).astype(np.uint8)
 
         # Find bounding box
-        coords = cv2.findNonZero(binary)  # Find all non-zero points (text)
-        x, y, w, h = cv2.boundingRect(coords)  # Find minimum spanning bounding box
-
-        # Return cropped image
-        return img[y:y + h, x:x + w]
+        mask = binary[:, :, 0] if binary.ndim == 3 and binary.shape[2] == 1 else binary
+        ys, xs = np.nonzero(mask)
+        if xs.size == 0:
+            return img[0:0, 0:0]
+        return img[int(ys.min()):int(ys.max()) + 1, int(xs.min()):int(xs.max()) + 1]
 
     def prepare_input(self, img, random_padding: bool = False):
         """
@@ -105,7 +108,8 @@ class UnimerSwinImageProcessor(BaseImageProcessor):
             new_h, new_w = int(h * scale), int(w * scale)
 
             # Resize the image while preserving aspect ratio
-            resized_img = cv2.resize(img, (new_w, new_h))
+
+            resized_img = resize_image(img, (new_w, new_h))
 
             # Calculate padding values using the existing method
             delta_width = target_w - new_w
@@ -113,18 +117,11 @@ class UnimerSwinImageProcessor(BaseImageProcessor):
 
             pad_width, pad_height = self._get_padding_values(new_w, new_h, random_padding)
 
-            # Apply padding (convert PIL padding format to OpenCV format)
-            padding_color = [0, 0, 0] if len(img.shape) == 3 else [0]
-
-            padded_img = cv2.copyMakeBorder(
-                resized_img,
-                pad_height,  # top
-                delta_height - pad_height,  # bottom
-                pad_width,  # left
-                delta_width - pad_width,  # right
-                cv2.BORDER_CONSTANT,
-                value=padding_color
-            )
+            # 常量零填充无需 OpenCV，保持缩放结果的维度和位深。
+            padding = [(pad_height, delta_height - pad_height), (pad_width, delta_width - pad_width)]
+            if resized_img.ndim == 3:
+                padding.append((0, 0))
+            padded_img = np.pad(resized_img, padding, mode="constant")
 
             return padded_img
 

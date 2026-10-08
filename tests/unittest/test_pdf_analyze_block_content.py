@@ -24,6 +24,11 @@ from mineru.backend.postprocess import document as postprocess_document
 from mineru.integrations.docvortex import build_metadata
 from mineru.types import RAW_ALGORITHM, RAW_CAPTION, RAW_FOOTNOTE, BlockType, ContentType, MiddleJson, ModelJson
 
+from mineru.backend.analysis.pdf import ocr as stage_ocr
+from mineru.backend.analysis.pdf import tables as stage_tables
+from mineru.backend.analysis.pdf.text import content as stage_text_content
+from mineru.model.runtime import hybrid as hybrid_runtime
+
 
 def _build_text_lines(*contents: str) -> list[_AnalyzeLine]:
     """按输入文本构造稳定的多行文本结构，供 block content 拼接测试复用。"""
@@ -196,7 +201,7 @@ def test_doc_analyze_converts_vlm_results_before_downstream_processing(
     xhigh_normalizer = MagicMock(wraps=layout._normalize_xhigh_vlm_blocks)
     native_table_priority = MagicMock(return_value=MagicMock(total=0))
     monkeypatch.setattr(pipeline, "PDFDocument", MagicMock(return_value=fake_document))
-    monkeypatch.setattr(pipeline, "HybridLocalModelContextSingleton", MagicMock(return_value=hybrid_singleton))
+    monkeypatch.setattr(hybrid_runtime, "HybridLocalModelContextSingleton", MagicMock(return_value=hybrid_singleton))
     monkeypatch.setattr(
         pipeline,
         "get_vlm_predictor",
@@ -208,9 +213,9 @@ def test_doc_analyze_converts_vlm_results_before_downstream_processing(
         MagicMock(return_value=[{"img_pil": page_image, "scale": 1.0}]),
     )
     monkeypatch.setattr(window, "_process_text_and_formulas", fake_process_text_and_formulas)
-    monkeypatch.setattr(window, "_apply_native_txt_table_priority", native_table_priority)
+    monkeypatch.setattr(stage_tables, "_apply_native_txt_table_priority", native_table_priority)
     monkeypatch.setattr(window, "_normalize_xhigh_vlm_blocks", xhigh_normalizer)
-    monkeypatch.setattr(window, "_apply_seal_ocr", MagicMock())
+    monkeypatch.setattr(stage_ocr, "_apply_seal_ocr", MagicMock())
     monkeypatch.setattr(window, "_supplement_missing_image_block_containers", MagicMock())
     monkeypatch.setattr(window, "_attach_visual_block_images", MagicMock())
     expected_middle_json = MiddleJson(
@@ -619,11 +624,11 @@ def test_process_flash_ocr_runs_detection_recognition_content_and_tables(
     apply_ocr_rec = MagicMock(side_effect=lambda *_args: events.append("rec"))
     fill_content = MagicMock(side_effect=lambda *_args: events.append("content") or model_list)
     fill_tables = MagicMock(side_effect=lambda *_args: events.append("tables"))
-    monkeypatch.setattr(window, "_validate_text_formula_window_inputs", validate_inputs)
-    monkeypatch.setattr(window, "_ocr_det", ocr_det)
-    monkeypatch.setattr(window, "_apply_ocr_rec_results", apply_ocr_rec)
-    monkeypatch.setattr(window, "_fill_window_block_content_and_lines", fill_content)
-    monkeypatch.setattr(window, "_fill_flash_ocr_table_contents", fill_tables)
+    monkeypatch.setattr(stage_text_content, "_validate_text_formula_window_inputs", validate_inputs)
+    monkeypatch.setattr(stage_ocr, "_ocr_det", ocr_det)
+    monkeypatch.setattr(stage_ocr, "_apply_ocr_rec_results", apply_ocr_rec)
+    monkeypatch.setattr(stage_text_content, "_fill_window_block_content_and_lines", fill_content)
+    monkeypatch.setattr(stage_tables, "_fill_flash_ocr_table_contents", fill_tables)
 
     try:
         result = window._process_flash_ocr(

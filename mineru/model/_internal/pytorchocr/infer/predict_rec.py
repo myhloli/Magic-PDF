@@ -1,6 +1,7 @@
 # Copyright (c) Opendatalab. All rights reserved.
+
+from docvortex.image import gray_image, resize_image
 from PIL import Image
-import cv2
 from ....ocr.image import resize_text_recognition_image
 import numpy as np
 import math
@@ -105,9 +106,10 @@ class TextRecognizer(BaseOCRV20):
 
     def resize_norm_img(self, img: np.ndarray, max_wh_ratio: float) -> np.ndarray:
         """特殊识别器保持各自变换，标准 CTC 路径复用跨后端处理。"""
+
         imgC, imgH, imgW = self.rec_image_shape
         if self.rec_algorithm == 'NRTR' or self.rec_algorithm == 'ViTSTR':
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            img = gray_image(img, color_order='bgr')
             # return padding_im
             image_pil = Image.fromarray(np.uint8(img))
             if self.rec_algorithm == 'ViTSTR':
@@ -123,9 +125,8 @@ class TextRecognizer(BaseOCRV20):
                 norm_img = norm_img.astype(np.float32) / 128. - 1.
             return norm_img
         elif self.rec_algorithm == 'RFL':
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            resized_image = cv2.resize(
-                img, (imgW, imgH), interpolation=cv2.INTER_CUBIC)
+            img = gray_image(img, color_order='bgr')
+            resized_image = resize_image(img, (imgW, imgH), interpolation='cubic')
             resized_image = resized_image.astype('float32')
             resized_image = resized_image / 255
             resized_image = resized_image[np.newaxis, :]
@@ -139,9 +140,9 @@ class TextRecognizer(BaseOCRV20):
 
     def resize_norm_img_svtr(self, img, image_shape):
 
+
         imgC, imgH, imgW = image_shape
-        resized_image = cv2.resize(
-            img, (imgW, imgH), interpolation=cv2.INTER_LINEAR)
+        resized_image = resize_image(img, (imgW, imgH), interpolation='linear')
         resized_image = resized_image.astype('float32')
         resized_image = resized_image.transpose((2, 0, 1)) / 255
         resized_image -= 0.5
@@ -150,6 +151,7 @@ class TextRecognizer(BaseOCRV20):
 
 
     def resize_norm_img_srn(self, img, image_shape):
+
         imgC, imgH, imgW = image_shape
 
         img_black = np.zeros((imgH, imgW))
@@ -157,16 +159,16 @@ class TextRecognizer(BaseOCRV20):
         im_wid = img.shape[1]
 
         if im_wid <= im_hei * 1:
-            img_new = cv2.resize(img, (imgH * 1, imgH))
+            img_new = resize_image(img, (imgH * 1, imgH))
         elif im_wid <= im_hei * 2:
-            img_new = cv2.resize(img, (imgH * 2, imgH))
+            img_new = resize_image(img, (imgH * 2, imgH))
         elif im_wid <= im_hei * 3:
-            img_new = cv2.resize(img, (imgH * 3, imgH))
+            img_new = resize_image(img, (imgH * 3, imgH))
         else:
-            img_new = cv2.resize(img, (imgW, imgH))
+            img_new = resize_image(img, (imgW, imgH))
 
         img_np = np.asarray(img_new)
-        img_np = cv2.cvtColor(img_np, cv2.COLOR_BGR2GRAY)
+        img_np = gray_image(img_np, color_order='bgr')
         img_black[:, 0:img_np.shape[1]] = img_np
         img_black = img_black[:, :, np.newaxis]
 
@@ -223,6 +225,7 @@ class TextRecognizer(BaseOCRV20):
 
     def resize_norm_img_sar(self, img, image_shape,
                             width_downsample_ratio=0.25):
+
         imgC, imgH, imgW_min, imgW_max = image_shape
         h = img.shape[0]
         w = img.shape[1]
@@ -239,7 +242,7 @@ class TextRecognizer(BaseOCRV20):
         if imgW_max is not None:
             valid_ratio = min(1.0, 1.0 * resize_w / imgW_max)
             resize_w = min(imgW_max, resize_w)
-        resized_image = cv2.resize(img, (resize_w, imgH))
+        resized_image = resize_image(img, (resize_w, imgH))
         resized_image = resized_image.astype('float32')
         # norm
         if image_shape[0] == 1:
@@ -259,8 +262,8 @@ class TextRecognizer(BaseOCRV20):
 
     def norm_img_can(self, img, image_shape):
 
-        img = cv2.cvtColor(
-            img, cv2.COLOR_BGR2GRAY)  # CAN only predict gray scale image
+
+        img = gray_image(img, color_order='bgr')  # CAN only predict gray scale image
 
         if self.inverse:
             img = 255 - img

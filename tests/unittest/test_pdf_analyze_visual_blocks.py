@@ -34,6 +34,9 @@ from mineru.types import (
 )
 from mineru.version import __version__ as mineru_version
 
+from mineru.backend.analysis.pdf import formulas as stage_formulas
+from mineru.model.runtime import hybrid as hybrid_runtime
+
 JPEG_DATA_URI_PREFIX = "data:image/jpeg;base64,"
 RED = (255, 0, 0)
 GREEN = (0, 255, 0)
@@ -906,7 +909,7 @@ def test_flash_ocr_formula_number_merge_runs_before_visual_crop(
         MagicMock(return_value=[{"img_pil": page_image}]),
     )
     monkeypatch.setattr(window, "_process_flash_ocr", fake_process_flash_ocr)
-    monkeypatch.setattr(window, "optimize_hybrid_formula_number_blocks", tracked_optimizer)
+    monkeypatch.setattr(stage_formulas, "optimize_hybrid_formula_number_blocks", tracked_optimizer)
     monkeypatch.setattr(window, "_attach_visual_block_images", fake_attach_visual_blocks)
 
     model_list = window.process_pdf_windows(
@@ -1206,7 +1209,7 @@ def test_doc_analyze_office_returns_model_json_without_pdf_processing(
     model_list_normalizer = MagicMock()
     monkeypatch.setattr(office, "_OFFICE_MODEL_MAP", model_factories)
     monkeypatch.setattr(pipeline, "PDFDocument", pdf_document)
-    monkeypatch.setattr(pipeline, "HybridLocalModelContextSingleton", hybrid_model_factory)
+    monkeypatch.setattr(hybrid_runtime, "HybridLocalModelContextSingleton", hybrid_model_factory)
     monkeypatch.setattr(window, "_configured_window_size", window_size_reader)
     monkeypatch.setattr(window, "_build_processing_windows", window_builder)
     monkeypatch.setattr(window, "load_images_from_pdf_bytes_range", image_loader)
@@ -1328,7 +1331,7 @@ def test_doc_analyze_rejects_invalid_pdf_modes_before_model_initialization(
     pdf_document = MagicMock(return_value=fake_document)
     hybrid_model_factory = MagicMock()
     monkeypatch.setattr(pipeline, "PDFDocument", pdf_document)
-    monkeypatch.setattr(pipeline, "HybridLocalModelContextSingleton", hybrid_model_factory)
+    monkeypatch.setattr(hybrid_runtime, "HybridLocalModelContextSingleton", hybrid_model_factory)
 
     with pytest.raises(ValueError, match=expected_message):
         analyze.doc_analyze(
@@ -1363,7 +1366,7 @@ def test_pdf_flash_ocr_uses_local_ocr_without_vlm(
 
     monkeypatch.setattr(pipeline, "PDFDocument", MagicMock(return_value=fake_document))
     monkeypatch.setattr(
-        pipeline,
+        hybrid_runtime,
         "HybridLocalModelContextSingleton",
         MagicMock(return_value=hybrid_singleton),
     )
@@ -1402,7 +1405,7 @@ def test_pdf_flash_txt_skips_all_neural_model_loading(
     clean_memory = MagicMock()
     process_pdf_windows = MagicMock(return_value=[])
     monkeypatch.setattr(pipeline, "PDFDocument", MagicMock(return_value=fake_document))
-    monkeypatch.setattr(pipeline, "HybridLocalModelContextSingleton", hybrid_model_factory)
+    monkeypatch.setattr(hybrid_runtime, "HybridLocalModelContextSingleton", hybrid_model_factory)
     monkeypatch.setattr(pipeline, "get_vlm_predictor", get_vlm_predictor)
     monkeypatch.setattr(pipeline, "clean_memory", clean_memory)
     monkeypatch.setattr(pipeline, "process_pdf_windows", process_pdf_windows)
@@ -1474,7 +1477,7 @@ def test_pdf_infer_timer_excludes_hybrid_vlm_initialization_and_cleanup(
         events.append("clean_memory")
 
     monkeypatch.setattr(pipeline, "PDFDocument", MagicMock(return_value=fake_document))
-    monkeypatch.setattr(pipeline, "HybridLocalModelContextSingleton", MagicMock(return_value=hybrid_singleton))
+    monkeypatch.setattr(hybrid_runtime, "HybridLocalModelContextSingleton", MagicMock(return_value=hybrid_singleton))
     monkeypatch.setattr(pipeline, "get_vlm_predictor", fake_vlm_get_model)
     monkeypatch.setattr(pipeline.time, "perf_counter", fake_perf_counter)
     monkeypatch.setattr(pipeline, "_normalize_pdf_model_list", fake_normalize_model_list)
@@ -1517,7 +1520,7 @@ def test_pdf_analyze_releases_document_and_model_when_window_processing_fails(
 
     monkeypatch.setattr(pipeline, "PDFDocument", MagicMock(return_value=fake_document))
     monkeypatch.setattr(
-        pipeline,
+        hybrid_runtime,
         "HybridLocalModelContextSingleton",
         MagicMock(return_value=hybrid_singleton),
     )

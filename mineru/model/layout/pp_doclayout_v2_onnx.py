@@ -9,17 +9,19 @@
 """
 
 from __future__ import annotations
+from docvortex.image import resize_image
+
 
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
-import cv2
 import numpy as np
 import yaml
 from loguru import logger
 from PIL import Image
 from tqdm import tqdm
 
+from ..ocr.image import rgb_to_bgr
 from ..runtime.onnx import ort_session
 from .pp_doclayout_v2_base import PP_DOCLAYOUT_V2_LABELS, PPDocLayoutV2PostProcessor
 
@@ -58,7 +60,7 @@ class PPDocLayoutV2LayoutModelONNX(PPDocLayoutV2PostProcessor):
         self.use_paddlex_filter_boxes = use_paddlex_filter_boxes
         self.model_path = str(weight)
         self.imgsz = imgsz
-        self.interpolation = cv2.INTER_CUBIC
+        self.interpolation = 2  # OpenCV INTER_CUBIC，与官方预处理配置的整数编码一致。
         configuration_path = Path(config_path) if config_path else Path(weight).with_suffix(".yml")
         if config_path or configuration_path.is_file():
             with configuration_path.open(encoding="utf-8") as handle:
@@ -79,6 +81,7 @@ class PPDocLayoutV2LayoutModelONNX(PPDocLayoutV2PostProcessor):
 
     def _preprocess_single_image(self, image: Union[np.ndarray, Image.Image]) -> Tuple[np.ndarray, Tuple[int, int]]:
         """Resize 到 800x800 (BICUBIC) + /255，返回 CHW float32 ndarray。"""
+
         if isinstance(image, Image.Image):
             pil_image = image.convert("RGB")
             target_size = pil_image.size[1], pil_image.size[0]
@@ -86,12 +89,12 @@ class PPDocLayoutV2LayoutModelONNX(PPDocLayoutV2PostProcessor):
         elif isinstance(image, np.ndarray):
             arr = image
             if arr.ndim == 3 and arr.shape[2] == 3:
-                arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+                arr = rgb_to_bgr(arr)
             target_size = arr.shape[0], arr.shape[1]
         else:
             raise TypeError(f"Unsupported image type for PP-DocLayoutV2 ONNX: {type(image)}")
 
-        resized = cv2.resize(arr, (self.imgsz[1], self.imgsz[0]), interpolation=self.interpolation)
+        resized = resize_image(arr, (self.imgsz[1], self.imgsz[0]), interpolation={0: 'nearest', 1: 'linear', 2: 'cubic', 3: 'area', 4: 'lanczos4'}[self.interpolation])
         norm = resized.astype(np.float32) * self.rescale_factor
         chw = norm.transpose(2, 0, 1)
         return chw, target_size

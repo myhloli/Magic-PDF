@@ -1,5 +1,6 @@
 # Copyright (c) Opendatalab. All rights reserved.
-import cv2
+
+from docvortex.image import resize_image
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
@@ -23,11 +24,12 @@ class PaddleTableClsModel:
 
     def preprocess(self, input_img):
         # 放大图片，使其最短边长为256
+
         h, w = input_img.shape[:2]
         scale = 256 / min(h, w)
         h_resize = round(h * scale)
         w_resize = round(w * scale)
-        img = cv2.resize(input_img, (w_resize, h_resize), interpolation=1)
+        img = resize_image(input_img, (w_resize, h_resize), interpolation='linear')
         # 调整为224*224的正方形
         h, w = img.shape[:2]
         cw, ch = 224, 224
@@ -39,7 +41,7 @@ class PaddleTableClsModel:
             raise ValueError(f"Input image ({w}, {h}) smaller than the target size ({cw}, {ch}).")
         img = img[y1:y2, x1:x2, ...]
         # 正则化
-        split_im = list(cv2.split(img))
+        split_im = [img[:, :, channel].copy() for channel in range(img.shape[2])]
         std = [0.229, 0.224, 0.225]
         scale = 0.00392156862745098
         mean = [0.485, 0.456, 0.406]
@@ -49,7 +51,7 @@ class PaddleTableClsModel:
             split_im[c] = split_im[c].astype(np.float32)
             split_im[c] *= alpha[c]
             split_im[c] += beta[c]
-        img = cv2.merge(split_im)
+        img = np.stack(split_im, axis=2)
         # 5. 转换为 CHW 格式
         img = img.transpose((2, 0, 1))
         imgs = [img]
@@ -87,6 +89,7 @@ class PaddleTableClsModel:
         return batches
 
     def batch_preprocess(self, imgs):
+
         res_imgs = []
         for img in imgs:
             img = np.asarray(img)
@@ -95,7 +98,7 @@ class PaddleTableClsModel:
             scale = 256 / min(h, w)
             h_resize = round(h * scale)
             w_resize = round(w * scale)
-            img = cv2.resize(img, (w_resize, h_resize), interpolation=1)
+            img = resize_image(img, (w_resize, h_resize), interpolation='linear')
             # 调整为224*224的正方形
             h, w = img.shape[:2]
             cw, ch = 224, 224
@@ -107,7 +110,7 @@ class PaddleTableClsModel:
                 raise ValueError(f"Input image ({w}, {h}) smaller than the target size ({cw}, {ch}).")
             img = img[y1:y2, x1:x2, ...]
             # 正则化
-            split_im = list(cv2.split(img))
+            split_im = [img[:, :, channel].copy() for channel in range(img.shape[2])]
             std = [0.229, 0.224, 0.225]
             scale = 0.00392156862745098
             mean = [0.485, 0.456, 0.406]
@@ -117,7 +120,7 @@ class PaddleTableClsModel:
                 split_im[c] = split_im[c].astype(np.float32)
                 split_im[c] *= alpha[c]
                 split_im[c] += beta[c]
-            img = cv2.merge(split_im)
+            img = np.stack(split_im, axis=2)
             # 5. 转换为 CHW 格式
             img = img.transpose((2, 0, 1))
             res_imgs.append(img)

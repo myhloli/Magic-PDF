@@ -6,13 +6,13 @@ import traceback
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Union
 
-import cv2
 import numpy as np
 from bs4 import BeautifulSoup
 from docvortex.assets import calculate_contrast
 from loguru import logger
 from PIL import Image
 
+from ....ocr.image import rgb_to_bgr
 from ....registry import small_model_repo
 from .table_recover import TableRecover
 from .table_structure_unet import TSRUnet
@@ -173,7 +173,7 @@ class WiredTableRecognition:
         cell_box_map: Dict[int, List[str]],
     ) -> Dict[int, List[Any]]:
         """找到poly对应为空的框，尝试将直接将poly框直接送到识别中"""
-        bgr_img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        bgr_img = rgb_to_bgr(img)
         img_crop_info_list = []
         img_crop_list = []
         for i in range(sorted_polygons.shape[0]):
@@ -275,7 +275,7 @@ class UnetTableModel:
             np_img = input_img
         else:
             raise ValueError("Input must be a pillow object or a numpy array.")
-        bgr_img = cv2.cvtColor(np_img, cv2.COLOR_RGB2BGR)
+        bgr_img = rgb_to_bgr(np_img)
 
         if ocr_result is None:
             ocr_result = self.ocr_engine.ocr(bgr_img)[0]

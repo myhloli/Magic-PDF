@@ -1,5 +1,6 @@
 # Copyright (c) Opendatalab. All rights reserved.
-import cv2
+
+from docvortex.image import perspective_matrix, warp_image
 import copy
 import numpy as np
 
@@ -28,6 +29,7 @@ class TextSystem(object):
         points[:, 0] = points[:, 0] - left
         points[:, 1] = points[:, 1] - top
         '''
+
         img_crop_width = int(
             max(
                 np.linalg.norm(points[0] - points[1]),
@@ -39,12 +41,8 @@ class TextSystem(object):
         pts_std = np.float32([[0, 0], [img_crop_width, 0],
                               [img_crop_width, img_crop_height],
                               [0, img_crop_height]])
-        M = cv2.getPerspectiveTransform(points, pts_std)
-        dst_img = cv2.warpPerspective(
-            img,
-            M, (img_crop_width, img_crop_height),
-            borderMode=cv2.BORDER_REPLICATE,
-            flags=cv2.INTER_CUBIC)
+        M = perspective_matrix(points, pts_std)
+        dst_img = warp_image(img, M, (img_crop_width, img_crop_height), border='replicate', interpolation='cubic')
         dst_img_height, dst_img_width = dst_img.shape[0:2]
         if dst_img_height * 1.0 / dst_img_width >= 1.5:
             dst_img = np.rot90(dst_img)

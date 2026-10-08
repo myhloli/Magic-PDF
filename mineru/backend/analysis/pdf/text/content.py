@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+
+
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 from docvortex.analyzers.pdf import PDF_NATIVE_SCRIPT_MARKUP_KEY, PDFTextEvidence, apply_text_evidence, prepare_text_evidence
@@ -15,7 +17,6 @@ from ..snapshots import PageSnapshotCache, get_page_snapshot_entry
 
 from .....model.ocr.image import rotate_vertical_crop_if_needed
 from .....model.ocr.results import OcrConfidence
-from .....model.runtime.hybrid import HybridLocalModelContext, run_ocr_inference
 from .....types import BBox, BlockType, ContentType
 from ..constants import (
     CODE_CONTENT_BLOCK_TYPES,
@@ -35,6 +36,9 @@ from .native import (
     _restore_post_ocr_fallback,
     txt_spans_extract,
 )
+
+if TYPE_CHECKING:
+    from .....model.runtime.hybrid import HybridLocalModelContext
 
 
 def _validate_text_formula_window_inputs(
@@ -254,6 +258,8 @@ def _apply_window_post_ocr(
     page_block_lines_list: list[dict[int, list[_AnalyzeLine]]],
 ) -> None:
     """在当前窗口内识别原生字符不足的 span，保持 finalize 后置 OCR 的回退语义。"""
+    from .....model.runtime.hybrid import run_ocr_inference
+
     need_ocr_spans: list[_AnalyzeSpan] = []
     img_crop_list: list[np.ndarray] = []
     for block_lines in page_block_lines_list:

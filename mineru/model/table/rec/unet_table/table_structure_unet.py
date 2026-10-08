@@ -1,9 +1,10 @@
 # Copyright (c) Opendatalab. All rights reserved.
+
+from docvortex.image import contour_area, morphology, trace_contours, minimum_rectangle, resize_image, rotation_matrix, transform_points, warp_image
 import copy
 import math
 from typing import Optional, Dict, Any, Tuple
 
-import cv2
 import numpy as np
 
 from .utils import OrtInferSession, resize_img
@@ -59,15 +60,16 @@ class TSRUnet:
         return polygons, rotated_polygons
 
     def preprocess(self, img) -> Dict[str, Any]:
+
         scale = (self.inp_height, self.inp_width)
         img, _, _ = resize_img(img, scale, True)
         img = img.copy().astype(np.float32)
         assert img.dtype != np.uint8
         mean = np.float64(self.mean.reshape(1, -1))
         stdinv = 1 / np.float64(self.std.reshape(1, -1))
-        cv2.cvtColor(img, cv2.COLOR_BGR2RGB, img)  # inplace
-        cv2.subtract(img, mean, img)  # inplace
-        cv2.multiply(img, stdinv, img)  # inplace
+        img[:] = img[:, :, ::-1]  # 原位交换通道，保留输入数组所有权。
+        np.subtract(img, mean, out=img, casting="unsafe")  # 保留 double 中间计算再量化为 float32。
+        np.multiply(img, stdinv, out=img, casting="unsafe")
         img = img.transpose(2, 0, 1)
         images = img[None, :]
         return {"img": images}
@@ -78,6 +80,7 @@ class TSRUnet:
         return result
 
     def postprocess(self, img, pred, **kwargs):
+
         row = kwargs.get("row", 50) if kwargs else 50
         col = kwargs.get("col", 30) if kwargs else 30
         h_lines_threshold = kwargs.get("h_lines_threshold", 100) if kwargs else 100
@@ -107,19 +110,17 @@ class TSRUnet:
         hpred[wherev] = 0
         vpred[whereh] = 0
 
-        hpred = cv2.resize(hpred, (ori_shape[1], ori_shape[0]))
-        vpred = cv2.resize(vpred, (ori_shape[1], ori_shape[0]))
+        hpred = resize_image(hpred, (ori_shape[1], ori_shape[0]))
+        vpred = resize_image(vpred, (ori_shape[1], ori_shape[0]))
 
         h, w = pred.shape
         hors_k = int(math.sqrt(w) * 1.2)
         vert_k = int(math.sqrt(h) * 1.2)
-        hkernel = cv2.getStructuringElement(cv2.MORPH_RECT, (hors_k, 1))
-        vkernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, vert_k))
-        vpred = cv2.morphologyEx(
-            vpred, cv2.MORPH_CLOSE, vkernel, iterations=1
-        )  # 先膨胀后腐蚀的过程
+        hkernel = (hors_k, 1)
+        vkernel = (1, vert_k)
+        vpred = morphology(vpred, vkernel, operation="close")  # 先膨胀后腐蚀的过程
         if morph_close:
-            hpred = cv2.morphologyEx(hpred, cv2.MORPH_CLOSE, hkernel, iterations=1)
+            hpred = morphology(hpred, hkernel, operation="close")
         colboxes = get_table_line(vpred, axis=1, lineW=col)  # 竖线
         rowboxes = get_table_line(hpred, axis=0, lineW=row)  # 横线
         rboxes_row_, rboxes_col_ = [], []
@@ -159,11 +160,12 @@ class TSRUnet:
 
     def cal_rotate_angle(self, tmp):
         # 计算最外侧的旋转框
-        contours, _ = cv2.findContours(tmp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        contours = trace_contours(tmp, external_only=True)
         if not contours:
             return 0
-        largest_contour = max(contours, key=cv2.contourArea)
-        rect = cv2.minAreaRect(largest_contour)
+        largest_contour = max(contours, key=contour_area)
+        rect = minimum_rectangle(largest_contour)
         # 计算旋转角度
         angle = rect[2]
         if angle < -45:
@@ -174,16 +176,15 @@ class TSRUnet:
 
     def rotate_image(self, image, angle):
         # 获取图像的中心点
+
         (h, w) = image.shape[:2]
         center = (w // 2, h // 2)
 
         # 计算旋转矩阵
-        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        M = rotation_matrix(center, angle, 1.0)
 
         # 进行旋转
-        rotated_image = cv2.warpAffine(
-            image, M, (w, h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_REPLICATE
-        )
+        rotated_image = warp_image(image, M, (w, h), interpolation='nearest', border='replicate')
 
         return rotated_image
 
@@ -191,15 +192,16 @@ class TSRUnet:
         self, polygons: np.ndarray, angle: float, img_shape: tuple
     ) -> np.ndarray:
         # 将多边形旋转回原始位置
+
         (h, w) = img_shape
         center = (w // 2, h // 2)
-        M_inv = cv2.getRotationMatrix2D(center, -angle, 1.0)
+        M_inv = rotation_matrix(center, -angle, 1.0)
 
         # 将 (N, 8) 转换为 (N, 4, 2)
         polygons_reshaped = polygons.reshape(-1, 4, 2)
 
         # 批量逆旋转
-        unrotated_polygons = cv2.transform(polygons_reshaped, M_inv)
+        unrotated_polygons = transform_points(polygons_reshaped, M_inv)
 
         # 将 (N, 4, 2) 转换回 (N, 8)
         unrotated_polygons = unrotated_polygons.reshape(-1, 8)

@@ -24,7 +24,6 @@ from ....utils.timing import stage_timer
 
 from ....model.runtime.execution import local_model_stage
 from ....utils.async_utils import drain_future, run_sync
-from ....model.runtime.hybrid import HybridLocalModelContext
 from ....model.runtime.memory import trim_process_heap
 from ..contracts import AnalyzeEffort
 from .constants import (
@@ -33,13 +32,6 @@ from .constants import (
     MFR_BASE_BATCH_SIZE,
     NOT_EXTRACT_TYPES,
     PIPELINE_DET_TYPE,
-)
-from .formulas import (
-    _apply_medium_display_formula_results,
-    _apply_medium_formula_number_ocr,
-    _build_formula_inputs,
-    _split_formula_results,
-    optimize_hybrid_formula_number_blocks,
 )
 from .images import (
     get_document_render_session,
@@ -54,27 +46,11 @@ from .layout import (
     _normalize_xhigh_vlm_blocks,
 )
 from .normalization import _apply_layout_title_split
-from .ocr import (
-    _apply_ocr_rec_results,
-    _apply_seal_ocr,
-    _build_ocr_det_type_and_mfr_enable,
-    _ocr_det,
-)
 from .snapshots import PageSnapshotCache, clear_page_snapshot_cache, create_page_snapshot_cache
-from .tables import (
-    _apply_medium_table_recognition,
-    _apply_native_txt_table_priority,
-    _apply_table_orientations,
-    _build_table_external_mfr_inputs,
-    _fill_flash_ocr_table_contents,
-    _restore_native_high_table_blocks,
-    _split_native_high_table_blocks,
-)
-from .text.content import (
-    _fill_window_block_content_and_lines,
-    _validate_text_formula_window_inputs,
-)
 from .visual_containers import supplement_missing_image_block_containers as _supplement_missing_image_block_containers
+
+if TYPE_CHECKING:
+    from ....model.runtime.hybrid import HybridLocalModelContext
 
 
 def _configured_window_size(default: int = 64) -> int:
@@ -162,6 +138,10 @@ def _process_flash_ocr(
     np_images: list[np.ndarray] | None = None,
 ) -> list[list[dict[str, Any]]]:
     """使用本地 OCR 为 Flash layout block 填充正文和表格内容。"""
+    from .ocr import _apply_ocr_rec_results, _ocr_det
+    from .tables import _fill_flash_ocr_table_contents
+    from .text.content import _fill_window_block_content_and_lines, _validate_text_formula_window_inputs
+
     _validate_text_formula_window_inputs(
         images_list,
         pdf_pages,
@@ -218,6 +198,17 @@ def _process_text_and_formulas(
     np_images: list[np.ndarray] | None = None,
 ) -> list[list[dict[str, Any]]]:
     """在当前窗口内完成 OCR、公式、原生文本及 block 行信息回填。"""
+    from .formulas import (
+        _apply_medium_display_formula_results,
+        _apply_medium_formula_number_ocr,
+        _build_formula_inputs,
+        _split_formula_results,
+        optimize_hybrid_formula_number_blocks,
+    )
+    from .ocr import _apply_ocr_rec_results, _build_ocr_det_type_and_mfr_enable, _ocr_det
+    from .tables import _apply_medium_table_recognition, _build_table_external_mfr_inputs
+    from .text.content import _fill_window_block_content_and_lines, _validate_text_formula_window_inputs
+
 
     _validate_text_formula_window_inputs(
         images_list,
@@ -366,6 +357,8 @@ def _prepare_pdf_window(
     hybrid_model: HybridLocalModelContext,
 ) -> _WindowInputs:
     """渲染并准备布局、原生表格和 VLM 输入；失败时由本阶段关闭图片。"""
+    from .tables import _apply_native_txt_table_priority, _apply_table_orientations, _split_native_high_table_blocks
+
     images_list: list[dict[str, Any]] = []
     images_pil_list = []
     np_images = []
@@ -499,6 +492,10 @@ def _finish_pdf_window(
     hybrid_model: HybridLocalModelContext,
 ) -> list[list[dict[str, Any]]]:
     """按原有顺序回填推理结果、文本公式与视觉素材。"""
+    from .formulas import optimize_hybrid_formula_number_blocks
+    from .ocr import _apply_seal_ocr
+    from .tables import _restore_native_high_table_blocks
+
     images_list = state.images_list
     window_pages = state.window_pages
     images_pil_list = state.images_pil_list

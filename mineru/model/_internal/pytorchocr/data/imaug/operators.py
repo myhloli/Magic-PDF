@@ -15,12 +15,13 @@
 """
 
 from __future__ import absolute_import
+
 from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
+from docvortex.image import decode_image, gray_image, resize_image
 
 import sys
-import cv2
 import numpy as np
 from PIL import Image
 
@@ -33,15 +34,16 @@ class DecodeImage(object):
         self.channel_first = channel_first
 
     def __call__(self, data):
+
         img = data['image']
         assert type(img) is bytes and len(
             img) > 0, "invalid input 'img' in DecodeImage"
         img = np.frombuffer(img, dtype='uint8')
-        img = cv2.imdecode(img, 1)
+        img = decode_image(img.tobytes(), color=True, apply_orientation=True)
         if img is None:
             return None
         if self.img_mode == 'GRAY':
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            img = np.repeat(img[:, :, None], 3, axis=2)
         elif self.img_mode == 'RGB':
             assert img.shape[2] == 3, 'invalid shape of image[%s]' % (img.shape)
             img = img[:, :, ::-1]
@@ -61,21 +63,22 @@ class NRTRDecodeImage(object):
         self.channel_first = channel_first
 
     def __call__(self, data):
+
         img = data['image']
         assert type(img) is bytes and len(
             img) > 0, "invalid input 'img' in DecodeImage"
         img = np.frombuffer(img, dtype='uint8')
 
-        img = cv2.imdecode(img, 1)
+        img = decode_image(img.tobytes(), color=True, apply_orientation=True)
 
         if img is None:
             return None
         if self.img_mode == 'GRAY':
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            img = np.repeat(img[:, :, None], 3, axis=2)
         elif self.img_mode == 'RGB':
             assert img.shape[2] == 3, 'invalid shape of image[%s]' % (img.shape)
             img = img[:, :, ::-1]
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        img = gray_image(img, color_order='bgr')
         if self.channel_first:
             img = img.transpose((2, 0, 1))
         data['image'] = img
@@ -152,11 +155,12 @@ class Resize(object):
         self.size = size
 
     def resize_image(self, img):
+
         resize_h, resize_w = self.size
         ori_h, ori_w = img.shape[:2]  # (h, w, c)
         ratio_h = float(resize_h) / ori_h
         ratio_w = float(resize_w) / ori_w
-        img = cv2.resize(img, (int(resize_w), int(resize_h)))
+        img = resize_image(img, (int(resize_w), int(resize_h)))
         return img, [ratio_h, ratio_w]
 
     def __call__(self, data):
@@ -210,11 +214,12 @@ class DetResizeForTest(object):
         return data
 
     def resize_image_type1(self, img):
+
         resize_h, resize_w = self.image_shape
         ori_h, ori_w = img.shape[:2]  # (h, w, c)
         ratio_h = float(resize_h) / ori_h
         ratio_w = float(resize_w) / ori_w
-        img = cv2.resize(img, (int(resize_w), int(resize_h)))
+        img = resize_image(img, (int(resize_w), int(resize_h)))
         # return img, np.array([ori_h, ori_w])
         return img, [ratio_h, ratio_w]
 
@@ -226,6 +231,7 @@ class DetResizeForTest(object):
         return(tuple):
             img, (ratio_h, ratio_w)
         """
+
         limit_side_len = self.limit_side_len
         h, w, c = img.shape
 
@@ -264,7 +270,7 @@ class DetResizeForTest(object):
         try:
             if int(resize_w) <= 0 or int(resize_h) <= 0:
                 return None, (None, None)
-            img = cv2.resize(img, (int(resize_w), int(resize_h)))
+            img = resize_image(img, (int(resize_w), int(resize_h)))
         except:
             print(img.shape, resize_w, resize_h)
             sys.exit(0)
@@ -273,6 +279,7 @@ class DetResizeForTest(object):
         return img, [ratio_h, ratio_w]
 
     def resize_image_type2(self, img):
+
         h, w, _ = img.shape
 
         resize_w = w
@@ -289,7 +296,7 @@ class DetResizeForTest(object):
         max_stride = 128
         resize_h = (resize_h + max_stride - 1) // max_stride * max_stride
         resize_w = (resize_w + max_stride - 1) // max_stride * max_stride
-        img = cv2.resize(img, (int(resize_w), int(resize_h)))
+        img = resize_image(img, (int(resize_w), int(resize_h)))
         ratio_h = resize_h / float(h)
         ratio_w = resize_w / float(w)
 
@@ -317,6 +324,7 @@ class E2EResizeForTest(object):
 
     def resize_image_for_totaltext(self, im, max_side_len=512):
 
+
         h, w, _ = im.shape
         resize_w = w
         resize_h = h
@@ -329,7 +337,7 @@ class E2EResizeForTest(object):
         max_stride = 128
         resize_h = (resize_h + max_stride - 1) // max_stride * max_stride
         resize_w = (resize_w + max_stride - 1) // max_stride * max_stride
-        im = cv2.resize(im, (int(resize_w), int(resize_h)))
+        im = resize_image(im, (int(resize_w), int(resize_h)))
         ratio_h = resize_h / float(h)
         ratio_w = resize_w / float(w)
         return im, (ratio_h, ratio_w)
@@ -341,6 +349,7 @@ class E2EResizeForTest(object):
         :param max_side_len: limit of max image size to avoid out of memory in gpu
         :return: the resized image and the resize ratio
         """
+
         h, w, _ = im.shape
 
         resize_w = w
@@ -358,7 +367,7 @@ class E2EResizeForTest(object):
         max_stride = 128
         resize_h = (resize_h + max_stride - 1) // max_stride * max_stride
         resize_w = (resize_w + max_stride - 1) // max_stride * max_stride
-        im = cv2.resize(im, (int(resize_w), int(resize_h)))
+        im = resize_image(im, (int(resize_w), int(resize_h)))
         ratio_h = resize_h / float(h)
         ratio_w = resize_w / float(w)
 
@@ -386,6 +395,7 @@ class KieResize(object):
         return data
 
     def resize_image(self, img):
+
         norm_img = np.zeros([1024, 1024, 3], dtype='float32')
         scale = [512, 1024]
         h, w = img.shape[:2]
@@ -398,7 +408,7 @@ class KieResize(object):
         max_stride = 32
         resize_h = (resize_h + max_stride - 1) // max_stride * max_stride
         resize_w = (resize_w + max_stride - 1) // max_stride * max_stride
-        im = cv2.resize(img, (resize_w, resize_h))
+        im = resize_image(img, (resize_w, resize_h))
         new_h, new_w = im.shape[:2]
         w_scale = new_w / w
         h_scale = new_h / h

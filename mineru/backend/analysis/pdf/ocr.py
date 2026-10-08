@@ -3,18 +3,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Literal
 
-import cv2
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Literal
+
 import numpy as np
 from docvortex.geometry import normalize_to_int_bbox
 from tqdm import tqdm
 
 from ....model.ocr.geometry import merge_det_boxes, sorted_boxes, update_det_boxes
-from ....model.ocr.image import mask_formula_regions_for_ocr_det
+from ....model.ocr.image import mask_formula_regions_for_ocr_det, rgb_to_bgr
 from ....model.ocr.results import OcrConfidence, get_adjusted_mfdetrec_res, get_ocr_result_list
-from ....model.runtime.hybrid import HybridLocalModelContext
 from ....types import BlockType
 from .constants import (
     BATCH_RATIO,
@@ -25,6 +25,10 @@ from .constants import (
 )
 from .images import crop_img
 from .model_inputs import _bbox_to_pixel_bbox, _normalize_medium_content
+
+if TYPE_CHECKING:
+    from ....model.runtime.hybrid import HybridLocalModelContext
+
 
 
 @dataclass
@@ -96,7 +100,7 @@ def _collect_ocr_det_crops(
             finally:
                 _restore_normalized_bbox(res)
             adjusted_mfdetrec_res = get_adjusted_mfdetrec_res(page_mfd_res, useful_list)
-            bgr_image = cv2.cvtColor(new_image, cv2.COLOR_RGB2BGR)  # type: ignore
+            bgr_image = rgb_to_bgr(new_image)  # type: ignore
             bgr_image = mask_formula_regions_for_ocr_det(bgr_image, adjusted_mfdetrec_res)
             crops.append(
                 _OcrDetCrop(
@@ -291,7 +295,7 @@ def _apply_seal_ocr(
             if seal_crop_rgb.size == 0:
                 continue
 
-            seal_crop_bgr = cv2.cvtColor(seal_crop_rgb, cv2.COLOR_RGB2BGR)
+            seal_crop_bgr = rgb_to_bgr(seal_crop_rgb)
             seal_tasks.append((block_item, seal_crop_bgr))
 
     if not seal_tasks:

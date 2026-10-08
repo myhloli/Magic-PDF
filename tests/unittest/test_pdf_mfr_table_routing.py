@@ -16,6 +16,11 @@ from mineru.backend.analysis.pdf import window
 from mineru.backend.analysis.pdf.formulas import _build_formula_inputs
 from mineru.backend.analysis.pdf.tables import _build_table_external_mfr_inputs
 
+from mineru.backend.analysis.pdf import ocr as stage_ocr
+from mineru.backend.analysis.pdf import formulas as stage_formulas
+from mineru.backend.analysis.pdf import tables as stage_tables
+from mineru.backend.analysis.pdf.text import content as stage_text_content
+
 
 def _formula(bbox: list[float], label: str = "inline_formula") -> dict[str, Any]:
     """构造与 MFD 输出一致的测试公式。"""
@@ -84,15 +89,15 @@ def test_window_mfr_routing_and_original_ocr_masks(
     context = SimpleNamespace(mfr_model=SimpleNamespace(batch_predict=mfr)) if enabled else SimpleNamespace()
     det = MagicMock(return_value=[[]])
     fill = MagicMock(return_value=blocks)
-    monkeypatch.setattr(window, "_ocr_det", det)
-    monkeypatch.setattr(window, "_fill_window_block_content_and_lines", fill)
-    for name in (
-        "_apply_medium_table_recognition",
-        "_apply_medium_display_formula_results",
-        "_apply_medium_formula_number_ocr",
-        "_apply_ocr_rec_results",
+    monkeypatch.setattr(stage_ocr, "_ocr_det", det)
+    monkeypatch.setattr(stage_text_content, "_fill_window_block_content_and_lines", fill)
+    for module, name in (
+        (stage_tables, "_apply_medium_table_recognition"),
+        (stage_formulas, "_apply_medium_display_formula_results"),
+        (stage_formulas, "_apply_medium_formula_number_ocr"),
+        (stage_ocr, "_apply_ocr_rec_results"),
     ):
-        monkeypatch.setattr(window, name, MagicMock())
+        monkeypatch.setattr(module, name, MagicMock())
     with Image.new("RGB", (100, 100)) as image:
         window._process_text_and_formulas(
             [{"img_pil": image, "scale": 1.0}],
@@ -132,8 +137,8 @@ def test_final_layout_controls_filter_and_empty_results_skip_model_loading(
     context = SimpleNamespace() if final_table else SimpleNamespace(mfr_model=SimpleNamespace(batch_predict=mfr))
     fill = MagicMock(return_value=blocks)
     det = MagicMock(return_value=[[], []])
-    monkeypatch.setattr(window, "_ocr_det", det)
-    monkeypatch.setattr(window, "_fill_window_block_content_and_lines", fill)
+    monkeypatch.setattr(stage_ocr, "_ocr_det", det)
+    monkeypatch.setattr(stage_text_content, "_fill_window_block_content_and_lines", fill)
     with Image.new("RGB", (100, 100)) as image:
         window._process_text_and_formulas(
             [{"img_pil": image, "scale": 1.0}] * 2,

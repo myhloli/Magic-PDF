@@ -1,9 +1,10 @@
 # Copyright (c) Opendatalab. All rights reserved.
+
+from docvortex.image import decode_image, resize_image
 import os
 import math
 from pathlib import Path
 import numpy as np
-import cv2
 import argparse
 from ....ocr.resources import PPOCRV6_DICT_PATH
 
@@ -178,11 +179,12 @@ def resize_img(img, input_size=600):
     """
     resize img and limit the longest side of the image to input_size
     """
+
     img = np.array(img)
     im_shape = img.shape
     im_size_max = np.max(im_shape[0:2])
     im_scale = float(input_size) / float(im_size_max)
-    img = cv2.resize(img, None, None, fx=im_scale, fy=im_scale)
+    img = resize_image(img, None, scale=(im_scale, im_scale))
     return img
 
 
@@ -211,10 +213,11 @@ def str_count(s):
 
 
 def base64_to_cv2(b64str):
+
     import base64
     data = base64.b64decode(b64str.encode('utf8'))
     data = np.fromstring(data, np.uint8)
-    data = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    data = decode_image(data.tobytes(), color=True, apply_orientation=True)
     return data
 
 

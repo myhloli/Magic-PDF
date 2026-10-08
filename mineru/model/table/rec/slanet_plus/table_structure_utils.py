@@ -11,11 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+from docvortex.image import resize_image
 import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Union
 
-import cv2
 import numpy as np
 from loguru import logger
 from onnxruntime import GraphOptimizationLevel, SessionOptions
@@ -322,12 +323,13 @@ class ResizeTableImage:
         self.infer_mode = infer_mode
 
     def __call__(self, data):
+
         img = data["image"]
         height, width = img.shape[0:2]
         ratio = self.max_len / (max(height, width) * 1.0)
         resize_h = int(height * ratio)
         resize_w = int(width * ratio)
-        resize_img = cv2.resize(img, (resize_w, resize_h))
+        resize_img = resize_image(img, (resize_w, resize_h))
         if self.resize_bboxes and not self.infer_mode:
             data["bboxes"] = data["bboxes"] * ratio
         data["image"] = resize_img

@@ -20,7 +20,6 @@ import warnings
 from pathlib import Path
 from typing import Any, List, Literal, Optional, Tuple, Union
 
-import cv2
 import numpy as np
 from loguru import logger
 from tqdm import tqdm
@@ -543,6 +542,7 @@ class PPOCRv6ONNX:
 
 
 if __name__ == "__main__":
+
     import argparse
     import json
 
@@ -568,7 +568,9 @@ if __name__ == "__main__":
         device=args.device,
     )
 
-    img = cv2.imread(args.image)
+    from docvortex.image import decode_image
+
+    img = decode_image(Path(args.image).read_bytes(), color=True, apply_orientation=True)
     results = model.ocr(img)
     print(f"\ndetected {len(results[0] or [])} text lines")
     for item in results[0] or []:

@@ -19,6 +19,10 @@ from mineru.backend.analysis.pdf import tables as pdf_tables
 from mineru.backend.analysis.pdf import window as pdf_window
 from mineru.types import RAW_FORMULA_NUMBER, BlockType
 
+from mineru.backend.analysis.pdf import ocr as stage_ocr
+from mineru.backend.analysis.pdf.text import content as stage_text_content
+from mineru.model.runtime import hybrid as hybrid_runtime
+
 _PROJECT_ROOT = Path(__file__).parents[2]
 
 
@@ -44,7 +48,7 @@ def test_flash_ocr_projects_table_text(
 ) -> None:
     """验证 Flash OCR 保持现有 OCR 空间投影路径。"""
 
-    monkeypatch.setattr(pdf_tables, "run_ocr_inference", MagicMock(return_value=[[]]))
+    monkeypatch.setattr(hybrid_runtime, "run_ocr_inference", MagicMock(return_value=[[]]))
     monkeypatch.setattr(pdf_tables, "project_ocr_table_text", MagicMock(return_value="OCR TABLE"))
     context = MagicMock()
     context.get_ocr_model.return_value = SimpleNamespace(ocr=object())
@@ -384,12 +388,12 @@ def test_medium_formula_processing_skips_mfr_after_native_cleanup(
     local_model_context = MagicMock()
     local_model_context.mfr_model = MagicMock()
     medium_table_recognition = MagicMock()
-    monkeypatch.setattr(pdf_window, "_apply_medium_table_recognition", medium_table_recognition)
-    monkeypatch.setattr(pdf_window, "_apply_medium_display_formula_results", MagicMock())
-    monkeypatch.setattr(pdf_window, "_apply_medium_formula_number_ocr", MagicMock())
-    monkeypatch.setattr(pdf_window, "_ocr_det", MagicMock(return_value=[[]]))
+    monkeypatch.setattr(pdf_tables, "_apply_medium_table_recognition", medium_table_recognition)
+    monkeypatch.setattr(pdf_formulas, "_apply_medium_display_formula_results", MagicMock())
+    monkeypatch.setattr(pdf_formulas, "_apply_medium_formula_number_ocr", MagicMock())
+    monkeypatch.setattr(stage_ocr, "_ocr_det", MagicMock(return_value=[[]]))
     monkeypatch.setattr(
-        pdf_window,
+        stage_text_content,
         "_fill_window_block_content_and_lines",
         MagicMock(return_value=model_list),
     )
@@ -521,10 +525,10 @@ def test_high_txt_window_excludes_native_table_from_vlm(
         "load_images_from_pdf_bytes_range",
         MagicMock(return_value=[{"img_pil": page_image, "scale": 1.0}]),
     )
-    monkeypatch.setattr(pdf_window, "_apply_table_orientations", MagicMock())
-    monkeypatch.setattr(pdf_window, "_apply_native_txt_table_priority", fake_native_priority)
+    monkeypatch.setattr(pdf_tables, "_apply_table_orientations", MagicMock())
+    monkeypatch.setattr(pdf_tables, "_apply_native_txt_table_priority", fake_native_priority)
     monkeypatch.setattr(pdf_window, "_process_text_and_formulas", keep_window_model_list)
-    monkeypatch.setattr(pdf_window, "_apply_seal_ocr", MagicMock())
+    monkeypatch.setattr(stage_ocr, "_apply_seal_ocr", MagicMock())
     monkeypatch.setattr(pdf_window, "_attach_visual_block_images", MagicMock())
 
     result = pdf_window.process_pdf_windows(

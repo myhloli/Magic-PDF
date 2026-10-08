@@ -5,9 +5,9 @@ import os
 import warnings
 from pathlib import Path
 
-import cv2
 import numpy as np
 import yaml
+from PIL import Image, ImageDraw
 from loguru import logger
 
 from ..registry import MINERU_4_MODELS_TORCH
@@ -110,7 +110,15 @@ class PytorchPaddleOCR(TextSystem):
 
         return None
 
+    @staticmethod
+    def _save_debug_image(path: Path, image: np.ndarray) -> None:
+        """独立物化 BGR 诊断图后用 Pillow 保存，调试过程不加载视觉运行时。"""
+        pixels = image[:, :, ::-1] if image.ndim == 3 else image
+        with Image.fromarray(pixels) as canvas:
+            canvas.save(path)
+
     def _dump_seal_debug_artifacts(self, input_image, dt_boxes, img_crop_list, rec_res=None):
+
         if not self._seal_debug_dir:
             return
 
@@ -121,29 +129,19 @@ class PytorchPaddleOCR(TextSystem):
         self._seal_debug_counter += 1
         os.makedirs(sample_dir, exist_ok=True)
 
-        cv2.imwrite(os.path.join(sample_dir, "input.png"), input_image)
-
-        det_vis = input_image.copy()
-        for index, box in enumerate(dt_boxes or []):
-            points = np.asarray(box, dtype=np.int32).reshape((-1, 1, 2))
-            cv2.polylines(det_vis, [points], isClosed=True, color=(0, 0, 255), thickness=2)
-            anchor = tuple(np.asarray(box[0], dtype=np.int32).tolist())
-            cv2.putText(
-                det_vis,
-                str(index),
-                anchor,
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (255, 0, 0),
-                2,
-                cv2.LINE_AA,
-            )
-        cv2.imwrite(os.path.join(sample_dir, "det_vis.png"), det_vis)
+        self._save_debug_image(Path(sample_dir) / "input.png", input_image)
+        with Image.fromarray(input_image[:, :, ::-1]) as canvas:
+            draw = ImageDraw.Draw(canvas)
+            for index, box in enumerate(dt_boxes or []):
+                points = [tuple(map(int, xy)) for xy in np.asarray(box).reshape(-1, 2)]
+                draw.line(points + points[:1], fill=(255, 0, 0), width=2)
+                draw.text(points[0], str(index), fill=(0, 0, 255))
+            canvas.save(Path(sample_dir) / "det_vis.png")
 
         records = []
         for index, crop_img in enumerate(img_crop_list or []):
             crop_name = f"crop_{index:02d}.png"
-            cv2.imwrite(os.path.join(sample_dir, crop_name), crop_img)
+            self._save_debug_image(Path(sample_dir) / crop_name, crop_img)
             record = {
                 "index": index,
                 "crop_path": crop_name,
@@ -276,8 +274,9 @@ class PytorchPaddleOCR(TextSystem):
         return filter_boxes, filter_rec_res
 
 if __name__ == '__main__':
+
     pytorch_paddle_ocr = PytorchPaddleOCR()
-    img = cv2.imread("/Users/myhloli/Downloads/screenshot-20250326-194348.png")
+    img = np.asarray(Image.open("/Users/myhloli/Downloads/screenshot-20250326-194348.png").convert("RGB"))[:, :, ::-1].copy()
     dt_boxes, rec_res = pytorch_paddle_ocr(img)
     ocr_res = []
     if not dt_boxes and not rec_res:

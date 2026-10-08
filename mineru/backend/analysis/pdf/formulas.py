@@ -4,9 +4,8 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import cv2
 import numpy as np
 from docvortex.assets import image_size as _normalize_page_size
 from docvortex.content.text import build_tagged_formula_content
@@ -14,10 +13,12 @@ from docvortex.geometry import bbox_to_quad as _medium_bbox_to_quad
 from docvortex.geometry import normalize_to_int_bbox
 from PIL import Image
 
-from ....model.ocr.image import get_rotate_crop_image_for_text_rec
-from ....model.runtime.hybrid import HybridLocalModelContext
+from ....model.ocr.image import get_rotate_crop_image_for_text_rec, rgb_to_bgr
 from ....types import RAW_FORMULA_NUMBER, BlockType
 from .model_inputs import _bbox_to_pixel_bbox, _normalize_layout_bbox_to_unit, _normalize_medium_content
+
+if TYPE_CHECKING:
+    from ....model.runtime.hybrid import HybridLocalModelContext
 
 
 def _is_hybrid_equation_block(block: dict[str, Any]) -> bool:
@@ -189,7 +190,7 @@ def _apply_medium_formula_number_ocr(
     formula_number_crops: list[np.ndarray] = []
     for block_list, np_img in zip(model_list, np_images):
         image_h, image_w = np_img.shape[:2]
-        bgr_image = cv2.cvtColor(np_img, cv2.COLOR_RGB2BGR)
+        bgr_image = rgb_to_bgr(np_img)
         for block_item in block_list:
             if block_item.get("type") != RAW_FORMULA_NUMBER:
                 continue

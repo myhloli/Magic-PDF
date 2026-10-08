@@ -18,6 +18,10 @@ from mineru.backend import analyze
 from mineru.backend.analysis.pdf import pipeline, window
 from mineru.model.runtime import memory
 
+from mineru.backend.analysis.pdf import ocr as stage_ocr
+from mineru.backend.analysis.pdf import tables as stage_tables
+from mineru.model.runtime import hybrid as hybrid_runtime
+
 
 def _window_probe(monkeypatch: pytest.MonkeyPatch, failure: str = "") -> SimpleNamespace:
     """隔离推理模型，保留真实数组、表格裁图和素材编码以检查窗口边界。"""
@@ -90,11 +94,11 @@ def _window_probe(monkeypatch: pytest.MonkeyPatch, failure: str = "") -> SimpleN
     monkeypatch.setattr(window, "get_document_render_session", lambda _document: None)
     monkeypatch.setattr(window, "load_images_from_pdf_bytes_range", render)
     monkeypatch.setattr(window, "_collect_table_items", collect)
-    monkeypatch.setattr(window, "_apply_table_orientations", orient)
+    monkeypatch.setattr(stage_tables, "_apply_table_orientations", orient)
     monkeypatch.setattr(window, "_build_vl_style_layout_blocks", blocks)
     monkeypatch.setattr(window, "_process_text_and_formulas", text)
     monkeypatch.setattr(window, "_process_flash_ocr", text)
-    monkeypatch.setattr(window, "_apply_seal_ocr", lambda *_args: None)
+    monkeypatch.setattr(stage_ocr, "_apply_seal_ocr", lambda *_args: None)
     monkeypatch.setattr(window, "_convert_vlm_results_to_model_list", lambda value: value)
     monkeypatch.setattr(window, "_attach_visual_block_images", attach)
     monkeypatch.setattr(window, "trim_process_heap", trimmed)
@@ -185,7 +189,7 @@ def test_document_cleanup_order_and_global_switch(
     monkeypatch.setattr(pipeline, "process_pdf_windows", process)
     monkeypatch.setattr(pipeline, "clean_memory", lambda _device: stage("device"))
     monkeypatch.setattr(
-        pipeline,
+        hybrid_runtime,
         "HybridLocalModelContextSingleton",
         lambda: SimpleNamespace(get_model=lambda: SimpleNamespace(device="cpu")),
     )
@@ -212,7 +216,11 @@ def test_real_window_and_document_hooks_share_switch(
     document = Mock(page_count=2, close=Mock())
     monkeypatch.setattr(window, "_get_window_pdf_pages", lambda *_args: [object()])
     monkeypatch.setattr(pipeline, "PDFDocument", lambda _data: document)
-    monkeypatch.setattr(pipeline, "HybridLocalModelContextSingleton", lambda: SimpleNamespace(get_model=lambda: probe.model))
+    monkeypatch.setattr(
+        hybrid_runtime,
+        "HybridLocalModelContextSingleton",
+        lambda: SimpleNamespace(get_model=lambda: probe.model),
+    )
     monkeypatch.setattr(pipeline, "clean_memory", lambda _device: None)
     if asynchronous:
         middle, model = asyncio.run(analyze.aio_doc_analyze(b"pdf", effort="medium", parse_mode="ocr"))

@@ -1,10 +1,11 @@
 # Copyright (c) Opendatalab. All rights reserved.
+
+from docvortex.image import gray_image
 import json
 import math
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import cv2
 import numpy as np
 from PIL import Image, ImageOps
 from tokenizers import AddedToken
@@ -42,9 +43,10 @@ class UniMERNetImgDecode(object):
             return img
         data = (data - min_val) / (max_val - min_val) * 255
         gray = 255 * (data < 200).astype(np.uint8)
-        coords = cv2.findNonZero(gray)  # Find all non-zero points (text)
-        a, b, w, h = cv2.boundingRect(coords)  # Find minimum spanning bounding box
-        return img.crop((a, b, w + a, h + b))
+        ys, xs = np.nonzero(gray)
+        if xs.size == 0:
+            return img.crop((0, 0, 0, 0))
+        return img.crop((int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1))
 
     def get_dimensions(self, img: Union[Image.Image, np.ndarray]) -> List[int]:
         """Gets the dimensions of the image.
@@ -180,6 +182,7 @@ class UniMERNetTestTransform:
         Returns:
             numpy.ndarray: The transformed image.
         """
+
         mean = [0.7931, 0.7931, 0.7931]
         std = [0.1738, 0.1738, 0.1738]
         scale = float(1 / 255.0)
@@ -188,13 +191,13 @@ class UniMERNetTestTransform:
         std = np.array(std).reshape(shape).astype("float32")
         if self.paddle_compatible:
             # plus-S 对齐 Paddle：先对 RGB uint8 图像灰度化，再归一化；保留 plus-M 原行为。
-            gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-            img = cv2.merge([gray] * self.num_output_channels).astype("float32")
+            gray = gray_image(img, color_order='rgb')
+            img = np.stack([gray] * self.num_output_channels, axis=2).astype("float32")
             return (img - mean * 255.0) * (1.0 / (std * 255.0))
         img = (img.astype("float32") * scale - mean) / std
-        grayscale_image = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        grayscale_image = gray_image(img, color_order='bgr')
         squeezed = np.squeeze(grayscale_image)
-        img = cv2.merge([squeezed] * self.num_output_channels)
+        img = np.stack([squeezed] * self.num_output_channels, axis=2)
         return img
 
     def __call__(self, imgs: List[np.ndarray]) -> List[np.ndarray]:

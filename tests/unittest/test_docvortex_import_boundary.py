@@ -26,7 +26,7 @@ def _check_source(source: str, *, model_layer: bool = False) -> list[str]:
     tree = ast.parse(source)
     aliases: dict[str, str] = {}
     errors: list[str] = []
-    model_modules = {"docvortex.schema", "docvortex.options", "docvortex.geometry", "docvortex.assets"}
+    model_modules = {"docvortex.schema", "docvortex.options", "docvortex.geometry", "docvortex.assets", "docvortex.image"}
 
     def check_module(module: str, line: int) -> None:
         """按公开清单和宿主层级校验模块依赖。"""

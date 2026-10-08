@@ -23,6 +23,9 @@ from mineru.config import VlmConfig, config
 from mineru.model.vlm.client import get_vlm_predictor
 from mineru.parser import api_server, parse, parse_async
 
+from mineru.backend.analysis.pdf import ocr as stage_ocr
+from mineru.model.runtime import hybrid as hybrid_runtime
+
 
 @dataclass
 class _OpenAIServer:
@@ -240,7 +243,7 @@ def hybrid_stub(monkeypatch: pytest.MonkeyPatch) -> None:
     context.device = "cpu"
     context.layout_model.batch_predict.return_value = [[{"bbox": [20, 20, 250, 80], "label": "text"}]]
     monkeypatch.setattr(
-        pipeline,
+        hybrid_runtime,
         "HybridLocalModelContextSingleton",
         MagicMock(return_value=MagicMock(get_model=MagicMock(return_value=context))),
     )
@@ -263,7 +266,7 @@ def hybrid_stub(monkeypatch: pytest.MonkeyPatch) -> None:
         return blocks
 
     monkeypatch.setattr(window, "_process_text_and_formulas", retain_vlm_text)
-    monkeypatch.setattr(window, "_apply_seal_ocr", lambda *args: None)
+    monkeypatch.setattr(stage_ocr, "_apply_seal_ocr", lambda *args: None)
     monkeypatch.setattr(api_server, "ensure_tier_runtime_dependencies", lambda tier, **kwargs: None)
 
 
@@ -469,7 +472,7 @@ def test_standard_progress_label_survives_pdf_mode_routing(
 
     monkeypatch.setattr(config.model, "vlm", _settings(openai_server))
     monkeypatch.setattr(pipeline.PDFDocument, "classify", lambda self: resolved_mode)
-    context = pipeline.HybridLocalModelContextSingleton().get_model()
+    context = hybrid_runtime.HybridLocalModelContextSingleton().get_model()
     # 公式块在 TXT 下仍需 VLM 抽取，避免测试被原生正文跳过逻辑短路。
     context.layout_model.batch_predict.return_value = [[{"bbox": [20, 20, 250, 80], "label": "display_formula"}]]
     source = _pdf_input(tmp_path)

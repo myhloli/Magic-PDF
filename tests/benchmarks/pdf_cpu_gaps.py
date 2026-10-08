@@ -22,6 +22,8 @@ from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 
+from mineru.model.runtime import hybrid as hybrid_runtime
+
 
 def _input_digest(value: object) -> str:
     """按值指纹化模型输入，覆盖数组像素、PIL 页图、顺序和标量参数。"""
@@ -152,7 +154,7 @@ def main() -> None:
 
     setup_started = time.perf_counter()
     if live:
-        model = p.HybridLocalModelContextSingleton().get_model()
+        model = hybrid_runtime.HybridLocalModelContextSingleton().get_model()
         predictor, backend = p.get_vlm_predictor(None)
     else:
         model = SimpleNamespace(
@@ -165,7 +167,7 @@ def main() -> None:
         )
         predictor = SimpleNamespace()
         backend = "replay"
-        p.HybridLocalModelContextSingleton = lambda: SimpleNamespace(get_model=lambda: model)
+        hybrid_runtime.HybridLocalModelContextSingleton = lambda: SimpleNamespace(get_model=lambda: model)
     p.get_vlm_predictor = lambda config: (predictor, backend)
     model_setup_seconds = time.perf_counter() - setup_started
     for owner, method, name in [

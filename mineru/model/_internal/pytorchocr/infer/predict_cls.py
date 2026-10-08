@@ -1,5 +1,6 @@
 # Copyright (c) Opendatalab. All rights reserved.
-import cv2
+
+from docvortex.image import resize_image
 import copy
 import numpy as np
 import math
@@ -37,6 +38,7 @@ class TextClassifier(BaseOCRV20):
         self._apply_inference_precision(self.device)
 
     def resize_norm_img(self, img):
+
         imgC, imgH, imgW = self.cls_image_shape
         h = img.shape[0]
         w = img.shape[1]
@@ -48,7 +50,7 @@ class TextClassifier(BaseOCRV20):
             resized_w = imgW
         else:
             resized_w = int(math.ceil(imgH * ratio))
-        resized_image = cv2.resize(img, (resized_w, imgH))
+        resized_image = resize_image(img, (resized_w, imgH))
         resized_image = resized_image.astype('float32')
         if self.cls_image_shape[0] == 1:
             resized_image = resized_image / 255
@@ -102,6 +104,5 @@ class TextClassifier(BaseOCRV20):
                 label, score = cls_result[rno]
                 cls_res[indices[beg_img_no + rno]] = [label, score]
                 if '180' in label and score > self.cls_thresh:
-                    img_list[indices[beg_img_no + rno]] = cv2.rotate(
-                        img_list[indices[beg_img_no + rno]], 1)
+                    img_list[indices[beg_img_no + rno]] = np.rot90(img_list[indices[beg_img_no + rno]], k=2).copy(order="C")
         return img_list, cls_res, elapse

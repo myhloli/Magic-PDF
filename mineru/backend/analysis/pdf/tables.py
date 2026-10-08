@@ -7,9 +7,8 @@ import html
 import math
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
-import cv2
 import numpy as np
 from docvortex.analyzers.pdf import PDFTableRecoveryError, prepare_table_page, recover_table_region
 from docvortex.analyzers.pdf import project_table_text as project_ocr_table_text
@@ -24,9 +23,8 @@ from docvortex.geometry import normalize_quarter_turn_angle as _normalize_visual
 from docvortex.geometry import rotate_bbox as _rotate_medium_table_bbox
 from loguru import logger
 
-from ....model.ocr.image import mask_formula_regions_for_ocr_det
+from ....model.ocr.image import mask_formula_regions_for_ocr_det, rgb_to_bgr
 from ....model.runtime.contracts import AtomicModelName
-from ....model.runtime.hybrid import HybridLocalModelContext, run_ocr_inference
 from ....types import RAW_ALGORITHM, RAW_FORMULA_NUMBER, RAW_PHONETIC, BBox, BlockType
 from .snapshots import PageSnapshotCache, get_page_snapshot_entry
 from .constants import (
@@ -44,6 +42,10 @@ from .model_inputs import (
     _sidecar_bbox_to_page_bbox,
 )
 from .text.native import _is_supported_rotation
+
+if TYPE_CHECKING:
+    from ....model.runtime.hybrid import HybridLocalModelContext
+
 
 _NATIVE_TABLE_ALWAYS_COMPLEX_BLOCK_TYPES = {
     BlockType.IMAGE,
@@ -814,6 +816,8 @@ def _prepare_medium_table_ocr_results(
     table_tasks: list[dict[str, Any]],
 ) -> None:
     """遮盖表内图片和公式后逐表执行 OCR，并合并内联对象 token。"""
+    from ....model.runtime.hybrid import run_ocr_inference
+
     table_ocr_model = None
     try:
         table_ocr_model = local_model_context.get_ocr_model(
@@ -826,7 +830,7 @@ def _prepare_medium_table_ocr_results(
 
     for table_task in table_tasks:
         ocr_result: list[list[Any]] = []
-        bgr_image = cv2.cvtColor(table_task["table_img"], cv2.COLOR_RGB2BGR)
+        bgr_image = rgb_to_bgr(table_task["table_img"])
         mask_boxes = [{"bbox": item["mask_bbox"]} for item in table_task["inline_objects"]]
         masked_image = mask_formula_regions_for_ocr_det(bgr_image, mask_boxes)
 
@@ -972,6 +976,8 @@ def _fill_flash_ocr_table_contents(
     local_model_context: HybridLocalModelContext,
 ) -> None:
     """为 Flash OCR 表格回填 OCR 空间投影文本。"""
+    from ....model.runtime.hybrid import run_ocr_inference
+
     table_entries: list[dict[str, Any]] = []
     for page_idx, page_model_list in enumerate(model_list):
         table_idx = 0
@@ -1038,7 +1044,7 @@ def _fill_flash_ocr_table_contents(
 
             angle = _normalize_visual_block_angle(table_block.get("angle", 0))
             rotated_crop = _rotate_visual_block_image_to_upright(table_crop, angle)
-            bgr_crop = cv2.cvtColor(rotated_crop, cv2.COLOR_RGB2BGR)
+            bgr_crop = rgb_to_bgr(rotated_crop)
             page_ocr_results = run_ocr_inference(table_ocr_model.ocr, bgr_crop)
             raw_ocr_result = page_ocr_results[0] if page_ocr_results else None
             rotated_height, rotated_width = rotated_crop.shape[:2]

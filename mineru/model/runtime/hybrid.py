@@ -16,13 +16,13 @@ from ...utils.timing import stage_timer
 from ..ocr.language import normalize_ocr_model_lang
 from ..ocr.resources import PPOCRV6_DICT_PATH
 from ..registry import MINERU_4_MODELS_ONNX, small_model_repo
-from ..table.cls.mineru_table_ori_cls import MineruTableOrientationClsModel
-from ..table.cls.paddle_table_cls import PaddleTableClsModel
-from ..table.rec.slanet_plus.main import PaddleTableModel
-from ..table.rec.unet_table.main import UnetTableModel
 from .contracts import AtomicModelName
 
 if TYPE_CHECKING:
+    from ..table.cls.mineru_table_ori_cls import MineruTableOrientationClsModel
+    from ..table.cls.paddle_table_cls import PaddleTableClsModel
+    from ..table.rec.slanet_plus.main import PaddleTableModel
+    from ..table.rec.unet_table.main import UnetTableModel
     from ..layout.pp_doclayoutv2 import PPDocLayoutV2LayoutModel
     from ..mfr.pp_formulanet.predict_formula import FormulaRecognizer
     from ..ocr.pytorch_paddle import PytorchPaddleOCR
@@ -84,6 +84,8 @@ def table_orientation_cls_model_init(
     small_backend: str | None = None, device: str | None = None
 ) -> MineruTableOrientationClsModel:
     """初始化表格方向分类包装器，并注入适配方向检测的 OCR 引擎。"""
+    from ..table.cls.mineru_table_ori_cls import MineruTableOrientationClsModel
+
     atom_model_manager = AtomModelSingleton()
     ocr_engine = atom_model_manager.get_atom_model(
         atom_model_name=AtomicModelName.OCR,
@@ -100,6 +102,8 @@ def table_orientation_cls_model_init(
 
 def table_cls_model_init(small_backend: str | None = None) -> PaddleTableClsModel:
     """初始化有线与无线表格类型分类模型。"""
+    from ..table.cls.paddle_table_cls import PaddleTableClsModel
+
     return PaddleTableClsModel(model_path=str(small_model_repo(small_backend).paddle_table_cls.ensure()))
 
 
@@ -107,6 +111,8 @@ def wired_table_model_init(
     lang: str | None = None, *, small_backend: str | None = None, device: str | None = None
 ) -> UnetTableModel:
     """初始化有线表格识别模型，并注入指定语言的 OCR 引擎。"""
+    from ..table.rec.unet_table.main import UnetTableModel
+
     atom_model_manager = AtomModelSingleton()
     ocr_engine = atom_model_manager.get_atom_model(
         atom_model_name=AtomicModelName.OCR,
@@ -125,6 +131,8 @@ def wireless_table_model_init(
     lang: str | None = None, *, small_backend: str | None = None, device: str | None = None
 ) -> PaddleTableModel:
     """初始化无线表格识别模型，并注入指定语言的 OCR 引擎。"""
+    from ..table.rec.slanet_plus.main import PaddleTableModel
+
     atom_model_manager = AtomModelSingleton()
     ocr_engine = atom_model_manager.get_atom_model(
         atom_model_name=AtomicModelName.OCR,

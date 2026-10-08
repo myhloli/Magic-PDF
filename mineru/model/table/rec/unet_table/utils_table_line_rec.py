@@ -1,8 +1,9 @@
 # Copyright (c) Opendatalab. All rights reserved.
+
+from docvortex.image import draw_lines as rasterize_lines, label_components, affine_matrix, minimum_rectangle, rectangle_corners
 import math
 from typing import Iterator
 
-import cv2
 import numpy as np
 
 
@@ -35,7 +36,8 @@ class ConnectedComponent:
 
 
 def _iter_connected_component_coords(binary_mask: np.ndarray) -> Iterator[ConnectedComponent]:
-    """用 OpenCV 提取 8 连通域，避免构造旧版 region 对象带来的额外开销。"""
+    """用共享数值内核提取 8 连通域，避免构造旧版 region 对象带来的额外开销。"""
+
     mask = np.asarray(binary_mask)
     if mask.size == 0:
         return
@@ -44,18 +46,15 @@ def _iter_connected_component_coords(binary_mask: np.ndarray) -> Iterator[Connec
     if not np.any(mask):
         return
 
-    label_count, labels, stats, _ = cv2.connectedComponentsWithStats(
-        mask,
-        connectivity=8,
-    )
+    label_count, labels, stats = label_components(mask)
     if label_count <= 1:
         return
 
     for label_id in range(1, label_count):
-        left = int(stats[label_id, cv2.CC_STAT_LEFT])
-        top = int(stats[label_id, cv2.CC_STAT_TOP])
-        width = int(stats[label_id, cv2.CC_STAT_WIDTH])
-        height = int(stats[label_id, cv2.CC_STAT_HEIGHT])
+        left = int(stats[label_id, 0])
+        top = int(stats[label_id, 1])
+        width = int(stats[label_id, 2])
+        height = int(stats[label_id, 3])
         yield ConnectedComponent(
             labels=labels,
             label_id=label_id,
@@ -72,9 +71,7 @@ def transform_preds(coords, center, scale, output_size, rot=0):
     return target_coords
 
 
-def get_affine_transform(
-    center, scale, rot, output_size, shift=np.array([0, 0], dtype=np.float32), inv=0
-):
+def get_affine_transform(center, scale, rot, output_size, shift=np.array([0, 0], dtype=np.float32), inv=0):
     if not isinstance(scale, np.ndarray) and not isinstance(scale, list):
         scale = np.array([scale, scale], dtype=np.float32)
 
@@ -98,9 +95,9 @@ def get_affine_transform(
     dst[2:, :] = get_3rd_point(dst[0, :], dst[1, :])
 
     if inv:
-        trans = cv2.getAffineTransform(np.float32(dst), np.float32(src))
+        trans = affine_matrix(np.float32(dst), np.float32(src))
     else:
-        trans = cv2.getAffineTransform(np.float32(src), np.float32(dst))
+        trans = affine_matrix(np.float32(src), np.float32(dst))
 
     return trans
 
@@ -133,15 +130,11 @@ def get_table_line(binimg, axis=0, lineW=10):
     components = _iter_connected_component_coords(binimg > 0)
     if axis == 1:
         lineboxes = [
-            min_area_rect(component.coords)
-            for component in components
-            if component.bbox[2] - component.bbox[0] > lineW
+            min_area_rect(component.coords) for component in components if component.bbox[2] - component.bbox[0] > lineW
         ]
     else:
         lineboxes = [
-            min_area_rect(component.coords)
-            for component in components
-            if component.bbox[3] - component.bbox[1] > lineW
+            min_area_rect(component.coords) for component in components if component.bbox[3] - component.bbox[1] > lineW
         ]
     return lineboxes
 
@@ -150,8 +143,9 @@ def min_area_rect(coords):
     """
     多边形外接矩形
     """
-    rect = cv2.minAreaRect(coords[:, ::-1])
-    box = cv2.boxPoints(rect)
+
+    rect = minimum_rectangle(coords[:, ::-1])
+    box = rectangle_corners(rect)
     box = box.reshape((8,)).tolist()
 
     box = image_location_sort_box(box)
@@ -199,14 +193,8 @@ def calculate_center_rotate_angle(box):
     x1, y1, x2, y2, x3, y3, x4, y4 = box[:8]
     cx = (x1 + x3 + x2 + x4) / 4.0
     cy = (y1 + y3 + y4 + y2) / 4.0
-    w = (
-        np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
-        + np.sqrt((x3 - x4) ** 2 + (y3 - y4) ** 2)
-    ) / 2
-    h = (
-        np.sqrt((x2 - x3) ** 2 + (y2 - y3) ** 2)
-        + np.sqrt((x1 - x4) ** 2 + (y1 - y4) ** 2)
-    ) / 2
+    w = (np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2) + np.sqrt((x3 - x4) ** 2 + (y3 - y4) ** 2)) / 2
+    h = (np.sqrt((x2 - x3) ** 2 + (y2 - y3) ** 2) + np.sqrt((x1 - x4) ** 2 + (y1 - y4) ** 2)) / 2
     # x = cx-w/2
     # y = cy-h/2
     sinA = (h * (x1 - cx) - w * (y1 - cy)) * 1.0 / (h * h + w * w + 1e-10) * 2
@@ -251,9 +239,7 @@ def adjust_lines(lines, alph=50, angle=50):
             if i != j:
                 x3, y3, x4, y4 = lines[j]
                 cx2, cy2 = (x3 + x4) / 2, (y3 + y4) / 2
-                if (x3 < cx1 < x4 or y3 < cy1 < y4) or (
-                    x1 < cx2 < x2 or y1 < cy2 < y2
-                ):  # 判断两个横线在y方向的投影重不重合
+                if (x3 < cx1 < x4 or y3 < cy1 < y4) or (x1 < cx2 < x2 or y1 < cy2 < y2):  # 判断两个横线在y方向的投影重不重合
                     continue
                 else:
                     r = sqrt((x1, y1), (x3, y3))
@@ -295,17 +281,21 @@ def draw_lines(im, bboxes, color=(0, 0, 0), lineW=3):
     """
     boxes: bounding boxes
     """
-    tmp = np.copy(im)
-    c = color
-    h, w = im.shape[:2]
+    # 只在入口复制一次掩码，批量栅格化避免逐条线反复物化整幅图。
+    lines = np.asarray(bboxes, dtype=np.float64).reshape(-1, 4).astype(np.int32)
+    if im.ndim == 3:
+        # 彩色画线仅用于诊断；Pillow 保留 BGR/RGB 转换及原图所有权。
+        from PIL import Image, ImageDraw
 
-    for box in bboxes:
-        x1, y1, x2, y2 = box[:4]
-        cv2.line(
-            tmp, (int(x1), int(y1)), (int(x2), int(y2)), c, lineW, lineType=cv2.LINE_AA
-        )
-
-    return tmp
+        order = [2, 1, 0, 3] if im.shape[2] == 4 else [2, 1, 0]
+        values = tuple(color) if isinstance(color, (tuple, list)) else (int(color), 0, 0)
+        with Image.fromarray(im[:, :, order]) as canvas:
+            draw = ImageDraw.Draw(canvas)
+            for x1, y1, x2, y2 in lines:
+                draw.line((int(x1), int(y1), int(x2), int(y2)), fill=values[:3][::-1], width=lineW)
+            return np.asarray(canvas)[:, :, order].copy()
+    value = int(color[0]) if isinstance(color, (tuple, list)) else int(color)
+    return rasterize_lines(im, lines, value=value, width=lineW, antialias=True)
 
 
 def line_to_line(points1, points2, alpha=10, angle=30):
@@ -344,12 +334,11 @@ def line_to_line(points1, points2, alpha=10, angle=30):
     return points1
 
 
-def min_area_rect_box(
-    regions, flag=True, W=0, H=0, filtersmall=False, adjust_box=False
-):
+def min_area_rect_box(regions, flag=True, W=0, H=0, filtersmall=False, adjust_box=False):
     """
     多边形外接矩形
     """
+
     boxes = []
     for region in regions:
         region_bbox_area = getattr(region, "bbox_area", None)
@@ -357,9 +346,9 @@ def min_area_rect_box(
             region_bbox_area = region.area_bbox
         if region_bbox_area > H * W * 3 / 4:  # 过滤大的单元格
             continue
-        rect = cv2.minAreaRect(region.coords[:, ::-1])
+        rect = minimum_rectangle(region.coords[:, ::-1])
 
-        box = cv2.boxPoints(rect)
+        box = rectangle_corners(rect)
         box = box.reshape((8,)).tolist()
         box = image_location_sort_box(box)
         x1, y1, x2, y2, x3, y3, x4, y4 = box
@@ -376,33 +365,28 @@ def min_area_rect_box(
         #         boxes.append([x1, y1, x2, y2, x3, y3, x4, y4])
         # else:
         if w * h < 0.5 * W * H:
-            if filtersmall and (
-                w < 15 or h < 15
-            ):  # or w / h > 30 or h / w > 30): # 过滤小的单元格
+            if filtersmall and (w < 15 or h < 15):  # or w / h > 30 or h / w > 30): # 过滤小的单元格
                 continue
             boxes.append([x1, y1, x2, y2, x3, y3, x4, y4])
     return boxes
 
 
-def min_area_rect_box_from_components(
-    components, flag=True, W=0, H=0, filtersmall=False, adjust_box=False
-):
+def min_area_rect_box_from_components(components, flag=True, W=0, H=0, filtersmall=False, adjust_box=False):
     """对 OpenCV 连通域组件执行与 min_area_rect_box 相同的过滤和外接框计算。"""
+
     boxes = []
     for component in components:
         if component.bbox_area > H * W * 3 / 4:  # 过滤大的单元格
             continue
-        rect = cv2.minAreaRect(component.coords[:, ::-1])
+        rect = minimum_rectangle(component.coords[:, ::-1])
 
-        box = cv2.boxPoints(rect)
+        box = rectangle_corners(rect)
         box = box.reshape((8,)).tolist()
         box = image_location_sort_box(box)
         x1, y1, x2, y2, x3, y3, x4, y4 = box
         angle, w, h, cx, cy = calculate_center_rotate_angle(box)
         if w * h < 0.5 * W * H:
-            if filtersmall and (
-                w < 15 or h < 15
-            ):  # or w / h > 30 or h / w > 30): # 过滤小的单元格
+            if filtersmall and (w < 15 or h < 15):  # or w / h > 30 or h / w > 30): # 过滤小的单元格
                 continue
             boxes.append([x1, y1, x2, y2, x3, y3, x4, y4])
     return boxes

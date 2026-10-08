@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from docvortex.image import perspective_matrix, warp_image
+
 import copy
 
-import cv2
 import numpy as np
 from loguru import logger
+from PIL import Image, ImageDraw
 from numpy import arctan, cos, sin, sqrt
 
 
@@ -30,8 +32,10 @@ def Homography(
     ratio_height=1.0,
 ):
     if interpolation is None:
-        interpolation = cv2.INTER_CUBIC
+        interpolation = "cubic"
 
+    if isinstance(interpolation, int):
+        interpolation = {0: "nearest", 1: "linear", 2: "cubic", 3: "area", 4: "lanczos4"}[interpolation]
     _points = np.array(img_points).reshape(-1, 2).astype(np.float32)
 
     expand_x = int(0.5 * world_width * (ratio_width - 1))
@@ -47,15 +51,9 @@ def Homography(
     img_crop_width = int(world_width * ratio_width)
     img_crop_height = int(world_height * ratio_height)
 
-    M = cv2.getPerspectiveTransform(_points, pts_std)
+    M = perspective_matrix(_points, pts_std)
 
-    dst_img = cv2.warpPerspective(
-        image,
-        M,
-        (img_crop_width, img_crop_height),
-        borderMode=cv2.BORDER_CONSTANT,
-        flags=interpolation,
-    )
+    dst_img = warp_image(image, M, (img_crop_width, img_crop_height), border="constant", interpolation=interpolation)
 
     return dst_img
 
@@ -73,7 +71,7 @@ class PlanB:
         square=False,
     ):
         if interpolation is None:
-            interpolation = cv2.INTER_LINEAR
+            interpolation = "linear"
         h, w = image.shape[:2]
         _points = np.array(points).reshape(-1, 2).astype(np.float32)
         x_min = int(np.min(_points[:, 0]))
@@ -145,9 +143,7 @@ class CurveTextRectifier:
         fv = 100
 
         matT = np.zeros((4, 4))
-        matT[0, 0] = cos(angle_z) * cos(angle_y) - sin(angle_z) * sin(angle_x1) * sin(
-            angle_y
-        )
+        matT[0, 0] = cos(angle_z) * cos(angle_y) - sin(angle_z) * sin(angle_x1) * sin(angle_y)
         matT[0, 1] = cos(angle_z) * sin(angle_y) * sin(angle_x2) - sin(angle_z) * (
             cos(angle_x1) * cos(angle_x2) - sin(angle_x1) * cos(angle_y) * sin(angle_x2)
         )
@@ -155,9 +151,7 @@ class CurveTextRectifier:
             cos(angle_x1) * sin(angle_x2) + sin(angle_x1) * cos(angle_y) * cos(angle_x2)
         )
         matT[0, 3] = optic_x
-        matT[1, 0] = sin(angle_z) * cos(angle_y) + cos(angle_z) * sin(angle_x1) * sin(
-            angle_y
-        )
+        matT[1, 0] = sin(angle_z) * cos(angle_y) + cos(angle_z) * sin(angle_x1) * sin(angle_y)
         matT[1, 1] = sin(angle_z) * sin(angle_y) * sin(angle_x2) + cos(angle_z) * (
             cos(angle_x1) * cos(angle_x2) - sin(angle_x1) * cos(angle_y) * sin(angle_x2)
         )
@@ -166,12 +160,8 @@ class CurveTextRectifier:
         )
         matT[1, 3] = optic_y
         matT[2, 0] = -cos(angle_x1) * sin(angle_y)
-        matT[2, 1] = cos(angle_x1) * cos(angle_y) * sin(angle_x2) + sin(angle_x1) * cos(
-            angle_x2
-        )
-        matT[2, 2] = cos(angle_x1) * cos(angle_y) * cos(angle_x2) - sin(angle_x1) * sin(
-            angle_x2
-        )
+        matT[2, 1] = cos(angle_x1) * cos(angle_y) * sin(angle_x2) + sin(angle_x1) * cos(angle_x2)
+        matT[2, 2] = cos(angle_x1) * cos(angle_y) * cos(angle_x2) - sin(angle_x1) * sin(angle_x2)
         matT[2, 3] = optic_z
         matT[3, 0] = 0
         matT[3, 1] = 0
@@ -199,9 +189,7 @@ class CurveTextRectifier:
         adjusted_points[:, 0] = _points[:, 1]
         adjusted_points[:, 1] = org_h - _points[:, 0] - 1
 
-        _image_coord, _world_coord, _new_image_size = self.horizontal_text_process(
-            adjusted_points
-        )
+        _image_coord, _world_coord, _new_image_size = self.horizontal_text_process(adjusted_points)
 
         image_coord = _points.reshape(1, -1, 2)
         world_coord = np.zeros(_world_coord.shape, dtype=np.float32)
@@ -229,10 +217,7 @@ class CurveTextRectifier:
             d = sqrt(ydx**2 + ydy**2)
             dy_list.append(d)
 
-        dx_list = [
-            (dx_list[i] + dx_list[len(dx_list) - 1 - i]) / 2
-            for i in range(len(dx_list) // 2)
-        ]
+        dx_list = [(dx_list[i] + dx_list[len(dx_list) - 1 - i]) / 2 for i in range(len(dx_list) // 2)]
 
         height = np.around(np.mean(dy_list))
 
@@ -319,30 +304,18 @@ class CurveTextRectifier:
             + (K[0, 2] + K[2, 0]) * D0 * D2
             + (K[1, 2] + K[2, 1]) * D1 * D2
         )
-        ratio_b = (
-            (K[0, 3] + K[3, 0]) * D0
-            + (K[1, 3] + K[3, 1]) * D1
-            + (K[2, 3] + K[3, 2]) * D2
-        )
+        ratio_b = (K[0, 3] + K[3, 0]) * D0 + (K[1, 3] + K[3, 1]) * D1 + (K[2, 3] + K[3, 2]) * D2
         ratio_c = K[3, 3] * np.ones(ratio_b.shape)
 
         delta = ratio_b * ratio_b - 4 * ratio_a * ratio_c
         t = np.zeros(delta.shape)
         t[ratio_a == 0] = -ratio_c[ratio_a == 0] / ratio_b[ratio_a == 0]
-        t[ratio_a != 0] = (-ratio_b[ratio_a != 0] + sqrt(delta[ratio_a != 0])) / (
-            2 * ratio_a[ratio_a != 0]
-        )
+        t[ratio_a != 0] = (-ratio_b[ratio_a != 0] + sqrt(delta[ratio_a != 0])) / (2 * ratio_a[ratio_a != 0])
         t[delta < 0] = 0
 
-        P[:, :, 0] = matT[0, 3] + t * (
-            matT[0, 0] * D0 + matT[0, 1] * D1 + matT[0, 2] * D2
-        )
-        P[:, :, 1] = matT[1, 3] + t * (
-            matT[1, 0] * D0 + matT[1, 1] * D1 + matT[1, 2] * D2
-        )
-        P[:, :, 2] = matT[2, 3] + t * (
-            matT[2, 0] * D0 + matT[2, 1] * D1 + matT[2, 2] * D2
-        )
+        P[:, :, 0] = matT[0, 3] + t * (matT[0, 0] * D0 + matT[0, 1] * D1 + matT[0, 2] * D2)
+        P[:, :, 1] = matT[1, 3] + t * (matT[1, 0] * D0 + matT[1, 1] * D1 + matT[1, 2] * D2)
+        P[:, :, 2] = matT[2, 3] + t * (matT[2, 0] * D0 + matT[2, 1] * D1 + matT[2, 2] * D2)
 
         return P
 
@@ -416,15 +389,9 @@ class CurveTextRectifier:
         r4 = r2 * r2
         r6 = r2 * r4
 
-        radial_distortion = (1 + k1 * r2 + k2 * r4 + k3 * r6) / (
-            1 + k4 * r2 + k5 * r4 + k6 * r6
-        )
-        x2 = (
-            x1 * radial_distortion + p1 * x1y1 + p2 * (r2 + 2 * x12) + s1 * r2 + s2 * r4
-        )
-        y2 = (
-            y1 * radial_distortion + p2 * x1y1 + p1 * (r2 + 2 * y12) + s3 * r2 + s4 * r4
-        )
+        radial_distortion = (1 + k1 * r2 + k2 * r4 + k3 * r6) / (1 + k4 * r2 + k5 * r4 + k6 * r6)
+        x2 = x1 * radial_distortion + p1 * x1y1 + p2 * (r2 + 2 * x12) + s1 * r2 + s2 * r4
+        y2 = y1 * radial_distortion + p2 * x1y1 + p1 * (r2 + 2 * y12) + s3 * r2 + s4 * r4
 
         x3 = tao11 * x2 + tao12 * y2 + tao13
         y3 = tao21 * x2 + tao22 * y2 + tao23
@@ -435,34 +402,27 @@ class CurveTextRectifier:
 
         return P
 
-    def spatial_transform(
-        self, image_data, new_image_size, mtx, dist, rvecs, tvecs, interpolation
-    ):
+    def spatial_transform(self, image_data, new_image_size, mtx, dist, rvecs, tvecs, interpolation):
+        import cv2
+
         rotation, _ = cv2.Rodrigues(rvecs)
         world_map = self.virtual_camera_to_world(new_image_size)
-        image_map = self.world_to_image(
-            new_image_size, world_map, mtx, dist, rotation, tvecs
-        )
+        image_map = self.world_to_image(new_image_size, world_map, mtx, dist, rotation, tvecs)
         image_map = image_map.astype(np.float32)
-        dst = cv2.remap(
-            image_data, image_map[:, :, 0], image_map[:, :, 1], interpolation
-        )
+        if isinstance(interpolation, str):
+            interpolation = {"nearest": 0, "linear": 1, "cubic": 2, "area": 3, "lanczos4": 4}[interpolation]
+        dst = cv2.remap(image_data, image_map[:, :, 0], image_map[:, :, 1], interpolation)
         return dst
 
     def calibrate(self, org_size, image_coord, world_coord):
+        """只在明确选择旧相机标定时按需使用 OpenCV，保留历史标定参数。"""
+        import cv2
+
         flag = cv2.CALIB_RATIONAL_MODEL
         flag2 = cv2.CALIB_RATIONAL_MODEL | cv2.CALIB_TILTED_MODEL
         flag3 = cv2.CALIB_RATIONAL_MODEL | cv2.CALIB_THIN_PRISM_MODEL
-        flag4 = (
-            cv2.CALIB_RATIONAL_MODEL
-            | cv2.CALIB_ZERO_TANGENT_DIST
-            | cv2.CALIB_FIX_ASPECT_RATIO
-        )
-        flag5 = (
-            cv2.CALIB_RATIONAL_MODEL
-            | cv2.CALIB_TILTED_MODEL
-            | cv2.CALIB_ZERO_TANGENT_DIST
-        )
+        flag4 = cv2.CALIB_RATIONAL_MODEL | cv2.CALIB_ZERO_TANGENT_DIST | cv2.CALIB_FIX_ASPECT_RATIO
+        flag5 = cv2.CALIB_RATIONAL_MODEL | cv2.CALIB_TILTED_MODEL | cv2.CALIB_ZERO_TANGENT_DIST
         flag6 = cv2.CALIB_RATIONAL_MODEL | cv2.CALIB_FIX_ASPECT_RATIO
         flag_list = [flag2, flag3, flag4, flag5, flag6]
 
@@ -502,7 +462,7 @@ class CurveTextRectifier:
         ratio_height=1.0,
     ):
         if interpolation is None:
-            interpolation = cv2.INTER_LINEAR
+            interpolation = "linear"
 
         _img_points = img_points.reshape(-1, 2)
         _obj_points = obj_points.reshape(-1, 3)
@@ -542,9 +502,7 @@ class CurveTextRectifier:
             width_list.append(_w)
             height_list.append(_h)
 
-        rectified_image = np.zeros((np.max(height_list), sum(width_list), 3)).astype(
-            np.uint8
-        )
+        rectified_image = np.zeros((np.max(height_list), sum(width_list), 3)).astype(np.uint8)
 
         st = 0
         for homo_img, w, h in zip(homo_img_list, width_list, height_list):
@@ -566,7 +524,7 @@ class CurveTextRectifier:
         mode="calibration",
     ):
         if interpolation is None:
-            interpolation = cv2.INTER_LINEAR
+            interpolation = "linear"
 
         org_h, org_w = image_data.shape[:2]
         org_size = (org_w, org_h)
@@ -574,26 +532,18 @@ class CurveTextRectifier:
 
         is_horizontal_text = self.horizontal_text_estimate(points)
         if is_horizontal_text:
-            image_coord, world_coord, new_image_size = self.horizontal_text_process(
-                points
-            )
+            image_coord, world_coord, new_image_size = self.horizontal_text_process(points)
         else:
-            image_coord, world_coord, new_image_size = self.vertical_text_process(
-                points, org_size
-            )
+            image_coord, world_coord, new_image_size = self.vertical_text_process(points, org_size)
 
         if mode.lower() == "calibration":
-            ret, mtx, dist, rvecs, tvecs = self.calibrate(
-                org_size, image_coord, world_coord
-            )
+            ret, mtx, dist, rvecs, tvecs = self.calibrate(org_size, image_coord, world_coord)
 
             st_size = (
                 int(new_image_size[0] * ratio_width),
                 int(new_image_size[1] * ratio_height),
             )
-            dst = self.spatial_transform(
-                image_data, st_size, mtx, dist[0], rvecs[0], tvecs[0], interpolation
-            )
+            dst = self.spatial_transform(image_data, st_size, mtx, dist[0], rvecs[0], tvecs[0], interpolation)
         elif mode.lower() == "homography":
             ret = 0.01
             dst = self.dc_homo(
@@ -606,9 +556,7 @@ class CurveTextRectifier:
                 ratio_height=1.0,
             )
         else:
-            raise ValueError(
-                'mode must be ["calibration", "homography"], but got {}'.format(mode)
-            )
+            raise ValueError('mode must be ["calibration", "homography"], but got {}'.format(mode))
 
         return dst, ret
 
@@ -619,11 +567,9 @@ class AutoRectifier:
         self.curveTextRectifier = CurveTextRectifier()
 
     @staticmethod
-    def get_rotate_crop_image(
-        img, points, interpolation=None, ratio_width=1.0, ratio_height=1.0
-    ):
+    def get_rotate_crop_image(img, points, interpolation=None, ratio_width=1.0, ratio_height=1.0):
         if interpolation is None:
-            interpolation = cv2.INTER_CUBIC
+            interpolation = "cubic"
         h, w = img.shape[:2]
         _points = np.array(points).reshape(-1, 2).astype(np.float32)
 
@@ -669,31 +615,15 @@ class AutoRectifier:
         return dst_img
 
     def visualize(self, image_data, points_list):
-        visualization = image_data.copy()
-
-        for box in points_list:
-            box = np.array(box).reshape(-1, 2).astype(np.int32)
-            cv2.drawContours(
-                visualization, [np.array(box).reshape((-1, 1, 2))], -1, (0, 0, 255), 2
-            )
-            for i, p in enumerate(box):
-                if i != 0:
-                    cv2.circle(
-                        visualization,
-                        tuple(p),
-                        radius=1,
-                        color=(255, 0, 0),
-                        thickness=2,
-                    )
-                else:
-                    cv2.circle(
-                        visualization,
-                        tuple(p),
-                        radius=1,
-                        color=(255, 255, 0),
-                        thickness=2,
-                    )
-        return visualization
+        """使用 Pillow 标注印章矫正点，返回与输入同通道顺序的诊断图。"""
+        with Image.fromarray(image_data[:, :, ::-1]) as canvas:
+            draw = ImageDraw.Draw(canvas)
+            for box in points_list:
+                points = [tuple(map(int, xy)) for xy in np.asarray(box).reshape(-1, 2)]
+                draw.line(points + points[:1], fill=(255, 0, 0), width=2)
+                for index, (x, y) in enumerate(points):
+                    draw.ellipse((x - 1, y - 1, x + 1, y + 1), outline=(0, 255, 255) if index == 0 else (0, 0, 255), width=2)
+            return np.asarray(canvas)[:, :, ::-1].copy()
 
     def __call__(
         self,
@@ -706,15 +636,13 @@ class AutoRectifier:
         mode="calibration",
     ):
         if interpolation is None:
-            interpolation = cv2.INTER_LINEAR
+            interpolation = "linear"
         _points = np.array(points).reshape(-1, 2)
         if len(_points) >= self.npoints and len(_points) % 2 == 0:
             try:
                 curveTextRectifier = CurveTextRectifier()
 
-                dst_img, loss = curveTextRectifier(
-                    image_data, points, interpolation, ratio_width, ratio_height, mode
-                )
+                dst_img, loss = curveTextRectifier(image_data, points, interpolation, ratio_width, ratio_height, mode)
                 if loss >= 2:
                     img_list, loss_list = [dst_img], [loss]
                     _dst_img, _loss = PlanB()(
@@ -752,18 +680,12 @@ class AutoRectifier:
                                 loss
                             )
                         )
-                        dst_img = self.get_rotate_crop_image(
-                            image_data, points, interpolation, ratio_width, ratio_height
-                        )
+                        dst_img = self.get_rotate_crop_image(image_data, points, interpolation, ratio_width, ratio_height)
             except Exception as e:
                 logger.warning(f"Exception caught: {e}")
-                dst_img = self.get_rotate_crop_image(
-                    image_data, points, interpolation, ratio_width, ratio_height
-                )
+                dst_img = self.get_rotate_crop_image(image_data, points, interpolation, ratio_width, ratio_height)
         else:
-            dst_img = self.get_rotate_crop_image(
-                image_data, _points, interpolation, ratio_width, ratio_height
-            )
+            dst_img = self.get_rotate_crop_image(image_data, _points, interpolation, ratio_width, ratio_height)
 
         return dst_img
 
@@ -785,7 +707,7 @@ class AutoRectifier:
             if not isinstance(points, list):
                 raise ValueError
         if interpolation is None:
-            interpolation = cv2.INTER_LINEAR
+            interpolation = "linear"
 
         if ratio_width < 1.0 or ratio_height < 1.0:
             raise ValueError(
@@ -794,9 +716,7 @@ class AutoRectifier:
             )
 
         if mode.lower() != "calibration" and mode.lower() != "homography":
-            raise ValueError(
-                'mode must be ["calibration", "homography"], but got {}'.format(mode)
-            )
+            raise ValueError('mode must be ["calibration", "homography"], but got {}'.format(mode))
 
         if mode.lower() == "homography" and ratio_width != 1.0 and ratio_height != 1.0:
             raise ValueError(

@@ -1,15 +1,15 @@
 # Copyright (c) Opendatalab. All rights reserved.
-import os
+
+from docvortex.image import resize_image
 import traceback
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-import cv2
 import loguru
 import numpy as np
 from onnxruntime import GraphOptimizationLevel, SessionOptions
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageDraw, UnidentifiedImageError
 
 from ....runtime.onnx import configure_ort_threads, table_ort_session
 
@@ -94,12 +94,12 @@ class LoadImage:
 
     def convert_img(self, img: np.ndarray):
         if img.ndim == 2:
-            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            return np.repeat(img[:, :, None], 3, axis=2)
 
         if img.ndim == 3:
             channel = img.shape[2]
             if channel == 1:
-                return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+                return np.repeat(img, 3, axis=2)
 
             if channel == 2:
                 return self.cvt_two_to_three(img)
@@ -108,7 +108,7 @@ class LoadImage:
                 return self.cvt_four_to_three(img)
 
             if channel == 3:
-                return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                return img[:, :, ::-1].copy(order="C")
 
             raise LoadImageError(f"The channel({channel}) of the img is not in [1, 2, 3, 4]")
 
@@ -117,28 +117,30 @@ class LoadImage:
     @staticmethod
     def cvt_four_to_three(img: np.ndarray) -> np.ndarray:
         """RGBA → BGR"""
-        r, g, b, a = cv2.split(img)
-        new_img = cv2.merge((b, g, r))
 
-        not_a = cv2.bitwise_not(a)
-        not_a = cv2.cvtColor(not_a, cv2.COLOR_GRAY2BGR)
+        r, g, b, a = (img[:, :, index] for index in range(4))
+        new_img = np.stack((b, g, r), axis=2)
 
-        new_img = cv2.bitwise_and(new_img, new_img, mask=a)
-        new_img = cv2.add(new_img, not_a)
+        not_a = np.bitwise_not(a)
+        not_a = np.repeat(not_a[:, :, None], 3, axis=2)
+
+        new_img = np.where(a[:, :, None] != 0, new_img, 0)
+        new_img = np.minimum(new_img.astype(np.uint16) + not_a, 255).astype(np.uint8)
         return new_img
 
     @staticmethod
     def cvt_two_to_three(img: np.ndarray) -> np.ndarray:
         """gray + alpha → BGR"""
+
         img_gray = img[..., 0]
-        img_bgr = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
+        img_bgr = np.repeat(img_gray[:, :, None], 3, axis=2)
 
         img_alpha = img[..., 1]
-        not_a = cv2.bitwise_not(img_alpha)
-        not_a = cv2.cvtColor(not_a, cv2.COLOR_GRAY2BGR)
+        not_a = np.bitwise_not(img_alpha)
+        not_a = np.repeat(not_a[:, :, None], 3, axis=2)
 
-        new_img = cv2.bitwise_and(img_bgr, img_bgr, mask=img_alpha)
-        new_img = cv2.add(new_img, not_a)
+        new_img = np.where(img_alpha[:, :, None] != 0, img_bgr, 0)
+        new_img = np.minimum(new_img.astype(np.uint16) + not_a, 255).astype(np.uint8)
         return new_img
 
     @staticmethod
@@ -172,14 +174,6 @@ if Image is not None:
             "lanczos": Image.LANCZOS,
             "hamming": Image.HAMMING,
         }
-
-cv2_interp_codes = {
-    "nearest": cv2.INTER_NEAREST,
-    "bilinear": cv2.INTER_LINEAR,
-    "bicubic": cv2.INTER_CUBIC,
-    "area": cv2.INTER_AREA,
-    "lanczos": cv2.INTER_LANCZOS4,
-}
 
 
 def resize_img(img, scale, keep_ratio=True):
@@ -248,9 +242,9 @@ def imresize(img, size, return_scale=False, interpolation="bilinear", out=None, 
     """
     h, w = img.shape[:2]
     if backend is None:
-        backend = "cv2"
-    if backend not in ["cv2", "pillow"]:
-        raise ValueError(f"backend: {backend} is not supported for resize.Supported backends are 'cv2', 'pillow'")
+        backend = "numeric"
+    if backend not in ["numeric", "cv2", "pillow"]:
+        raise ValueError(f"backend: {backend} is not supported for resize.Supported backends are 'numeric', 'pillow'")
 
     if backend == "pillow":
         assert img.dtype == np.uint8, "Pillow backend only support uint8 type"
@@ -258,7 +252,18 @@ def imresize(img, size, return_scale=False, interpolation="bilinear", out=None, 
         pil_image = pil_image.resize(size, pillow_interp_codes[interpolation])
         resized_img = np.array(pil_image)
     else:
-        resized_img = cv2.resize(img, size, dst=out, interpolation=cv2_interp_codes[interpolation])
+
+        interpolation_names = {
+            "nearest": 'nearest',
+            "bilinear": 'linear',
+            "bicubic": 'cubic',
+            "area": 'area',
+            "lanczos": 'lanczos4',
+        }
+        resized_img = resize_image(img, size, interpolation=interpolation_names[interpolation])
+        if out is not None and out.shape == resized_img.shape and out.dtype == resized_img.dtype:
+            np.copyto(out, resized_img)
+            resized_img = out
     if not return_scale:
         return resized_img
     else:
@@ -378,68 +383,42 @@ class VisTable:
         return html_with_border
 
     def plot_rec_box_with_logic_info(self, img, output_path, logic_points, sorted_polygons):
-        """
-        :param img_path
-        :param output_path
-        :param logic_points: [row_start,row_end,col_start,col_end]
-        :param sorted_polygons: [xmin,ymin,xmax,ymax]
-        :return:
-        """
-        # 读取原图
-        img = cv2.copyMakeBorder(img, 0, 0, 0, 100, cv2.BORDER_CONSTANT, value=[255, 255, 255])
-        # 绘制 polygons 矩形
-        for idx, polygon in enumerate(sorted_polygons):
-            x0, y0, x1, y1 = polygon[0], polygon[1], polygon[2], polygon[3]
-            x0 = round(x0)
-            y0 = round(y0)
-            x1 = round(x1)
-            y1 = round(y1)
-            cv2.rectangle(img, (x0, y0), (x1, y1), (0, 0, 255), 1)
-            # 增大字体大小和线宽
-            font_scale = 0.9  # 原先是0.5
-            thickness = 1  # 原先是1
-            logic_point = logic_points[idx]
-            cv2.putText(
-                img,
-                f"row: {logic_point[0]}-{logic_point[1]}",
-                (x0 + 3, y0 + 8),
-                cv2.FONT_HERSHEY_PLAIN,
-                font_scale,
-                (0, 0, 255),
-                thickness,
-            )
-            cv2.putText(
-                img,
-                f"col: {logic_point[2]}-{logic_point[3]}",
-                (x0 + 3, y0 + 18),
-                cv2.FONT_HERSHEY_PLAIN,
-                font_scale,
-                (0, 0, 255),
-                thickness,
-            )
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            # 保存绘制后的图像
-            self.save_img(output_path, img)
+        """在表格诊断图中标注逻辑行列，Pillow 画布只用于调试输出。"""
+        padded = np.pad(img, ((0, 0), (0, 100), (0, 0)), constant_values=255)
+        with Image.fromarray(padded[:, :, ::-1]) as canvas:
+            draw = ImageDraw.Draw(canvas)
+            for polygon, logic in zip(sorted_polygons, logic_points):
+                x0, y0, x1, y1 = map(round, polygon[:4])
+                draw.rectangle((x0, y0, x1, y1), outline=(255, 0, 0), width=1)
+                draw.text((x0 + 3, y0 + 8), f"row: {logic[0]}-{logic[1]}", fill=(255, 0, 0))
+                draw.text((x0 + 3, y0 + 18), f"col: {logic[2]}-{logic[3]}", fill=(255, 0, 0))
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            canvas.save(output_path)
 
     @staticmethod
     def draw_rectangle(img: np.ndarray, boxes: np.ndarray) -> np.ndarray:
-        img_copy = img.copy()
-        for box in boxes.astype(int):
-            x1, y1, x2, y2 = box
-            cv2.rectangle(img_copy, (x1, y1), (x2, y2), (255, 0, 0), 2)
-        return img_copy
+        """在独立 BGR 诊断图上绘制矩形，保持原数组所有权。"""
+        with Image.fromarray(img[:, :, ::-1]) as canvas:
+            draw = ImageDraw.Draw(canvas)
+            for box in boxes.astype(int):
+                draw.rectangle(tuple(map(int, box)), outline=(0, 0, 255), width=2)
+            return np.asarray(canvas)[:, :, ::-1].copy()
 
     @staticmethod
     def draw_polylines(img: np.ndarray, points) -> np.ndarray:
-        img_copy = img.copy()
-        for point in points.astype(int):
-            point = point.reshape(4, 2)
-            cv2.polylines(img_copy, [point.astype(int)], True, (255, 0, 0), 2)
-        return img_copy
+        """用 Pillow 标注表格多边形，点序及蓝色诊断语义保持不变。"""
+        with Image.fromarray(img[:, :, ::-1]) as canvas:
+            draw = ImageDraw.Draw(canvas)
+            for point in points.astype(int):
+                vertices = [tuple(map(int, xy)) for xy in point.reshape(4, 2)]
+                draw.line(vertices + vertices[:1], fill=(0, 0, 255), width=2)
+            return np.asarray(canvas)[:, :, ::-1].copy()
 
     @staticmethod
-    def save_img(save_path: Union[str, Path], img: np.ndarray):
-        cv2.imwrite(str(save_path), img)
+    def save_img(save_path: Union[str, Path], img: np.ndarray) -> None:
+        """物化 BGR 诊断图后交由 Pillow 编码保存。"""
+        with Image.fromarray(img[:, :, ::-1] if img.ndim == 3 else img) as canvas:
+            canvas.save(save_path)
 
     @staticmethod
     def save_html(save_path: Union[str, Path], html: str):

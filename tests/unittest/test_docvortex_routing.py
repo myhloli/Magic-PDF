@@ -8,6 +8,8 @@ import pytest
 
 from mineru.backend.analysis.pdf import pipeline
 
+from mineru.model.runtime import hybrid as hybrid_runtime
+
 
 @pytest.mark.parametrize(
     ("parse_mode", "classification", "native", "classification_calls"),
@@ -62,7 +64,7 @@ def test_flash_routes_classification_and_native_analysis_explicitly(
         ]
 
     monkeypatch.setattr(pipeline, "PDFDocument", Document)
-    monkeypatch.setattr(pipeline, "HybridLocalModelContextSingleton", lambda: SimpleNamespace(get_model=get_model))
+    monkeypatch.setattr(hybrid_runtime, "HybridLocalModelContextSingleton", lambda: SimpleNamespace(get_model=get_model))
     monkeypatch.setattr(pipeline, "process_pdf_windows", process)
     monkeypatch.setattr(pipeline, "clean_memory", lambda *_args: None)
     result = pipeline.analyze_pdf(b"pdf", effort="flash", parse_mode=parse_mode)
@@ -91,7 +93,9 @@ def test_hybrid_and_vlm_pdf_outputs_share_docvortex_text_cleanup(
         lambda _data: SimpleNamespace(close=lambda: None, page_count=1, page_size=lambda _index: (612.0, 792.0)),
     )
     monkeypatch.setattr(
-        pipeline, "HybridLocalModelContextSingleton", lambda: SimpleNamespace(get_model=lambda: SimpleNamespace(device="cpu"))
+        hybrid_runtime,
+        "HybridLocalModelContextSingleton",
+        lambda: SimpleNamespace(get_model=lambda: SimpleNamespace(device="cpu")),
     )
     monkeypatch.setattr(pipeline, "get_vlm_predictor", lambda _config: (object(), "test"))
     monkeypatch.setattr(pipeline, "clean_memory", lambda _device: None)
