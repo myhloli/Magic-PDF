@@ -313,3 +313,58 @@ def test_kit_cli_forwards_explicit_retention(monkeypatch: pytest.MonkeyPatch) ->
     assert response.exit_code == 0, response.output
     args = forwarded.call_args.kwargs["args"]
     assert args[args.index("--retention-seconds") + 1] == "0"
+
+
+def test_external_worker_lost_task_releases_load_and_keeps_snapshot() -> None:
+    """外部 worker 重启丢失内存任务时，Router 不得永久占用名额或丢弃失败历史。"""
+    from test_v1_router import _FakeV1Upstream, _make_router
+    from mineru.kit.router.app import _reconcile_jobs_once
+
+    upstream = _FakeV1Upstream("worker-a", ("standard",))
+    app, _ = _make_router(upstream)
+    with TestClient(app) as client:
+        created = client.post(
+            "/v1/parse/jobs",
+            json={"tier": "standard", "files": [{"source": {"type": "inline", "name": "demo.pdf", "data": "cGRm"}}]},
+        )
+        assert created.status_code == 202
+        job_id = created.json()["job_id"]
+        route = app.state.registry.get("job", job_id)
+        worker = app.state.worker_pool.get(route.worker_id)
+        assert worker.active_jobs == 1
+        upstream.jobs.clear()
+        client.portal.call(_reconcile_jobs_once, app.state.registry, app.state.worker_pool)
+        assert worker.active_jobs == 0
+        response = client.get(f"/v1/parse/jobs/{job_id}")
+        assert response.status_code == 200 and response.json()["status"] == "failed"
+        assert response.json()["files"][0]["error"]["code"] == "upstream_job_lost"
+
+
+def test_lost_task_retries_failed_cross_worker_copy_cleanup() -> None:
+    """上游任务丢失后副本删除失败一次，后续后台轮次仍继续回收并释放 alias。"""
+    from test_v1_router import _FakeV1Upstream, _make_router, _upload_file
+    from mineru.kit.router.app import _reconcile_jobs_once
+
+    first = _FakeV1Upstream("worker-a", ("standard",))
+    second = _FakeV1Upstream("worker-b", ("advanced",))
+    app, _ = _make_router(first, second)
+    headers = {"authorization": "Bearer lost-copy"}
+    with TestClient(app) as client:
+        source = _upload_file(client, token="lost-copy", content=b"pdf")
+        response = client.post(
+            "/v1/parse/jobs",
+            headers=headers,
+            json={"tier": "advanced", "files": [{"source": {"type": "file_id", "file_id": source}}]},
+        )
+        assert response.status_code == 202
+        route = app.state.registry.get("job", response.json()["job_id"])
+        copied = route.metadata["copied_inputs"][0]
+        second.jobs.clear()
+        second.fail_file_delete_once.add(copied.upstream_file_id)
+        client.portal.call(_reconcile_jobs_once, app.state.registry, app.state.worker_pool)
+        assert route.metadata["upstream_lost"] and route.metadata["copied_inputs"]
+        assert second.files.get(copied.upstream_file_id) is not None
+        client.portal.call(_reconcile_jobs_once, app.state.registry, app.state.worker_pool)
+        assert not route.metadata.get("copied_inputs")
+        assert copied.upstream_file_id not in second.files
+        assert app.state.registry.find_upstream("file", copied.owner_scope, copied.worker_id, copied.upstream_file_id) is None

@@ -335,14 +335,42 @@ async def _finalize_terminal_job(
             route.metadata.pop("upstream_headers", None)
 
 
+def _mark_missing_job(route: ResourceRoute, pool: WorkerPool) -> dict[str, Any]:
+    """上游已丢失任务时保存失败快照并归还负载，避免重启后永久占用名额。"""
+    payload = route.metadata.get("payload") or {}
+    if payload.get("status") not in {"completed", "partial", "failed", "canceled"}:
+        payload["status"] = "failed"
+        payload["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        for file in payload.get("files") or []:
+            if file.get("status") != "completed":
+                file["status"] = "failed"
+                file["error"] = {
+                    "type": "engine_error",
+                    "code": "upstream_job_lost",
+                    "message": "Upstream task no longer exists",
+                }
+        progress = payload.get("progress")
+        if isinstance(progress, dict):
+            progress["failed"] = progress.get("total", 0) - progress.get("completed", 0)
+    route.metadata["payload"] = payload
+    route.metadata["upstream_lost"] = True
+    release_job_load(route, pool)
+    return payload
+
+
 async def _reconcile_jobs_once(registry: ResourceRegistry, pool: WorkerPool) -> None:
     """后台查询活动或待清理 Job，并统一执行终态资源收敛。"""
     for route in registry.list("job", include_expired=True):
         if not route.metadata.get("active_counted") and not route.metadata.get("copied_inputs"):
             continue
+        headers = dict(route.metadata.get("upstream_headers") or {})
+        if route.metadata.get("upstream_lost"):
+            await _finalize_terminal_job(
+                route, route.metadata["payload"], request=None, pool=pool, registry=registry, headers=headers
+            )
+            continue
         worker = pool.get(route.worker_id)
         generation = worker.generation
-        headers = dict(route.metadata.get("upstream_headers") or {})
         try:
             response = await request_upstream(
                 pool,
@@ -354,8 +382,8 @@ async def _reconcile_jobs_once(registry: ResourceRegistry, pool: WorkerPool) -> 
             if worker.generation != generation or route.metadata.get("upstream_lost"):
                 continue
             if response.status_code >= 400:
-                cached = route.metadata.get("payload") or {}
-                if response.status_code == 404 and cached.get("status") in {"completed", "partial", "failed", "canceled"}:
+                if response.status_code == 404:
+                    cached = _mark_missing_job(route, pool)
                     await _finalize_terminal_job(route, cached, request=None, pool=pool, registry=registry, headers=headers)
                 continue
             payload = json_or_error(response)
@@ -973,6 +1001,10 @@ def create_app(
         upstream = await request_upstream(pool, worker, "GET", f"/v1/parse/jobs/{route.upstream_id}", request=request)
         if worker.generation != generation or route.metadata.get("upstream_lost"):
             return JSONResponse(route.metadata["payload"])
+        if upstream.status_code == 404:
+            failed = _mark_missing_job(route, pool)
+            await _finalize_terminal_job(route, failed, request=request, pool=pool, registry=registry)
+            return JSONResponse(failed)
         result = _successful_json(upstream)
         if isinstance(result, Response):
             return result
