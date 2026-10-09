@@ -268,6 +268,7 @@ async def _hydrate_job_output_files(
             if route is None or isinstance(route.metadata.get("payload"), dict):
                 continue
             worker = pool.get(route.worker_id)
+            generation = worker.generation
             try:
                 response = await request_upstream(
                     pool,
@@ -290,6 +291,8 @@ async def _hydrate_job_output_files(
                     "code": exc.code,
                     "message": exc.message,
                 }
+                continue
+            if worker.generation != generation or registry.find("file", public_file_id) is not route:
                 continue
             rewrite_file_payload(metadata, worker, registry, route.owner_scope)
             route.metadata.pop("hydration_error", None)
@@ -338,6 +341,7 @@ async def _reconcile_jobs_once(registry: ResourceRegistry, pool: WorkerPool) -> 
         if not route.metadata.get("active_counted") and not route.metadata.get("copied_inputs"):
             continue
         worker = pool.get(route.worker_id)
+        generation = worker.generation
         headers = dict(route.metadata.get("upstream_headers") or {})
         try:
             response = await request_upstream(
@@ -347,6 +351,8 @@ async def _reconcile_jobs_once(registry: ResourceRegistry, pool: WorkerPool) -> 
                 f"/v1/parse/jobs/{route.upstream_id}",
                 headers=headers,
             )
+            if worker.generation != generation or route.metadata.get("upstream_lost"):
+                continue
             if response.status_code >= 400:
                 cached = route.metadata.get("payload") or {}
                 if response.status_code == 404 and cached.get("status") in {"completed", "partial", "failed", "canceled"}:
@@ -963,7 +969,10 @@ def create_app(
         if route.metadata.get("upstream_lost"):
             return JSONResponse(route.metadata["payload"])
         worker = pool.get(route.worker_id)
+        generation = worker.generation
         upstream = await request_upstream(pool, worker, "GET", f"/v1/parse/jobs/{route.upstream_id}", request=request)
+        if worker.generation != generation or route.metadata.get("upstream_lost"):
+            return JSONResponse(route.metadata["payload"])
         result = _successful_json(upstream)
         if isinstance(result, Response):
             return result
@@ -975,6 +984,8 @@ def create_app(
             pool=pool,
             registry=registry,
         )
+        if worker.generation != generation or route.metadata.get("upstream_lost"):
+            return JSONResponse(route.metadata["payload"])
         return JSONResponse(rewritten, status_code=upstream.status_code)
 
     @application.delete("/v1/parse/jobs/{job_id}")

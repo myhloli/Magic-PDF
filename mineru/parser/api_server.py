@@ -2469,6 +2469,8 @@ _MODEL_PRELOAD_DEVICE_ERROR_PATTERNS = (
 
 def _classify_model_preload_error(exc: Exception) -> tuple[str, str]:
     message = str(exc).strip() or type(exc).__name__
+    if is_fatal_engine_error(exc):
+        return "engine_dead", message
     if isinstance(exc, (ModuleNotFoundError, ImportError)):
         return "model_preload_dependency_missing", message
     if isinstance(exc, FileNotFoundError):
@@ -2654,6 +2656,8 @@ def create_app(
                     )
                 except Exception as exc:
                     error_code, error_msg = _classify_model_preload_error(exc)
+                    if error_code == "engine_dead":
+                        job_store.fail_engine(error_msg)
                     application.state.model_preload_error = _ModelPreloadError(
                         code=error_code,
                         message=error_msg,

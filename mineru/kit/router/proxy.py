@@ -80,6 +80,7 @@ async def request_upstream(
     follow_redirects: bool = False,
 ) -> httpx.Response:
     """执行普通 upstream 请求，并把连接失败与超时转成稳定 Router 错误。"""
+    generation = worker.generation
     outgoing_headers = forwarded_headers(request) if request is not None else {}
     outgoing_headers.pop("expect", None)
     if json_body is not None:
@@ -94,7 +95,7 @@ async def request_upstream(
             headers=outgoing_headers,
             follow_redirects=follow_redirects,
         )
-        if response.status_code == 503:
+        if response.status_code == 503 and worker.generation == generation:
             try:
                 if (response.json().get("error") or {}).get("code") == "engine_dead":
                     pool.notify_engine_dead(worker)

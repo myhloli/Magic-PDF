@@ -180,3 +180,41 @@ def test_old_generation_failure_snapshot_remains_queryable() -> None:
         assert response.json()["status"] == "failed"
         assert response.json()["files"][0]["error"]["code"] == "engine_dead"
         assert client.delete(f"/v1/parse/jobs/{route.public_id}").status_code == 409
+
+
+def test_old_generation_engine_dead_response_does_not_kill_replacement() -> None:
+    """旧请求迟到报告死亡时，不得把健康的新 generation 再次标记死亡。"""
+    from mineru.kit.router.proxy import request_upstream
+
+    async def scenario() -> None:
+        """响应处理之前模拟替换已发布，验证 notify 的 generation 条件。"""
+        state = workers.WorkerState(
+            "local",
+            "http://old",
+            "local",
+            generation=1,
+            healthy=True,
+            local_worker=SimpleNamespace(process=SimpleNamespace(poll=lambda: None)),
+        )
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            """旧网络请求返回前发布新代，随后返回旧代的 engine_dead。"""
+            state.generation = 2
+            state.base_url = "http://new"
+            state.healthy = True
+            return httpx.Response(503, json={"error": {"code": "engine_dead"}})
+
+        pool = workers.WorkerPool(workers.RouterSettings(local_gpus="none"), transport=httpx.MockTransport(handle))
+        try:
+            response = await request_upstream(pool, state, "GET", "/v1/health")
+            assert response.status_code == 503
+            assert state.healthy and not state.restart_requested
+        finally:
+            await pool.client.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_fatal_preload_uses_engine_dead_code() -> None:
+    """预加载期间死亡与推理期间死亡共享同一稳定错误码。"""
+    assert api_server._classify_model_preload_error(EngineDeadError("dead")) == ("engine_dead", "dead")
