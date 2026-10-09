@@ -134,7 +134,8 @@ Local Parse Server 的 usage 不表达计费周期，而是表达本地进程视
 - `billing_period.start` 是服务进程启动时间。
 - `billing_period.end` 为 `null`。
 - `current.*` 是自启动以来的累计值。
-- `limits.max_file_retention_days` 为 `null`，除非本地实现了自动清理策略。
+- `limits.max_file_retention_days` 默认 1；`retention_seconds` 为 0 时是 `null`，其他秒数按天向上取整展示。
+- 终态任务和产物默认保留 24 小时，清理后 `current.*` 累计用量不减少。具体配置和输入租约见 [服务说明](../cli/mineru-kit-api-server.md)。
 - `access_level` 取决于是否启用并通过 API Key 鉴权。
 
 本地 server 可以不实现公网同等级别的限流。若实现限流，也应复用同一错误 envelope、`Retry-After` 和 `X-RateLimit-*` 响应头。
