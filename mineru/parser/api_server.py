@@ -8,6 +8,7 @@ import base64
 import hashlib
 import io
 import json
+from importlib.resources import files as package_resources
 import logging
 import os
 import pathlib
@@ -31,7 +32,7 @@ import uvicorn
 from docvortex.assets import validate_image_sidecar_path
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Path, Query, Request, Response, status
 from fastapi.exceptions import RequestValidationError
-from fastapi.openapi.docs import get_swagger_ui_html, get_swagger_ui_oauth2_redirect_html
+from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html, get_swagger_ui_oauth2_redirect_html
 from fastapi_offline import FastAPIOffline
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
@@ -2681,7 +2682,7 @@ def create_app(
 
     app_factory = FastAPIOffline if enable_docs else FastAPI
     application = app_factory(
-        **({"static_url": "/docs/assets"} if enable_docs else {}),
+        **({"static_url": "/docs/assets/vendor"} if enable_docs else {}),
         title="MinerU API",
         description=_FASTAPI_DESCRIPTION,
         version="1.0.0",
@@ -2689,7 +2690,7 @@ def create_app(
         dependencies=[Depends(HTTPBearer(auto_error=False, description="Bearer API key when configured"))],
         openapi_url="/openapi.json" if enable_docs else None,
         docs_url=None,
-        redoc_url="/redoc" if enable_docs else None,
+        redoc_url=None,
         lifespan=_lifespan,
     )
     if enable_docs:
@@ -2701,11 +2702,32 @@ def create_app(
             return get_swagger_ui_html(
                 openapi_url=f"{root}/openapi.json",
                 title="MinerU API - Swagger UI",
-                swagger_js_url=f"{root}/docs/assets/swagger-ui-bundle.js",
-                swagger_css_url=f"{root}/docs/assets/swagger-ui.css",
-                swagger_favicon_url=f"{root}/docs/assets/favicon.png",
+                swagger_js_url=f"{root}/docs/assets/vendor/swagger-ui-bundle.js",
+                swagger_css_url=f"{root}/docs/assets/vendor/swagger-ui.css",
+                swagger_favicon_url=f"{root}/docs/assets/vendor/favicon.png",
                 oauth2_redirect_url=f"{root}/docs/oauth2-redirect",
             )
+
+        @application.get("/redoc", include_in_schema=False)
+        async def _offline_redoc(request: Request) -> Response:
+            """ReDoc 使用本地脚本、图标和字体，不请求远程品牌素材。"""
+            root = request.scope.get("root_path", "").rstrip("/")
+            return get_redoc_html(
+                openapi_url=f"{root}/openapi.json",
+                title="MinerU API - ReDoc",
+                redoc_js_url=f"{root}/docs/assets/redoc.standalone.js",
+                redoc_favicon_url=f"{root}/docs/assets/vendor/favicon.png",
+                with_google_fonts=False,
+            )
+
+        @application.get("/docs/assets/redoc.standalone.js", include_in_schema=False)
+        async def _offline_redoc_script() -> Response:
+            """沿用安装包内 ReDoc，替换其硬编码 CDN 图标为同包内嵌图标。"""
+            resources = package_resources("fastapi_offline").joinpath("static")
+            script = resources.joinpath("redoc.standalone.js").read_text(encoding="utf-8")
+            icon = base64.b64encode(resources.joinpath("favicon.png").read_bytes()).decode("ascii")
+            script = script.replace("https://cdn.redoc.ly/redoc/logo-mini.svg", f"data:image/png;base64,{icon}")
+            return Response(script, media_type="application/javascript")
 
         @application.get("/docs/oauth2-redirect", include_in_schema=False)
         async def _offline_oauth_redirect() -> Response:

@@ -21,8 +21,16 @@ def test_offline_docs_resources_and_proxy_paths(tmp_path: Path, monkeypatch: pyt
             assert "cdn.jsdelivr" not in response.text and "fonts.googleapis" not in response.text
         assert f"{root}/docs/oauth2-redirect" in client.get(root + "/docs").text
         assert client.get(root + "/docs/oauth2-redirect").status_code == 200
+        script = client.get(root + "/docs/assets/redoc.standalone.js").text
+        assert "https://cdn.redoc.ly/redoc/logo-mini.svg" not in script
+        assert "data:image/png;base64," in script
         for asset in ("swagger-ui-bundle.js", "swagger-ui.css", "redoc.standalone.js", "favicon.png"):
-            assert client.get(f"{root}/docs/assets/{asset}").status_code == 200
+            assert (
+                client.get(
+                    f"{root}/docs/assets/" + (asset if asset == "redoc.standalone.js" else f"vendor/{asset}")
+                ).status_code
+                == 200
+            )
         schema = client.get(root + "/openapi.json").json()
         assert schema["components"]["securitySchemes"]["HTTPBearer"]["scheme"] == "bearer"
         assert client.get(root + "/v1/files").status_code == 401
@@ -35,5 +43,5 @@ def test_disabled_docs_mount_no_resources(tmp_path: Path, monkeypatch: pytest.Mo
     monkeypatch.setenv("MINERU_API_ENABLE_FASTAPI_DOCS", "false")
     app = api_server.create_app(upload_dir=str(tmp_path), tier="flash")
     with TestClient(app) as client:
-        for path in ("/docs", "/redoc", "/openapi.json", "/docs/assets/favicon.png"):
+        for path in ("/docs", "/redoc", "/openapi.json", "/docs/assets/vendor/favicon.png"):
             assert client.get(path).status_code == 404
