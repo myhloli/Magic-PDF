@@ -55,6 +55,10 @@ class TaskUpload:
 class TaskBackend(Protocol):
     """便捷接口只依赖显式任务和文件操作，不维护独立队列。"""
 
+    def release_uploads(self) -> None:
+        """释放请求预检取得的输入租约，包括校验失败和取消路径。"""
+        ...
+
     async def find_upload(self, sha256sum: str, filename: str) -> TaskUpload | None:
         """查找当前调用方可复用的源字节。"""
         ...
@@ -378,9 +382,14 @@ def build_task_router(factory: Callable[[Request], TaskBackend]) -> APIRouter:
     async def create_task(request: Request) -> Response:
         """提交任务后立即返回公共 ID，缓存命中时不读取请求主体。"""
         backend = factory(request)
-        with tempfile.TemporaryDirectory(prefix="mineru-task-") as directory:
-            body, uploads, skipped = await _prepare_submission(request, backend, Path(directory), sync=False, force_zip=False)
-            job = await backend.submit(body, uploads)
+        try:
+            with tempfile.TemporaryDirectory(prefix="mineru-task-") as directory:
+                body, uploads, skipped = await _prepare_submission(
+                    request, backend, Path(directory), sync=False, force_zip=False
+                )
+                job = await backend.submit(body, uploads)
+        finally:
+            backend.release_uploads()
         return JSONResponse(
             task_payload(job),
             status_code=202,
@@ -430,11 +439,14 @@ def build_task_router(factory: Callable[[Request], TaskBackend]) -> APIRouter:
     ) -> Response:
         """同步包装共享异步任务，等待超时不取消后台工作。"""
         backend = factory(request)
-        with tempfile.TemporaryDirectory(prefix="mineru-task-") as directory:
-            body, uploads, skipped = await _prepare_submission(
-                request, backend, Path(directory), sync=True, force_zip=response_format == "zip"
-            )
-            job = await backend.submit(body, uploads)
+        try:
+            with tempfile.TemporaryDirectory(prefix="mineru-task-") as directory:
+                body, uploads, skipped = await _prepare_submission(
+                    request, backend, Path(directory), sync=True, force_zip=response_format == "zip"
+                )
+                job = await backend.submit(body, uploads)
+        finally:
+            backend.release_uploads()
         job = await backend.wait(job["job_id"], wait_timeout)
         response = await build_task_result(job, backend, response_format)
         if skipped and request.scope.get("http_version") == "1.1":
@@ -452,12 +464,22 @@ class ApiTaskBackend:
         self.request = request
         self.files: FileStore = request.app.state.file_store
         self.jobs: JobStore = request.app.state.job_store
+        self._cached_pins: list[str] = []
         self.access: AccessLevel = "registered" if request.app.state.api_key else "anonymous"
 
+    def release_uploads(self) -> None:
+        """释放当前请求的哈希预检引用，失败和取消同样经过此处。"""
+        for sha in self._cached_pins:
+            self.files.unpin_cached_blob(sha)
+        self._cached_pins.clear()
+
     async def find_upload(self, sha256sum: str, filename: str) -> TaskUpload | None:
-        """从内容寻址存储查询已有字节，并使用本次文件名。"""
-        path = self.files._blob_abs(sha256sum)
-        return TaskUpload(path, filename, path.stat().st_size, sha256sum) if path.is_file() else None
+        """原子查找并持有可复用字节，直到提交或输入校验完成。"""
+        path = self.files.pin_cached_blob(sha256sum)
+        if path is None:
+            return None
+        self._cached_pins.append(sha256sum)
+        return TaskUpload(path, filename, path.stat().st_size, sha256sum)
 
     async def submit(self, body: CreateJobRequest, uploads: dict[int, TaskUpload]) -> dict[str, Any]:
         """注册源字节后调用共享任务提交函数，失败时回滚文件视图。"""

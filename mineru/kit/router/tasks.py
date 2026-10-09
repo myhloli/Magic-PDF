@@ -6,6 +6,7 @@ import asyncio
 import json
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import ExitStack
 from typing import Any
 
 from fastapi import FastAPI, Request, Response
@@ -58,11 +59,19 @@ class RouterTaskBackend:
         self.sources: SourceFileStore = request.app.state.source_store
         self.registry: ResourceRegistry = request.app.state.registry
         self.pool: WorkerPool = request.app.state.worker_pool
+        self._input_pins = ExitStack()
+
+    def release_uploads(self) -> None:
+        """关闭预检阶段持有的输入引用，传输或校验失败也会释放。"""
+        self._input_pins.close()
 
     async def find_upload(self, sha256sum: str, filename: str) -> TaskUpload | None:
         """只复用本调用方在 Router 中仍持有的源字节。"""
         stored = self.sources.find_hash(self.owner_scope, sha256sum)
-        return TaskUpload(stored.path, filename, stored.bytes, stored.sha256sum, stored.mime_type) if stored else None
+        if stored is None:
+            return None
+        self._input_pins.enter_context(self.sources.pin(stored))
+        return TaskUpload(stored.path, filename, stored.bytes, stored.sha256sum, stored.mime_type)
 
     async def submit(self, body: CreateJobRequest, uploads: dict[int, TaskUpload]) -> dict[str, Any]:
         """委托共享提交服务，源字节传输也纳入相同的负载预占。"""

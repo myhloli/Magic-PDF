@@ -46,6 +46,7 @@ from .resources import (
     SourceFileStore,
     stored_file_chunks,
 )
+from ...utils.retention import RETENTION_SCAN_INTERVAL_SECONDS
 from .workers import RouterSettings, WorkerPool, WorkerState
 
 
@@ -306,6 +307,7 @@ async def _finalize_terminal_job(
     """在 Job 终态补齐 outputs，并回收或保留待重试的输入副本。"""
     if payload.get("status") not in {"completed", "partial", "failed", "canceled"}:
         return
+    route.metadata.setdefault("terminal_at", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
     try:
         await _hydrate_job_output_files(
             payload,
@@ -332,7 +334,7 @@ async def _finalize_terminal_job(
 
 async def _reconcile_jobs_once(registry: ResourceRegistry, pool: WorkerPool) -> None:
     """后台查询活动或待清理 Job，并统一执行终态资源收敛。"""
-    for route in registry.list("job"):
+    for route in registry.list("job", include_expired=True):
         if not route.metadata.get("active_counted") and not route.metadata.get("copied_inputs"):
             continue
         worker = pool.get(route.worker_id)
@@ -346,6 +348,9 @@ async def _reconcile_jobs_once(registry: ResourceRegistry, pool: WorkerPool) -> 
                 headers=headers,
             )
             if response.status_code >= 400:
+                cached = route.metadata.get("payload") or {}
+                if response.status_code == 404 and cached.get("status") in {"completed", "partial", "failed", "canceled"}:
+                    await _finalize_terminal_job(route, cached, request=None, pool=pool, registry=registry, headers=headers)
                 continue
             payload = json_or_error(response)
             rewritten = rewrite_job_payload(payload, worker, registry, pool, route.owner_scope)
@@ -380,8 +385,8 @@ def create_app(
 ) -> FastAPI:
     """创建完整代理 MinerU V1 资源面的 Router FastAPI 应用。"""
     resolved_settings = settings or RouterSettings.from_env()
-    registry = ResourceRegistry()
-    source_store = SourceFileStore()
+    registry = ResourceRegistry(resolved_settings.retention_seconds)
+    source_store = SourceFileStore(resolved_settings.retention_seconds)
 
     async def _invalidate_replaced_worker(worker: WorkerState) -> None:
         """在本地 worker replacement 发布前移除旧 generation 的资源状态。"""
@@ -420,7 +425,17 @@ def create_app(
         """启动 worker pool，并在应用关闭时释放全部网络和子进程资源。"""
         application.state.started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         reconcile_task: asyncio.Task[None] | None = None
+        collection_task: asyncio.Task[None] | None = None
+
+        async def collection_loop() -> None:
+            """每五分钟同步回收过期公共路由与无引用源文件缓存。"""
+            while True:
+                await asyncio.sleep(RETENTION_SCAN_INTERVAL_SECONDS)
+                registry.collect_expired(source_store)
+
         try:
+            if resolved_settings.retention_seconds:
+                collection_task = asyncio.create_task(collection_loop(), name="mineru-router-retention")
             await pool.start()
             if resolved_settings.worker_refresh_interval_seconds > 0:
                 reconcile_task = asyncio.create_task(
@@ -433,6 +448,9 @@ def create_app(
                 )
             yield
         finally:
+            if collection_task is not None:
+                collection_task.cancel()
+                await asyncio.gather(collection_task, return_exceptions=True)
             if reconcile_task is not None:
                 reconcile_task.cancel()
                 try:
@@ -545,7 +563,12 @@ def create_app(
                     cached, str(body.get("filename") or "input.bin"), worker, request=request, pool=pool, declaration=body
                 )
                 rewritten = rewrite_upload_payload(result, worker, registry, owner_scope)
-                source_store.bind_source(str(rewritten["file"]["id"]), cached, owner_scope=owner_scope)
+                source_store.bind_source(
+                    str(rewritten["file"]["id"]),
+                    cached,
+                    owner_scope=owner_scope,
+                    expires_at=rewritten["file"].get("expires_at"),
+                )
             return JSONResponse(rewritten)
         upstream_body = dict(body)
         # 本地未命中时必须收到源字节；仅凭 worker 的 blob 命中无法支持跨 worker 复制。
@@ -580,41 +603,42 @@ def create_app(
     async def upload_content(upload_id: str, request: Request) -> Response:
         """把上传内容流式暂存到 Router，再写入 upload 所属 worker。"""
         route = _route_or_404(registry, "upload", upload_id, _caller_scope(request))
-        upload_payload = route.metadata.get("payload")
-        upload_status = upload_payload.get("status") if isinstance(upload_payload, dict) else None
-        if source_store.is_bound_upload(upload_id) or upload_status == "completed":
-            raise RouterProxyError(409, "upload_already_completed", f"Upload {upload_id} is already completed")
-        if upload_status == "canceled":
-            raise RouterProxyError(409, "upload_already_canceled", f"Upload {upload_id} is already canceled")
-        worker = pool.get(route.worker_id)
-        declared = route.metadata.get("declared") if isinstance(route.metadata.get("declared"), dict) else {}
-        mime_type = str(declared.get("mime_type") or request.headers.get("content-type") or "application/octet-stream")
-        try:
-            stored = await source_store.stage_upload(upload_id, request.stream(), mime_type=mime_type)
-        except ValueError as exc:
-            raise RouterProxyError(409, "upload_not_writable", str(exc)) from exc
-        declared_bytes = declared.get("bytes")
-        if isinstance(declared_bytes, int) and stored.bytes != declared_bytes:
-            source_store.discard_upload(upload_id)
-            raise RouterProxyError(
-                400,
-                "upload_size_mismatch",
-                f"Expected {declared_bytes} upload bytes, received {stored.bytes}",
+        with registry.pin_route(route):
+            upload_payload = route.metadata.get("payload")
+            upload_status = upload_payload.get("status") if isinstance(upload_payload, dict) else None
+            if source_store.is_bound_upload(upload_id) or upload_status == "completed":
+                raise RouterProxyError(409, "upload_already_completed", f"Upload {upload_id} is already completed")
+            if upload_status == "canceled":
+                raise RouterProxyError(409, "upload_already_canceled", f"Upload {upload_id} is already canceled")
+            worker = pool.get(route.worker_id)
+            declared = route.metadata.get("declared") if isinstance(route.metadata.get("declared"), dict) else {}
+            mime_type = str(declared.get("mime_type") or request.headers.get("content-type") or "application/octet-stream")
+            try:
+                stored = await source_store.stage_upload(upload_id, request.stream(), mime_type=mime_type)
+            except ValueError as exc:
+                raise RouterProxyError(409, "upload_not_writable", str(exc)) from exc
+            declared_bytes = declared.get("bytes")
+            if isinstance(declared_bytes, int) and stored.bytes != declared_bytes:
+                source_store.discard_upload(upload_id)
+                raise RouterProxyError(
+                    400,
+                    "upload_size_mismatch",
+                    f"Expected {declared_bytes} upload bytes, received {stored.bytes}",
+                )
+            declared_sha256 = declared.get("sha256sum")
+            if isinstance(declared_sha256, str) and stored.sha256sum != declared_sha256:
+                source_store.discard_upload(upload_id)
+                raise RouterProxyError(400, "upload_sha256_mismatch", "Uploaded content SHA256 does not match request")
+            upstream = await request_upstream(
+                pool,
+                worker,
+                "PUT",
+                f"/v1/uploads/{route.upstream_id}/content",
+                request=request,
+                content=stored_file_chunks(stored.path),
+                headers={"content-type": "application/octet-stream"},
             )
-        declared_sha256 = declared.get("sha256sum")
-        if isinstance(declared_sha256, str) and stored.sha256sum != declared_sha256:
-            source_store.discard_upload(upload_id)
-            raise RouterProxyError(400, "upload_sha256_mismatch", "Uploaded content SHA256 does not match request")
-        upstream = await request_upstream(
-            pool,
-            worker,
-            "PUT",
-            f"/v1/uploads/{route.upstream_id}/content",
-            request=request,
-            content=stored_file_chunks(stored.path),
-            headers={"content-type": "application/octet-stream"},
-        )
-        return passthrough_response(upstream)
+            return passthrough_response(upstream)
 
     @application.post("/v1/uploads/{upload_id}/complete")
     async def complete_upload(upload_id: str, request: Request) -> Response:
@@ -642,7 +666,9 @@ def create_app(
         file_payload = rewritten.get("file")
         if not isinstance(file_payload, dict) or not isinstance(file_payload.get("id"), str):
             raise RouterProxyError(502, "invalid_upstream_response", "Completed upload did not return a file")
-        source_store.bind_file(upload_id, file_payload["id"], owner_scope=owner_scope)
+        source_store.bind_file(
+            upload_id, file_payload["id"], owner_scope=owner_scope, expires_at=file_payload.get("expires_at")
+        )
         return JSONResponse(rewritten, status_code=upstream.status_code)
 
     @application.post("/v1/uploads/{upload_id}/cancel")
@@ -856,7 +882,7 @@ def create_app(
                     public_id = str(rewritten["id"])
                     route = _route_or_404(registry, "file", public_id, owner_scope)
                     registered_inputs.append(route)
-                    source_store.bind_source(public_id, stored, owner_scope=owner_scope)
+                    source_store.bind_source(public_id, stored, owner_scope=owner_scope, expires_at=rewritten.get("expires_at"))
                     input_aliases[route.upstream_id] = public_id
                     files[index]["source"] = {"type": "file_id", "file_id": route.upstream_id}
                 for source, route in file_routes:

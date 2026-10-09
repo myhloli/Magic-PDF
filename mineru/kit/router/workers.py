@@ -23,6 +23,7 @@ from ...model.runtime.device import get_device
 from ...parser.process_control import ManagedProcessControl
 from ...types import SERVER_TIERS, ServerTier, Tier
 from ...utils.stdio import utf8_subprocess_env
+from ...utils.retention import resolve_retention_seconds
 
 DEFAULT_WORKER_REFRESH_INTERVAL_SECONDS = 2.0
 DEFAULT_WORKER_STARTUP_TIMEOUT_SECONDS = 300.0
@@ -134,10 +135,12 @@ class RouterSettings:
     worker_tier: ServerTier = "standard"
     worker_concurrency: int = 1
     preload_models: bool = False
+    retention_seconds: int | None = None
     worker_refresh_interval_seconds: float = DEFAULT_WORKER_REFRESH_INTERVAL_SECONDS
 
     def __post_init__(self) -> None:
         """校验 worker tier、并发数和刷新间隔。"""
+        object.__setattr__(self, "retention_seconds", resolve_retention_seconds(self.retention_seconds))
         if self.worker_tier not in SERVER_TIERS:
             raise ValueError(f"Unsupported worker tier: {self.worker_tier}")
         if self.worker_concurrency <= 0:
@@ -167,6 +170,7 @@ class RouterSettings:
 
     def apply_to_env(self) -> None:
         """把 Router 配置写入 reload 子进程可读取的环境变量。"""
+        os.environ["MINERU_API_RETENTION_SECONDS"] = str(self.retention_seconds)
         os.environ["MINERU_ROUTER_UPSTREAM_URLS_JSON"] = json.dumps(list(self.upstream_urls))
         os.environ["MINERU_ROUTER_LOCAL_GPUS"] = self.local_gpus
         os.environ["MINERU_ROUTER_WORKER_HOST"] = self.worker_host
@@ -205,6 +209,8 @@ class ManagedLocalWorker:
             self.settings.worker_tier,
             "--concurrency",
             str(self.settings.worker_concurrency),
+            "--retention-seconds",
+            str(self.settings.retention_seconds),
             "--log-level",
             "warning",
             *(["--preload-models"] if self.settings.preload_models else []),

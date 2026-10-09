@@ -1990,7 +1990,7 @@ def test_complete_upload_rejects_size_mismatch(tmp_path: Path) -> None:
 
 
 def test_get_upload_expires_pending_records_and_discards_staged_data(tmp_path: Path) -> None:
-    """expires_at 过后 pending 上传惰性转为 expired 终态并丢弃暂存数据，后续 PUT/complete 收到 409。"""
+    """上传到期后的新读取、写入和完成请求统一返回 404，并丢弃暂存数据。"""
     file_store = FileStore(tmp_path / "api-files")
     upload = file_store.create_upload(
         CreateUploadRequest.model_validate({"filename": "demo.pdf", "bytes": 4, "mime_type": "application/pdf"})
@@ -2001,20 +2001,19 @@ def test_get_upload_expires_pending_records_and_discards_staged_data(tmp_path: P
 
     file_store._uploads[upload.id].expires_at = int(time.time()) - 1
 
-    rec = file_store.get_upload(upload.id)
-
-    assert rec.status == "expired"
+    for operation in (
+        lambda: file_store.get_upload(upload.id),
+        lambda: file_store.store_upload_data(upload.id, b"demo"),
+        lambda: file_store.complete_upload(upload.id, None),
+    ):
+        with pytest.raises(api_server.ApiServerError) as exc_info:
+            operation()
+        assert exc_info.value.status_code == 404
     assert not staged.is_file()
-    with pytest.raises(api_server.ApiServerError) as exc_info:
-        file_store.store_upload_data(upload.id, b"demo")
-    assert exc_info.value.status_code == 409
-    with pytest.raises(api_server.ApiServerError) as exc_info:
-        file_store.complete_upload(upload.id, None)
-    assert exc_info.value.status_code == 409
 
 
-def test_get_upload_keeps_completed_records_after_expiry(tmp_path: Path) -> None:
-    """completed 是终态，expires_at 过后不再翻转，文件保留交给独立的 retention 机制。"""
+def test_get_upload_hides_completed_records_after_expiry(tmp_path: Path) -> None:
+    """已完成上传到期后同样不允许新的读取请求复用该上传视图。"""
     file_store = FileStore(tmp_path / "api-files")
     sha = "00" * 32
     file_store.store_blob(b"demo", sha256hex=sha)
@@ -2027,7 +2026,9 @@ def test_get_upload_keeps_completed_records_after_expiry(tmp_path: Path) -> None
 
     file_store._uploads[upload.id].expires_at = int(time.time()) - 1
 
-    assert file_store.get_upload(upload.id).status == "completed"
+    with pytest.raises(api_server.ApiServerError) as exc_info:
+        file_store.get_upload(upload.id)
+    assert exc_info.value.status_code == 404
 
 
 def test_run_job_preserves_input_file_id_and_keeps_source_undownloadable(
@@ -2610,9 +2611,7 @@ def test_api_server_model_preload_failure_keeps_health_diagnostics_and_rejects_c
 ) -> None:
     _stub_api_server_dependency_preflight(monkeypatch)
 
-    def _fail_preload(
-        startup_tier: DeploymentTier, *, vlm_config: VlmConfig | None = None
-    ) -> api_server._ModelPreloadResult:
+    def _fail_preload(startup_tier: DeploymentTier, *, vlm_config: VlmConfig | None = None) -> api_server._ModelPreloadResult:
         """模拟包含 VLM 初始化在内的服务预加载失败。"""
         raise ValueError("CUDA is not available.")
 
@@ -2637,9 +2636,7 @@ def test_api_server_model_preload_is_opt_in_and_ignored_for_flash(tmp_path: Path
     _stub_api_server_dependency_preflight(monkeypatch)
     calls: list[str] = []
 
-    def _preload(
-        startup_tier: DeploymentTier, *, vlm_config: VlmConfig | None = None
-    ) -> api_server._ModelPreloadResult:
+    def _preload(startup_tier: DeploymentTier, *, vlm_config: VlmConfig | None = None) -> api_server._ModelPreloadResult:
         """记录预加载调用，兼容显式 VLM 配置传入。"""
         calls.append(startup_tier)
         return api_server._ModelPreloadResult(tier=startup_tier, engine="test")

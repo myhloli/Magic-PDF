@@ -241,7 +241,7 @@ class _FakeV1Upstream:
             "object": "upload",
             "bytes": upload["bytes"],
             "created_at": 1,
-            "expires_at": 3601,
+            "expires_at": int(time.time()) + 3600,
             "filename": upload["filename"],
             "purpose": upload.get("purpose", "parse"),
             "mime_type": upload["mime_type"],
