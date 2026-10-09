@@ -81,6 +81,8 @@ def main() -> None:
         parser.error("PDF does not exist")
     os.environ["MINERU_DEVICE_MODE"] = "cpu"
     from mineru.config import config
+    import mineru
+    import docvortex
     from mineru import version
     import torch
 
@@ -92,6 +94,8 @@ def main() -> None:
         "platform": platform.platform(),
         "python": platform.python_version(),
         "mineru_version": version.__version__,
+        "mineru_source": str(Path(mineru.__file__).resolve()),
+        "docvortex_source": str(Path(docvortex.__file__).resolve()),
         "pdf_sha256": hashlib.sha256(args.pdf.read_bytes()).hexdigest(),
         "torch_intra_op_threads": torch.get_num_threads(),
         "thread_env": {
