@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -311,6 +312,10 @@ class WorkerState:
     max_concurrent_jobs: int = 1
     last_error: str | None = None
     generation: int = 0
+    restart_requested: bool = False
+    restart_failures: int = 0
+    retry_at: float = 0.0
+    refresh_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     @property
     def tiers(self) -> set[Tier]:
@@ -426,30 +431,48 @@ class WorkerPool:
         """并发刷新全部 worker 的 V1 health、tiers 与 models。"""
         await asyncio.gather(*(self.refresh(worker) for worker in self.workers))
 
+    def notify_engine_dead(self, worker: WorkerState) -> None:
+        """收到明确 engine_dead 后立即剔除；仅托管进程由 Router 负责恢复。"""
+        worker.healthy = False
+        worker.last_error = "engine_dead"
+        worker.restart_requested = worker.local_worker is not None
+
     async def refresh(self, worker: WorkerState) -> None:
-        """刷新单个 worker；本地进程退出时先尝试重启。"""
+        """序列化单 worker 的健康刷新，确保同一 generation 只替换一次。"""
+        async with worker.refresh_lock:
+            await self._refresh_worker(worker)
+
+    async def _refresh_worker(self, worker: WorkerState) -> None:
+        """复用启停超时重建死亡进程，启动失败按 5/10/20/30 秒退避。"""
         if worker.local_worker is not None:
             process = worker.local_worker.process
-            if process is None or process.poll() is not None:
+            if worker.restart_requested or process is None or process.poll() is not None:
+                worker.healthy = False
+                if time.monotonic() < worker.retry_at:
+                    return
                 try:
-                    replacing = worker.generation > 0 and process is not None
+                    replacing = worker.generation > 0 and (process is not None or worker.restart_requested)
                     if replacing:
-                        worker.healthy = False
                         worker.base_url = ""
-                        worker.active_jobs = 0
                         worker.tier_metadata.clear()
                         worker.models.clear()
                         worker.features.clear()
                         await worker.local_worker.stop()
                         if self._on_local_worker_replaced is not None:
                             await self._on_local_worker_replaced(worker)
+                        worker.active_jobs = 0
                         worker.generation += 1
+                        worker.restart_requested = False
                     await worker.local_worker.start(self.client)
                     worker.base_url = worker.local_worker.base_url
                     worker.generation = max(worker.generation, 1)
+                    worker.restart_failures = 0
+                    worker.retry_at = 0.0
                 except Exception as exc:
-                    worker.healthy = False
                     worker.last_error = str(exc)
+                    delay = (5, 10, 20, 30)[min(worker.restart_failures, 3)]
+                    worker.restart_failures += 1
+                    worker.retry_at = time.monotonic() + delay
                     return
         try:
             health, tiers, models = await asyncio.gather(
@@ -457,12 +480,13 @@ class WorkerPool:
                 self.client.get(f"{worker.base_url}/v1/tiers"),
                 self.client.get(f"{worker.base_url}/v1/models"),
             )
+            if health.status_code == 503 and (health.json().get("error") or {}).get("code") == "engine_dead":
+                self.notify_engine_dead(worker)
+                return
             health.raise_for_status()
             tiers.raise_for_status()
             models.raise_for_status()
-            health_payload = health.json()
-            tier_payload = tiers.json()
-            model_payload = models.json()
+            health_payload, tier_payload, model_payload = health.json(), tiers.json(), models.json()
             worker.features = dict(health_payload.get("features") or {})
             worker.tier_metadata = {
                 cast(Tier, item["id"]): dict(item) for item in tier_payload.get("data", []) if item.get("id")

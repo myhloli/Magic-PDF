@@ -412,3 +412,34 @@ def test_vllm_runtime_uses_standard_progress_label(
     finally:
         runtime.shutdown()
         image.close()
+
+
+def test_fatal_runtime_latches_and_rejects_new_inference(native_runtime: AsyncVlmPredictor) -> None:
+    """明确引擎死亡锁定本地运行时和所属应用，后续操作不再调用旧引擎。"""
+    from mineru.model.vlm.errors import EngineDeadError
+
+    owner = RuntimeOwner()
+    native_runtime.owners.add(owner)
+
+    async def fatal() -> None:
+        """模拟引擎自身报告死亡。"""
+        raise EngineDeadError("dead")
+
+    with pytest.raises(EngineDeadError):
+        asyncio.run(native_runtime._acall(fatal))
+    assert owner.engine_error == "dead"
+    with pytest.raises(EngineDeadError):
+        native_runtime.batch_two_step_extract([1])
+    assert native_runtime._predictor.active == 0
+
+
+def test_ordinary_runtime_error_does_not_latch(native_runtime: AsyncVlmPredictor) -> None:
+    """包含 EngineCore 的普通解析错误不影响下次推理。"""
+
+    async def invalid() -> None:
+        """模拟普通调用错误。"""
+        raise ValueError("EngineCore invalid input")
+
+    with pytest.raises(ValueError):
+        asyncio.run(native_runtime._acall(invalid))
+    assert native_runtime.batch_two_step_extract([1]) == [1]

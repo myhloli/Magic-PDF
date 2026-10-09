@@ -385,6 +385,24 @@ def create_app(
 
     async def _invalidate_replaced_worker(worker: WorkerState) -> None:
         """在本地 worker replacement 发布前移除旧 generation 的资源状态。"""
+        for route in registry.list("job"):
+            if route.worker_id != worker.worker_id:
+                continue
+            payload = route.metadata.get("payload")
+            if not isinstance(payload, dict) or payload.get("status") in {"completed", "partial", "failed", "canceled"}:
+                continue
+            release_job_load(route, pool)
+            route.metadata["upstream_lost"] = True
+            payload["status"] = "failed"
+            payload["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            for file in payload.get("files") or []:
+                if file.get("status") != "completed":
+                    file["status"] = "failed"
+                    file["error"] = {"type": "engine_error", "code": "engine_dead", "message": "Worker engine was replaced"}
+            progress = payload.get("progress")
+            if isinstance(progress, dict):
+                progress["failed"] = progress.get("total", 0) - progress.get("completed", 0)
+            route.metadata.pop("copied_inputs", None)
         for route in registry.remove_worker(worker.worker_id):
             if route.kind == "upload":
                 source_store.discard_upload(route.public_id)
@@ -916,6 +934,8 @@ def create_app(
         """查询 Router job 所属 worker 的最新状态并重写所有资源标识。"""
         owner_scope = _caller_scope(request)
         route = _route_or_404(registry, "job", job_id, owner_scope)
+        if route.metadata.get("upstream_lost"):
+            return JSONResponse(route.metadata["payload"])
         worker = pool.get(route.worker_id)
         upstream = await request_upstream(pool, worker, "GET", f"/v1/parse/jobs/{route.upstream_id}", request=request)
         result = _successful_json(upstream)
@@ -935,6 +955,8 @@ def create_app(
     async def cancel_job(job_id: str, request: Request) -> Response:
         """取消 Router job，并保持公共 job ID。"""
         route = _route_or_404(registry, "job", job_id, _caller_scope(request))
+        if route.metadata.get("upstream_lost"):
+            raise RouterProxyError(409, "job_already_terminal", "Job is failed")
         worker = pool.get(route.worker_id)
         upstream = await request_upstream(pool, worker, "DELETE", f"/v1/parse/jobs/{route.upstream_id}", request=request)
         result = _successful_json(upstream)

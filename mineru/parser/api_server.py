@@ -50,6 +50,7 @@ from ..filetypes import (
 from ..types import SERVER_TIERS, TIERS_BY_SERVER_TIER, DeploymentTier, PageInfo, ServerTier, Tier, select_default_quality_tier
 from ..utils.async_utils import drain_future, run_sync
 from ..model.vlm.async_runtime import RuntimeOwner, runtime_owner
+from ..model.vlm.errors import is_fatal_engine_error
 from ..utils.logger import configure_global_log_level
 from ..utils.stdio import configure_standard_streams
 from ..version import __version__
@@ -1161,8 +1162,34 @@ class JobStore:
         self._closing = False
         self.runtime_owner = RuntimeOwner()
 
+    def fail_engine(self, message: str) -> None:
+        """锁定失败状态并取消未结束任务，用户取消的任务保持原终态。"""
+        if self.runtime_owner.engine_error is None:
+            self.runtime_owner.engine_error = message
+        current = asyncio.current_task()
+        for job_id, task in tuple(self._tasks.items()):
+            rec = self._jobs[job_id]
+            if task.done() or rec.status == "canceled":
+                continue
+            rec.status = "failed"
+            for file in rec.files:
+                if file.status != "completed":
+                    file.status = "failed"
+                    file.error = ErrorDetail(type="engine_error", code="engine_dead", message=message)
+            rec.progress.failed = rec.progress.total - rec.progress.completed
+            if task is not current and not task.cancelling():
+                task.cancel()
+
+    def require_ready(self) -> None:
+        """健康和提交入口共用引擎死亡状态及现有错误封装。"""
+        message = self.runtime_owner.engine_error
+        if message is not None:
+            self.fail_engine(message)
+            _raise_api_error(503, error_type="engine_error", code="engine_dead", message=message)
+
     def start_task(self, rec: _JobRecord, operation: Callable[[], Awaitable[None]]) -> None:
         """保存真实后台任务及所属应用租约，排队取消也不会开始解析。"""
+        self.require_ready()
         if self._closing:
             _raise_api_error(503, error_type="engine_error", code="server_shutting_down", message="Server is shutting down")
         self._completion_events[rec.id] = asyncio.Event()
@@ -1172,10 +1199,11 @@ class JobStore:
             token = runtime_owner.set(self.runtime_owner)
             try:
                 async with self._semaphore:
-                    if rec.status != "canceled":
+                    if rec.status == "queued":
                         await operation()
             except asyncio.CancelledError:
-                rec.status = "canceled"
+                if rec.status != "failed":
+                    rec.status = "canceled"
                 raise
             finally:
                 runtime_owner.reset(token)
@@ -1485,6 +1513,7 @@ async def _run_job(
     max_url_bytes: int = _MAX_FILE_SIZE_BYTES_DEFAULT,
     flash_enabled: bool = True,
     vlm_config: VlmConfig | None = None,
+    job_store: JobStore | None = None,
 ) -> None:
     """执行解析任务，使用所属服务的 VLM 配置并记录每个文件的成功或失败。"""
     if rec.status == "canceled":
@@ -1494,7 +1523,7 @@ async def _run_job(
 
     with tempfile.TemporaryDirectory(prefix="mineru_job_") as tmpdir:
         for i, entry in enumerate(req.files):
-            if rec.status == "canceled":
+            if rec.status in {"canceled", "failed"}:
                 break
             fr = rec.files[i]
             try:
@@ -1546,7 +1575,7 @@ async def _run_job(
                     vlm_config=vlm_config,
                 )
 
-                if rec.status == "canceled":
+                if rec.status in {"canceled", "failed"}:
                     break
                 # collect outputs
                 out_formats = set(rec.output_formats)
@@ -1599,7 +1628,10 @@ async def _run_job(
                 rec.progress.completed += 1
 
             except Exception as exc:
-                if rec.status == "canceled":
+                if job_store is not None and is_fatal_engine_error(exc):
+                    job_store.fail_engine(str(exc))
+                    raise
+                if rec.status in {"canceled", "failed"}:
                     break
                 logger.exception(
                     "Parse-server job file failed: job_id=%s file=%r tier=%s page_range=%r",
@@ -1615,7 +1647,7 @@ async def _run_job(
                     fr.error = ErrorDetail(type="engine_error", code="parse_failed", message=str(exc))
                 rec.progress.failed += 1
 
-    if rec.status != "canceled":
+    if rec.status not in {"canceled", "failed"}:
         if rec.progress.failed == rec.progress.total:
             rec.status = "failed"
         elif rec.progress.failed > 0:
@@ -1671,6 +1703,7 @@ _ERR_503: _ErrorResponseMap = {503: {"model": ErrorResponse}}
 
 
 def _require_model_preload_ready(request: Request) -> None:
+    request.app.state.job_store.require_ready()
     preload_error: _ModelPreloadError | None = request.app.state.model_preload_error
     if preload_error is None:
         return
@@ -2034,6 +2067,7 @@ async def submit_parse_job(
             max_url_bytes=max_url_bytes_val,
             flash_enabled=flash_enabled_val,
             vlm_config=vlm_config_val,
+            job_store=job_store,
         )
 
     job_store.start_task(rec, _bg_run)

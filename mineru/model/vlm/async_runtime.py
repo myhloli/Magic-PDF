@@ -11,6 +11,7 @@ from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from ...utils.async_utils import drain_future, run_sync
+from .errors import EngineDeadError, is_fatal_engine_error
 
 if TYPE_CHECKING:
     from mineru_vl_utils import MinerUClient
@@ -26,6 +27,7 @@ class RuntimeOwner:
     def __init__(self) -> None:
         """记录关闭状态，阻止已关闭应用重新取得模型。"""
         self.closed = False
+        self.engine_error: str | None = None
 
 
 runtime_owner: ContextVar[RuntimeOwner | None] = ContextVar("mineru_vlm_runtime_owner", default=None)
@@ -72,6 +74,7 @@ class AsyncVlmPredictor:
         self._ready: concurrent.futures.Future[None] = concurrent.futures.Future()
         self._state_lock = threading.Lock()
         self._closing = False
+        self._fatal_error: BaseException | None = None
         self._shutdown_lock = threading.Lock()
         self._submissions: set[_Submission] = set()
         self._thread = threading.Thread(target=self._serve, name=f"mineru-{backend}", daemon=True)
@@ -122,7 +125,21 @@ class AsyncVlmPredictor:
 
         async def execute() -> T:
             """在所属循环执行调用级操作，不占用等待线程。"""
-            return await operation()
+            try:
+                if self._fatal_error is not None:
+                    raise EngineDeadError(str(self._fatal_error)) from self._fatal_error
+                return await operation()
+            except Exception as exc:
+                if self.backend != "http-client" and is_fatal_engine_error(exc):
+                    with self._state_lock:
+                        if self._fatal_error is None:
+                            self._fatal_error = exc
+                        for owner in tuple(self.owners):
+                            owner.engine_error = str(exc)
+                        owner = runtime_owner.get()
+                        if owner is not None:
+                            owner.engine_error = str(exc)
+                raise
 
         def finish(task: asyncio.Task[T]) -> None:
             """底层任务退出后才发布结果和清理完成信号。"""
@@ -143,6 +160,8 @@ class AsyncVlmPredictor:
                 submission.task.cancel()
 
         with self._state_lock:
+            if self._fatal_error is not None:
+                raise EngineDeadError(str(self._fatal_error)) from self._fatal_error
             if self._closing:
                 raise RuntimeError("VLM runtime is shutting down")
             self._loop.call_soon_threadsafe(start)

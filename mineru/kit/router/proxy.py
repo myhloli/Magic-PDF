@@ -86,7 +86,7 @@ async def request_upstream(
         outgoing_headers["content-type"] = "application/json"
     outgoing_headers.update(headers or {})
     try:
-        return await pool.client.request(
+        response = await pool.client.request(
             method,
             f"{worker.base_url}{path}",
             json=json_body,
@@ -94,6 +94,13 @@ async def request_upstream(
             headers=outgoing_headers,
             follow_redirects=follow_redirects,
         )
+        if response.status_code == 503:
+            try:
+                if (response.json().get("error") or {}).get("code") == "engine_dead":
+                    pool.notify_engine_dead(worker)
+            except (ValueError, AttributeError):
+                pass
+        return response
     except httpx.TimeoutException as exc:
         raise RouterProxyError(504, "upstream_timeout", f"Upstream {worker.worker_id} timed out") from exc
     except httpx.HTTPError as exc:

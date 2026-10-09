@@ -311,7 +311,7 @@ class ResourceRegistry:
         removed: list[ResourceRoute] = []
         for routes in self._by_public.values():
             for public_id, route in list(routes.items()):
-                if route.worker_id != worker_id:
+                if route.worker_id != worker_id or route.metadata.get("upstream_lost"):
                     continue
                 removed.append(route)
                 routes.pop(public_id, None)
