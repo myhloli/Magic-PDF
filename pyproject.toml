@@ -64,6 +64,7 @@ dependencies = [
     "aiosqlite>=0.20.0,<1",
     "watchfiles>=1.0.0,<2",
     "fastapi",
+    "fastapi-offline>=1.7.7,<2",
     "python-multipart",
     "uvicorn",
     "pydantic>=2.12.5,<3",

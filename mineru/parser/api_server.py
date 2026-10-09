@@ -30,8 +30,11 @@ import uvicorn
 from docvortex.assets import validate_image_sidecar_path
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Path, Query, Request, Response, status
 from fastapi.exceptions import RequestValidationError
+from fastapi.openapi.docs import get_swagger_ui_html, get_swagger_ui_oauth2_redirect_html
+from fastapi_offline import FastAPIOffline
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.datastructures import State
 
@@ -723,8 +726,13 @@ class FileStore:
         # sha256sum dedup
         if req.sha256sum and self.blob_exists(req.sha256sum):
             if self._blob_abs(req.sha256sum).stat().st_size != req.bytes:
-                _raise_api_error(400, error_type="invalid_request_error", code="upload_size_mismatch",
-                                 message="Declared size does not match the cached file", param="bytes")
+                _raise_api_error(
+                    400,
+                    error_type="invalid_request_error",
+                    code="upload_size_mismatch",
+                    message="Declared size does not match the cached file",
+                    param="bytes",
+                )
             file_id = self._new_file_id()
             self._files[file_id] = _FileRecord(
                 id=file_id,
@@ -2440,16 +2448,39 @@ def create_app(
 
     enable_docs = _env_flag("MINERU_API_ENABLE_FASTAPI_DOCS", default=True)
 
-    application = FastAPI(
+    app_factory = FastAPIOffline if enable_docs else FastAPI
+    application = app_factory(
+        **({"static_url": "/docs/assets"} if enable_docs else {}),
         title="MinerU API",
         description=_FASTAPI_DESCRIPTION,
         version="1.0.0",
         openapi_tags=_OPENAPI_TAGS,
+        dependencies=[Depends(HTTPBearer(auto_error=False, description="Bearer API key when configured"))],
         openapi_url="/openapi.json" if enable_docs else None,
-        docs_url="/docs" if enable_docs else None,
+        docs_url=None,
         redoc_url="/redoc" if enable_docs else None,
         lifespan=_lifespan,
     )
+    if enable_docs:
+
+        @application.get("/docs", include_in_schema=False)
+        async def _offline_swagger(request: Request) -> Response:
+            """使用安装包内资源，并为反向代理补全 OAuth 回调的路径前缀。"""
+            root = request.scope.get("root_path", "").rstrip("/")
+            return get_swagger_ui_html(
+                openapi_url=f"{root}/openapi.json",
+                title="MinerU API - Swagger UI",
+                swagger_js_url=f"{root}/docs/assets/swagger-ui-bundle.js",
+                swagger_css_url=f"{root}/docs/assets/swagger-ui.css",
+                swagger_favicon_url=f"{root}/docs/assets/favicon.png",
+                oauth2_redirect_url=f"{root}/docs/oauth2-redirect",
+            )
+
+        @application.get("/docs/oauth2-redirect", include_in_schema=False)
+        async def _offline_oauth_redirect() -> Response:
+            """保留 Swagger 的本地 OAuth 授权回调页。"""
+            return get_swagger_ui_oauth2_redirect_html()
+
     application.state.upload_dir = _upload_dir
     application.state.tier = tier
     application.state.default_tier = default_tier
@@ -2511,6 +2542,9 @@ def create_app(
 
     async def _auth_middleware(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
         path = request.url.path
+        root = request.scope.get("root_path", "").rstrip("/")
+        if root and path.startswith(root + "/"):
+            path = path[len(root) :]
         if path in _PUBLIC_PATHS or any(path.startswith(p) for p in _PUBLIC_PREFIXES) or path.startswith("/v1/models/"):
             return await call_next(request)
         api_key = (request.app.state.api_key or "").strip()
