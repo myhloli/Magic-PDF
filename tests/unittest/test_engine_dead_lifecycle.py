@@ -180,6 +180,23 @@ def test_old_generation_failure_snapshot_remains_queryable() -> None:
         assert response.json()["status"] == "failed"
         assert response.json()["files"][0]["error"]["code"] == "engine_dead"
         assert client.delete(f"/v1/parse/jobs/{route.public_id}").status_code == 409
+        pool._workers = {state.worker_id: state}
+        created = client.post(
+            "/v1/parse/jobs",
+            json={
+                "tier": "standard",
+                "files": [{"source": {"type": "inline", "name": "recovered.pdf", "data": base64.b64encode(b"pdf").decode()}}],
+            },
+        )
+        assert created.status_code == 202, created.text
+        new_job = created.json()["job_id"]
+        assert registry.get("job", new_job).worker_id == state.worker_id
+        completed = client.get(f"/v1/parse/jobs/{new_job}")
+        assert completed.json()["status"] == "completed"
+        output = completed.json()["files"][0]["output_files"]["markdown"]["file_id"]
+        assert client.get(f"/v1/files/{output}/content").content == b"result"
+        assert state.active_jobs == 0
+        assert client.get(f"/v1/parse/jobs/{route.public_id}").json()["status"] == "failed"
 
 
 def test_old_generation_engine_dead_response_does_not_kill_replacement() -> None:
