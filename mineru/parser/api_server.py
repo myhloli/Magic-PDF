@@ -1,11 +1,5 @@
 # Copyright (c) Opendatalab. All rights reserved.
-"""MinerU v1 REST API — Pydantic models and FastAPI route definitions.
-
-The API surface defined here matches the NEW-API.md specification.
-All route handlers are stubs (raise 501 Not Implemented) — only the
-contract (models, path/query params, response schemas, status codes)
-is defined.  Business logic belongs in downstream integration modules.
-"""
+"""MinerU V1 解析服务：上传资源、统一后台任务与 HTTP 接口。"""
 
 from __future__ import annotations
 
@@ -679,10 +673,40 @@ class FileStore:
         return self._blob_abs(sha256hex).is_file()
 
     def store_blob(self, data: bytes, *, sha256hex: str) -> None:
+        """原子写入已校验的内容，避免并发读取尚未写完的 blob。"""
         p = self._blob_abs(sha256hex)
         if not p.is_file():
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_bytes(data)
+            temporary = p.with_name(p.name + "." + secrets.token_hex(8))
+            try:
+                temporary.write_bytes(data)
+                os.replace(temporary, p)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+    def register_source_file(self, filename: str, path: pathlib.Path, sha256sum: str, file_id: str | None = None) -> str:
+        """从已校验的暂存文件原子注册源字节及独立的文件名视图。"""
+        target = self._blob_abs(sha256sum)
+        if not target.is_file():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = target.with_name(target.name + "." + secrets.token_hex(8))
+            try:
+                shutil.copyfile(path, temporary)
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
+        now = int(time.time())
+        file_id = file_id or self._new_file_id()
+        self._files[file_id] = _FileRecord(
+            id=file_id,
+            filename=filename,
+            bytes=target.stat().st_size,
+            created_at=now,
+            purpose="parse",
+            sha256sum=sha256sum,
+            expires_at=now + 3600,
+        )
+        return file_id
 
     def read_blob(self, sha256hex: str) -> bytes:
         p = self._blob_abs(sha256hex)
@@ -698,6 +722,9 @@ class FileStore:
 
         # sha256sum dedup
         if req.sha256sum and self.blob_exists(req.sha256sum):
+            if self._blob_abs(req.sha256sum).stat().st_size != req.bytes:
+                _raise_api_error(400, error_type="invalid_request_error", code="upload_size_mismatch",
+                                 message="Declared size does not match the cached file", param="bytes")
             file_id = self._new_file_id()
             self._files[file_id] = _FileRecord(
                 id=file_id,
@@ -1122,6 +1149,7 @@ class JobStore:
         self._semaphore = asyncio.Semaphore(self._concurrency)
         self._started_at = JobStore._now()
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._completion_events: dict[str, asyncio.Event] = {}
         self._closing = False
         self.runtime_owner = RuntimeOwner()
 
@@ -1129,6 +1157,7 @@ class JobStore:
         """保存真实后台任务及所属应用租约，排队取消也不会开始解析。"""
         if self._closing:
             _raise_api_error(503, error_type="engine_error", code="server_shutting_down", message="Server is shutting down")
+        self._completion_events[rec.id] = asyncio.Event()
 
         async def run_owned() -> None:
             """在整个任务期间传播应用租约，并直到清理完成才释放 job 名额。"""
@@ -1153,10 +1182,22 @@ class JobStore:
                     logger.error("Parse job task failed: %s", rec.id, exc_info=(type(error), error, error.__traceback__))
                     if rec.status != "canceled":
                         rec.status = "failed"
+            self._completion_events[rec.id].set()
 
         task = asyncio.create_task(run_owned(), name=f"mineru-job-{rec.id}")
         self._tasks[rec.id] = task
         task.add_done_callback(finished)
+
+    async def wait_for_terminal(self, job_id: str, timeout: float) -> _JobRecord:
+        """只等待完成通知，超时或等待方取消不会传播到后台解析任务。"""
+        rec = self.get(job_id)
+        event = self._completion_events.get(job_id)
+        if event is not None:
+            try:
+                await asyncio.wait_for(event.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                pass
+        return rec
 
     async def shutdown(self) -> None:
         """停止接单并等待所有任务清理，再释放应用持有的推理运行时。"""
@@ -1584,6 +1625,7 @@ _router = APIRouter(prefix="/v1")
 
 # OpenAPI tag metadata: drives the group order and descriptions on /docs.
 _OPENAPI_TAGS: list[dict[str, str]] = [
+    {"name": "Tasks", "description": "One-request parsing, asynchronous tasks and inline or ZIP results."},
     {"name": "Health", "description": "Liveness and server readiness."},
     {"name": "Tiers", "description": "Parsing tiers and runtime capability advertised by this server."},
     {"name": "Models", "description": "VLM models available for parsing."},
@@ -1596,7 +1638,9 @@ _OPENAPI_TAGS: list[dict[str, str]] = [
 _FASTAPI_DESCRIPTION = """\
 Parse documents into structured Middle JSON via self-hosted or remote capacity.
 
-The workflow is: create an upload, complete it, submit a parse job for the
+Use `/v1/file_parse` for a synchronous result or `/v1/tasks` for a one-request
+asynchronous submission. Both share the existing parse job lifecycle.
+The resource workflow remains: create an upload, complete it, submit a parse job for the
 resulting file, then poll the job and fetch its outputs. Health and usage
 endpoints report server readiness and quota state. Tiers (`flash`, `basic`,
 `standard`, `advanced`) select the quality/speed trade-off; the set advertised
@@ -1870,27 +1914,14 @@ async def delete_file(
 # ── Parse Jobs ───────────────────────────────────────────────────────
 
 
-@_router.post(
-    "/parse/jobs",
-    response_model=None,
-    status_code=status.HTTP_202_ACCEPTED,
-    responses={
-        202: {"model": JobAsyncResponse},
-        **_ERR_400,
-        **_ERR_403,
-        **_ERR_429,
-        **_ERR_503,
-    },
-    tags=["Jobs"],
-)
-async def create_job(
+async def submit_parse_job(
     body: CreateJobRequest,
     request: Request,
-    file_store: FileStore = Depends(_get_store),
-    job_store: JobStore = Depends(_get_job_store),
-    access_level: AccessLevel = Depends(_resolve_access_level),
-) -> Response:
-    """Create a parse job."""
+    file_store: FileStore,
+    job_store: JobStore,
+    access_level: AccessLevel,
+) -> _JobRecord:
+    """统一校验并提交后台解析任务，供 V1 Job 与便捷入口共同调用。"""
     for index, entry in enumerate(body.files):
         try:
             entry.page_range = normalize_page_range_input(entry.page_range) or None
@@ -1998,6 +2029,31 @@ async def create_job(
         )
 
     job_store.start_task(rec, _bg_run)
+    return rec
+
+
+@_router.post(
+    "/parse/jobs",
+    response_model=None,
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={
+        202: {"model": JobAsyncResponse},
+        **_ERR_400,
+        **_ERR_403,
+        **_ERR_429,
+        **_ERR_503,
+    },
+    tags=["Jobs"],
+)
+async def create_job(
+    body: CreateJobRequest,
+    request: Request,
+    file_store: FileStore = Depends(_get_store),
+    job_store: JobStore = Depends(_get_job_store),
+    access_level: AccessLevel = Depends(_resolve_access_level),
+) -> Response:
+    """通过共享任务服务创建 V1 Job，保持既有响应结构。"""
+    rec = await submit_parse_job(body, request, file_store, job_store, access_level)
     return JSONResponse(
         content=job_store.build_response(rec, access_level=access_level).model_dump(by_alias=True), status_code=202
     )
@@ -2474,6 +2530,9 @@ def create_app(
 
     application.middleware("http")(_auth_middleware)
     application.include_router(_build_v1_router())
+    from .task_api import ApiTaskBackend, build_task_router
+
+    application.include_router(build_task_router(ApiTaskBackend))
     return application
 
 

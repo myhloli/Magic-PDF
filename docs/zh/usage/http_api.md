@@ -1,4 +1,4 @@
-# V1 HTTP API 完整示例
+# V1 HTTP API
 
 自部署 V1 API 与 Python SDK、WebUI 使用同一套接口。本页说明一次完整请求周期——创建上传、上传字节、提交解析任务、轮询到终态、下载产物——并指向一个经过测试的示例脚本。Python 客户端见 [Python SDK](sdk_api.md)。
 
@@ -7,6 +7,35 @@
 ```bash
 mineru-kit api-server --host 127.0.0.1 --port 8000 --tier standard
 ```
+
+## 一次请求解析与异步 tasks
+
+API server 和 Router 都提供 `/v1/tasks`、`/v1/file_parse`，与现有 Job 共用后台解析和任务 ID：
+
+```bash
+curl -sS 'http://127.0.0.1:8000/v1/file_parse?tier=flash&ocr_mode=txt' \
+  -F 'files=@document.pdf' -o result.json
+
+curl -sS 'http://127.0.0.1:8000/v1/file_parse?tier=flash&response_format=zip' \
+  -F 'files=@document.pdf' -o result.zip
+
+MINERU_API_URL=http://127.0.0.1:8002 MODE=async RESPONSE_FORMAT=zip \
+  bash scripts/http_task_example.sh document.pdf
+```
+
+同步等待默认 300 秒，`wait_timeout` 支持 1–3600 秒；超时返回 `202` 和 `task_id/status_url/result_url`，任务继续执行。
+异步提交使用 `POST /v1/tasks`，通过返回的 V1 地址查询状态和结果。JSON 内联 `files[].content`，同时保留逐文件错误和产物引用。
+异步 ZIP 必须提交时请求 `output_formats=zip`；同步 ZIP 自动请求。部分成功返回 `200` 和 `partial`，批量 ZIP 含分目录产物及 manifest。
+
+上传可以是 multipart 或原始字节，也可使用与 V1 Job 相同的 JSON 来源。上传解析参数放查询串，JSON 参数放主体。
+每文件最多 200 MiB，每任务最多 100 文件；批量上传共用页范围，逐文件配置使用 JSON。原始字节需提供 `filename` 和 `Content-Length`。
+上述脚本自动计算 SHA-256 并使用 `Expect: 100-continue`；命中缓存且及时响应时，可跳过主体传输。
+代理缓冲和客户端等待预算会影响省流量效果；直接复用 `file_id` 或现有 uploads 预检仍可可靠避免重复上传。
+
+Router 的 V1 上传和便捷上传共享按调用方隔离的源字节缓存。上传按负载分配、同负载轮询；任务在上游网络等待前预占名额。
+文件归属仅在最低负载候选中享有优先权，哈希命中也不能把任务固定到繁忙 worker。
+一个批量任务仍整体交给一台 API，需要多 worker 并行时提交多个独立任务。
+外置 worker 当前按容量 1 计权；本地 worker 容量来自 `--worker-concurrency`。这些路由属于当前自部署服务，云端支持情况以具体部署为准。
 
 ## 经过测试的示例脚本
 
@@ -60,4 +89,4 @@ export MINERU_API_KEY=secret-key        # 匿名本地访问时省略
 - `--concurrency` 限制并发解析任务数；超出后表现为 `queued` 时间变长，而不是失败。
 - `GET /v1/usage` 报告用量。用 `/v1/health` 和 `/docs`（启用时）的 OpenAPI 文档区分服务端故障与客户端错误；重试 `failed` 任务前先查看服务端日志。
 
-V1 服务不提供旧 `/file_parse`、`/tasks` 路由；旧客户端迁移见[迁移指南](../reference/migration_4.md)。
+便捷解析使用 `/v1/file_parse`、`/v1/tasks`；根路径旧接口不提供，旧客户端迁移见[迁移指南](../reference/migration_4.md)。

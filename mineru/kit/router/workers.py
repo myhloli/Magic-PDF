@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import os
 import socket
@@ -14,7 +13,7 @@ import tempfile
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import httpx
 from loguru import logger
@@ -319,8 +318,24 @@ class WorkerState:
         return set(self.tier_metadata)
 
 
+@dataclass
+class JobReservation:
+    """持有特定 worker generation 的一次提交预占，释放操作保持幂等。"""
+
+    worker: WorkerState
+    generation: int
+    released: bool = False
+
+    def release(self) -> None:
+        """仅归还所属 generation 的名额，避免迟到清理影响 replacement。"""
+        if not self.released:
+            self.released = True
+            if self.worker.generation == self.generation:
+                self.worker.active_jobs = max(0, self.worker.active_jobs - 1)
+
+
 class WorkerPool:
-    """维护 Router worker 集合并按能力、负载和 affinity 选择目标。"""
+    """维护 Router worker 集合，按能力、负载与独立轮询分配请求。"""
 
     def __init__(
         self,
@@ -336,6 +351,7 @@ class WorkerPool:
         self._workers: dict[str, WorkerState] = {}
         self._monitor_task: asyncio.Task[None] | None = None
         self._built = False
+        self._selection_cursors: dict[str, str] = {}
 
     def _build_workers(self) -> None:
         """在 lifespan 启动阶段解析设备并创建 remote/local worker 状态。"""
@@ -471,34 +487,60 @@ class WorkerPool:
         *,
         tier: Tier | None,
         required_sources: set[str] | None = None,
-        affinity_key: str | None = None,
         preferred_worker_id: str | None = None,
+        required_outputs: set[str] | None = None,
+        require_flash: bool = False,
+        selection_kind: Literal["upload", "job"] = "job",
     ) -> WorkerState | None:
-        """按 tier、source、preferred worker、affinity 和活动任务数选择目标。"""
+        """按能力和负载选取目标，文件归属仅在最低负载候选中优先。"""
         required = required_sources or set()
         eligible = [
             worker
             for worker in self.healthy_workers()
-            if (tier is None or tier in worker.tiers) and required.issubset(set(worker.features.get("sources") or []))
+            if (tier is None or tier in worker.tiers)
+            and required.issubset(set(worker.features.get("sources") or []))
+            and (required_outputs or set()).issubset(set(worker.features.get("output_formats") or []))
+            and (not require_flash or "flash" in worker.tiers)
         ]
         if not eligible:
             return None
+        loads = {
+            worker.worker_id: (worker.active_jobs / max(worker.max_concurrent_jobs, 1), worker.active_jobs)
+            for worker in eligible
+        }
+        minimum = min(loads.values())
+        eligible = sorted((worker for worker in eligible if loads[worker.worker_id] == minimum), key=lambda w: w.worker_id)
         if preferred_worker_id is not None:
             preferred = next((worker for worker in eligible if worker.worker_id == preferred_worker_id), None)
             if preferred is not None:
+                self._selection_cursors[selection_kind] = preferred.worker_id
                 return preferred
-        if affinity_key:
-            ordered = sorted(eligible, key=lambda worker: worker.worker_id)
-            digest = hashlib.sha256(affinity_key.encode("utf-8")).digest()
-            return ordered[int.from_bytes(digest[:8], "big") % len(ordered)]
-        return min(
-            eligible,
-            key=lambda worker: (
-                worker.active_jobs / max(worker.max_concurrent_jobs, 1),
-                worker.active_jobs,
-                worker.worker_id,
-            ),
+        previous = self._selection_cursors.get(selection_kind, "")
+        selected = next((worker for worker in eligible if worker.worker_id > previous), eligible[0])
+        self._selection_cursors[selection_kind] = selected.worker_id
+        return selected
+
+    def reserve_job(
+        self,
+        *,
+        tier: Tier,
+        required_sources: set[str],
+        preferred_worker_id: str | None = None,
+        required_outputs: set[str] | None = None,
+        require_flash: bool = False,
+    ) -> JobReservation | None:
+        """在第一次网络等待前同步选择并预占解析 worker。"""
+        worker = self.select(
+            tier=tier,
+            required_sources=required_sources,
+            preferred_worker_id=preferred_worker_id,
+            required_outputs=required_outputs,
+            require_flash=require_flash,
         )
+        if worker is None:
+            return None
+        worker.active_jobs += 1
+        return JobReservation(worker, worker.generation)
 
     def mark_job_started(self, worker_id: str) -> None:
         """增加指定 worker 的活动任务计数。"""
@@ -511,6 +553,7 @@ class WorkerPool:
 
 
 __all__ = [
+    "JobReservation",
     "accelerator_device_count",
     "ManagedLocalWorker",
     "RouterSettings",

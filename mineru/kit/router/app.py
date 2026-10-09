@@ -7,27 +7,36 @@ import asyncio
 import copy
 import hashlib
 import json
+import secrets
 import time
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
+from pathlib import Path
 from typing import Any, AsyncIterator, Literal
 
 import httpx
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, Response
 
+from ...filetypes import is_flash_only_parse_extension
+from ...parser.api_server import CreateUploadRequest
+from ...parser.task_api import TaskUpload, build_task_router
 from ...types import TIERS, select_default_quality_tier, validate_tier
+from ...utils.async_utils import drain_future
 from ...version import __version__
 from .proxy import (
     RouterProxyError,
     copy_file_to_worker,
     json_or_error,
     passthrough_response,
+    release_job_load,
     request_upstream,
+    require_worker_generation,
     rewrite_file_payload,
     rewrite_job_payload,
     rewrite_upload_payload,
     router_error_response,
     stream_upstream,
+    upload_stored_source,
 )
 from .resources import (
     CopiedInputFile,
@@ -67,13 +76,6 @@ def _route_or_404(
     return route
 
 
-def _affinity_key(request: Request) -> str:
-    """用 Authorization 与客户端地址构造同一调用方的 upload affinity。"""
-    authorization = request.headers.get("authorization", "")
-    client_host = request.client.host if request.client is not None else "unknown"
-    return f"{authorization}\0{client_host}"
-
-
 def _successful_json(upstream: httpx.Response) -> dict[str, Any] | Response:
     """成功时返回 JSON 对象，业务错误时保持 upstream response 不变。"""
     if upstream.status_code >= 400:
@@ -98,11 +100,11 @@ async def _read_json_object(request: Request, *, allow_empty: bool = False) -> d
 
 
 def _healthy_worker_or_503(pool: WorkerPool) -> WorkerState:
-    """选择任意健康 worker，无可用 upstream 时抛出 503。"""
-    worker = pool.select(tier=None)
-    if worker is None:
+    """只检查健康 worker，不推进用于实际分配的轮询游标。"""
+    workers = pool.healthy_workers()
+    if not workers:
         raise RouterProxyError(503, "upstream_unavailable", "No healthy MinerU V1 upstream is available")
-    return worker
+    return workers[0]
 
 
 def _list_registered_files(
@@ -505,14 +507,30 @@ def create_app(
 
     @application.post("/v1/uploads")
     async def create_upload(request: Request) -> Response:
-        """按调用方 affinity 选择 worker 并创建 Router upload。"""
+        """按负载和上传轮询选择 worker，并复用本调用方已有的源字节。"""
         owner_scope = _caller_scope(request)
-        worker = pool.select(tier=None, required_sources={"file_id"}, affinity_key=_affinity_key(request))
+        body = await _read_json_object(request)
+        try:
+            validated = CreateUploadRequest.model_validate(body)
+        except ValueError as exc:
+            raise RouterProxyError(400, "invalid_request", str(exc)) from exc
+        body = validated.model_dump(exclude_none=True)
+        worker = pool.select(tier=None, required_sources={"file_id"}, selection_kind="upload")
         if worker is None:
             raise RouterProxyError(503, "upstream_unavailable", "No upstream accepts file uploads")
-        body = await _read_json_object(request)
+        cached = source_store.find_hash(owner_scope, body["sha256sum"]) if isinstance(body.get("sha256sum"), str) else None
+        if cached is not None:
+            if body.get("bytes") != cached.bytes:
+                raise RouterProxyError(400, "upload_size_mismatch", "Declared size does not match cached bytes")
+            with source_store.pin(cached):
+                result = await upload_stored_source(
+                    cached, str(body.get("filename") or "input.bin"), worker, request=request, pool=pool, declaration=body
+                )
+                rewritten = rewrite_upload_payload(result, worker, registry, owner_scope)
+                source_store.bind_source(str(rewritten["file"]["id"]), cached, owner_scope=owner_scope)
+            return JSONResponse(rewritten)
         upstream_body = dict(body)
-        # Router 必须收到源字节才能跨 worker 转移，因此禁止 upstream 在 PUT 前按 sha256 提前完成。
+        # 本地未命中时必须收到源字节；仅凭 worker 的 blob 命中无法支持跨 worker 复制。
         upstream_body.pop("sha256sum", None)
         upstream = await request_upstream(pool, worker, "POST", "/v1/uploads", request=request, json_body=upstream_body)
         result = _successful_json(upstream)
@@ -606,7 +624,7 @@ def create_app(
         file_payload = rewritten.get("file")
         if not isinstance(file_payload, dict) or not isinstance(file_payload.get("id"), str):
             raise RouterProxyError(502, "invalid_upstream_response", "Completed upload did not return a file")
-        source_store.bind_file(upload_id, file_payload["id"])
+        source_store.bind_file(upload_id, file_payload["id"], owner_scope=owner_scope)
         return JSONResponse(rewritten, status_code=upstream.status_code)
 
     @application.post("/v1/uploads/{upload_id}/cancel")
@@ -715,116 +733,163 @@ def create_app(
         result["id"] = file_id
         return JSONResponse(result, status_code=upstream.status_code)
 
-    @application.post("/v1/parse/jobs")
-    async def create_job(request: Request) -> Response:
-        """选择匹配 tier/source 的 worker，迁移跨 worker files 后创建 V1 job。"""
+    async def submit_job(body: dict[str, Any], request: Request, uploads: dict[int, TaskUpload] | None = None) -> Response:
+        """统一选择并预占 worker，V1 Job 和便捷任务共用上传与副本清理。"""
         owner_scope = _caller_scope(request)
-        body = await _read_json_object(request)
+        body = copy.deepcopy(body)
+        uploads = uploads or {}
         files = body.get("files")
         if not isinstance(files, list) or not files:
             raise RouterProxyError(400, "invalid_request", "Job request must contain at least one file", "files")
+        required_sources: set[str] = set()
+        file_routes: list[tuple[dict[str, Any], ResourceRoute]] = []
+        names: list[str] = []
+        for index, entry in enumerate(files):
+            source = entry.get("source") if isinstance(entry, dict) else None
+            if not isinstance(source, dict) or not isinstance(source.get("type"), str):
+                raise RouterProxyError(400, "invalid_request", "Each file must contain a typed source", f"files.{index}.source")
+            required_sources.add(source["type"])
+            if index in uploads:
+                names.append(uploads[index].filename)
+            elif source["type"] == "file_id":
+                public_file_id = source.get("file_id")
+                if not isinstance(public_file_id, str):
+                    raise RouterProxyError(400, "invalid_request", "file_id source requires a string file_id")
+                route = _route_or_404(registry, "file", public_file_id, owner_scope)
+                file_routes.append((source, route))
+                names.append(str((route.metadata.get("payload") or {}).get("filename") or ""))
+            else:
+                if source["type"] == "url":
+                    names.append(str(source.get("url") or "").rsplit("/", 1)[-1].split("?")[0] or "unknown")
+                elif source["type"] == "local":
+                    names.append(Path(str(source.get("path") or "")).name)
+                else:
+                    names.append(str(source.get("name") or ""))
+        can_default_to_flash = all(
+            is_flash_only_parse_extension(name) or (entry["source"]["type"] == "url" and not Path(name).suffix)
+            for name, entry in zip(names, files)
+        )
         raw_tier = body.get("tier")
         try:
             tier = validate_tier(raw_tier) if raw_tier is not None else select_default_quality_tier(pool.available_tiers())
         except ValueError as exc:
             raise RouterProxyError(400, "invalid_request", str(exc), "tier") from exc
+        if tier is None and can_default_to_flash and "flash" in pool.available_tiers():
+            tier = "flash"
         if tier is None:
             raise RouterProxyError(503, "quality_tier_unavailable", "No default quality tier is available")
         body["tier"] = tier
-        required_sources: set[str] = set()
-        file_routes: list[tuple[dict[str, Any], ResourceRoute]] = []
-        for index, entry in enumerate(files):
-            source = entry.get("source") if isinstance(entry, dict) else None
-            if not isinstance(source, dict) or not isinstance(source.get("type"), str):
-                raise RouterProxyError(400, "invalid_request", "Each file must contain a typed source", f"files.{index}.source")
-            source_type = source["type"]
-            required_sources.add(source_type)
-            if source_type == "file_id":
-                public_file_id = source.get("file_id")
-                if not isinstance(public_file_id, str):
-                    raise RouterProxyError(400, "invalid_request", "file_id source requires a string file_id")
-                file_routes.append((source, _route_or_404(registry, "file", public_file_id, owner_scope)))
+        selection_tier = "flash" if can_default_to_flash and tier not in pool.available_tiers() else tier
         owner_ids = {route.worker_id for _, route in file_routes}
-        preferred_worker_id = next(iter(owner_ids)) if len(owner_ids) == 1 else None
-        worker = pool.select(
-            tier=tier,
+        preferred = next(iter(owner_ids)) if len(owner_ids) == 1 else None
+        reservation = pool.reserve_job(
+            tier=selection_tier,
             required_sources=required_sources,
-            preferred_worker_id=preferred_worker_id,
+            preferred_worker_id=preferred,
+            required_outputs=set(body.get("output_formats") or ["markdown"]),
+            require_flash=any(is_flash_only_parse_extension(name) for name in names),
         )
-        if worker is None:
-            raise RouterProxyError(503, "quality_tier_unavailable", f"No healthy upstream supports tier '{tier}'")
+        if reservation is None:
+            raise RouterProxyError(
+                503, "quality_tier_unavailable", f"No healthy upstream supports tier '{tier}' and requested formats"
+            )
+        worker = reservation.worker
         input_aliases: dict[str, str] = {}
         copied_files: list[CopiedInputFile] = []
+        registered_inputs: list[ResourceRoute] = []
+        staged: list[str] = []
+        transferred = False
+
+        async def rollback() -> None:
+            """回收未被任务接管的跨 worker 副本和本次创建的源文件视图。"""
+            if worker.generation == reservation.generation and worker.base_url:
+                await _cleanup_copied_files(copied_files, request=request, pool=pool, registry=registry)
+            for route in registered_inputs:
+                try:
+                    if worker.generation == reservation.generation and worker.base_url:
+                        await request_upstream(pool, worker, "DELETE", f"/v1/files/{route.upstream_id}", request=request)
+                except RouterProxyError:
+                    pass
+                registry.remove("file", route.public_id)
+                source_store.delete_file(route.public_id)
+
         try:
-            for source, route in file_routes:
-                target_file_id = route.upstream_id
-                if route.worker_id != worker.worker_id:
-                    target_file_id = await copy_file_to_worker(
-                        route,
-                        worker,
-                        request=request,
-                        pool=pool,
-                        registry=registry,
-                        source_store=source_store,
-                    )
-                    copied_files.append(
-                        CopiedInputFile(
-                            source_public_id=route.public_id,
-                            owner_scope=owner_scope,
-                            worker_id=worker.worker_id,
-                            upstream_file_id=target_file_id,
+            with ExitStack() as pins:
+                # 哈希命中输入在第一次网络等待前固定缓存引用，避免并发删除原文件。
+                cached_inputs = {}
+                for index, upload in uploads.items():
+                    cached = source_store.find_hash(owner_scope, upload.sha256sum)
+                    if cached is not None:
+                        pins.enter_context(source_store.pin(cached))
+                        cached_inputs[index] = cached
+                for index, upload in uploads.items():
+                    stored = cached_inputs.get(index)
+                    if stored is None:
+                        staging_id = "task-" + secrets.token_hex(12)
+                        staged.append(staging_id)
+                        stored = await source_store.stage_upload(
+                            staging_id, stored_file_chunks(upload.path), mime_type=upload.mime_type, max_bytes=200 * 1024 * 1024
                         )
+                        pins.enter_context(source_store.pin(stored))
+                    payload = await upload_stored_source(
+                        stored, upload.filename, worker, request=request, pool=pool, generation=reservation.generation
                     )
-                input_aliases[target_file_id] = route.public_id
-                source["file_id"] = target_file_id
-            upstream = await request_upstream(pool, worker, "POST", "/v1/parse/jobs", request=request, json_body=body)
-        except RouterProxyError:
-            await _cleanup_copied_files(
-                copied_files,
-                request=request,
-                pool=pool,
-                registry=registry,
-            )
-            raise
-        result = _successful_json(upstream)
-        if isinstance(result, Response):
-            await _cleanup_copied_files(
-                copied_files,
-                request=request,
-                pool=pool,
-                registry=registry,
-            )
-            return result
-        upstream_job_id = result.get("job_id")
-        if not isinstance(upstream_job_id, str):
-            await _cleanup_copied_files(
-                copied_files,
-                request=request,
-                pool=pool,
-                registry=registry,
-            )
-            raise RouterProxyError(502, "invalid_upstream_response", "Created job did not return a job_id")
-        job_route = registry.register(
-            "job",
-            owner_scope=owner_scope,
-            worker_id=worker.worker_id,
-            upstream_id=upstream_job_id,
-        )
-        job_route.metadata["input_aliases"] = input_aliases
-        job_route.metadata["copied_inputs"] = copied_files
-        job_route.metadata["active_counted"] = True
-        job_route.metadata["upstream_headers"] = _authorization_headers(request)
-        pool.mark_job_started(worker.worker_id)
-        rewritten = rewrite_job_payload(result, worker, registry, pool, owner_scope)
-        job_route.metadata["payload"] = copy.deepcopy(rewritten)
-        await _finalize_terminal_job(
-            job_route,
-            rewritten,
-            request=request,
-            pool=pool,
-            registry=registry,
-        )
-        return JSONResponse(rewritten, status_code=upstream.status_code)
+                    rewritten = rewrite_file_payload(payload["file"], worker, registry, owner_scope)
+                    public_id = str(rewritten["id"])
+                    route = _route_or_404(registry, "file", public_id, owner_scope)
+                    registered_inputs.append(route)
+                    source_store.bind_source(public_id, stored, owner_scope=owner_scope)
+                    input_aliases[route.upstream_id] = public_id
+                    files[index]["source"] = {"type": "file_id", "file_id": route.upstream_id}
+                for source, route in file_routes:
+                    target_file_id = route.upstream_id
+                    if route.worker_id != worker.worker_id:
+                        target_file_id = await copy_file_to_worker(
+                            route, worker, request=request, pool=pool, registry=registry, source_store=source_store
+                        )
+                        copied_files.append(
+                            CopiedInputFile(
+                                source_public_id=route.public_id,
+                                owner_scope=owner_scope,
+                                worker_id=worker.worker_id,
+                                upstream_file_id=target_file_id,
+                            )
+                        )
+                    input_aliases[target_file_id] = route.public_id
+                    source["file_id"] = target_file_id
+                upstream = await request_upstream(pool, worker, "POST", "/v1/parse/jobs", request=request, json_body=body)
+                require_worker_generation(worker, reservation.generation)
+                result = _successful_json(upstream)
+                if isinstance(result, Response):
+                    return result
+                upstream_job_id = result.get("job_id")
+                if not isinstance(upstream_job_id, str):
+                    raise RouterProxyError(502, "invalid_upstream_response", "Created job did not return a job_id")
+                job_route = registry.register(
+                    "job", owner_scope=owner_scope, worker_id=worker.worker_id, upstream_id=upstream_job_id
+                )
+                job_route.metadata.update(
+                    input_aliases=input_aliases,
+                    copied_inputs=copied_files,
+                    active_counted=True,
+                    reservation=reservation,
+                    upstream_headers=_authorization_headers(request),
+                )
+                transferred = True
+                rewritten = rewrite_job_payload(result, worker, registry, pool, owner_scope)
+                await _finalize_terminal_job(job_route, rewritten, request=request, pool=pool, registry=registry)
+                return JSONResponse(rewritten, status_code=upstream.status_code)
+        finally:
+            for staging_id in staged:
+                source_store.discard_upload(staging_id)
+            if not transferred:
+                reservation.release()
+                await drain_future(asyncio.create_task(rollback()))
+
+    @application.post("/v1/parse/jobs")
+    async def create_job(request: Request) -> Response:
+        """沿用 V1 请求响应，通过共享服务提交并预占解析负载。"""
+        return await submit_job(await _read_json_object(request), request)
 
     @application.get("/v1/parse/jobs")
     async def list_jobs(
@@ -876,8 +941,7 @@ def create_app(
         if isinstance(result, Response):
             return result
         result["job_id"] = job_id
-        if route.metadata.pop("active_counted", False):
-            pool.mark_job_finished(worker.worker_id)
+        release_job_load(route, pool)
         payload = route.metadata.get("payload")
         if isinstance(payload, dict):
             payload["status"] = "canceled"
@@ -895,6 +959,14 @@ def create_app(
         """返回当前 Router 进程聚合的 V1 usage。"""
         return _usage_payload(request, registry, pool, _caller_scope(request))
 
+    from .tasks import RouterTaskBackend, install_task_error_handlers
+
+    def task_backend(request: Request) -> RouterTaskBackend:
+        """显式组装 Router 适配器，便捷入口不通过 HTTP 请求自身。"""
+        return RouterTaskBackend(request, submit_job, get_job, cancel_job, _caller_scope(request))
+
+    install_task_error_handlers(application)
+    application.include_router(build_task_router(task_backend))
     return application
 
 

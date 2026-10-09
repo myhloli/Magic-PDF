@@ -7,10 +7,11 @@ import hashlib
 import secrets
 import tempfile
 from collections.abc import AsyncIterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Iterator, Literal
 
 ResourceKind = Literal["upload", "file", "job"]
 
@@ -69,6 +70,9 @@ class SourceFileStore:
         self._uploads: dict[str, StoredSourceFile] = {}
         self._files: dict[str, StoredSourceFile] = {}
         self._bound_uploads: set[str] = set()
+        self._file_scopes: dict[str, str] = {}
+        self._hash_files: dict[tuple[str, str], set[str]] = {}
+        self._pins: dict[Path, int] = {}
 
     async def stage_upload(
         self,
@@ -76,6 +80,7 @@ class SourceFileStore:
         chunks: AsyncIterator[bytes],
         *,
         mime_type: str,
+        max_bytes: int | None = None,
     ) -> StoredSourceFile:
         """流式写入一个公共 Upload 的输入字节，并计算实际大小与 SHA256。"""
         if upload_id in self._bound_uploads:
@@ -84,13 +89,20 @@ class SourceFileStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         hasher = hashlib.sha256()
         byte_count = 0
-        with path.open("wb") as output:
-            async for chunk in chunks:
-                if not chunk:
-                    continue
-                output.write(chunk)
-                hasher.update(chunk)
-                byte_count += len(chunk)
+        try:
+            with path.open("wb") as output:
+                async for chunk in chunks:
+                    if not chunk:
+                        continue
+                    byte_count += len(chunk)
+                    if max_bytes is not None and byte_count > max_bytes:
+                        raise ValueError("file_too_large")
+                    output.write(chunk)
+                    hasher.update(chunk)
+        except BaseException:
+            path.unlink(missing_ok=True)
+            self._uploads.pop(upload_id, None)
+            raise
         stored = StoredSourceFile(
             path=path,
             bytes=byte_count,
@@ -103,12 +115,56 @@ class SourceFileStore:
             previous.path.unlink(missing_ok=True)
         return stored
 
-    def bind_file(self, upload_id: str, file_id: str) -> StoredSourceFile:
+    def bind_file(self, upload_id: str, file_id: str, *, owner_scope: str = "anonymous") -> StoredSourceFile:
         """把已完成 Upload 的暂存输入绑定到 Router 公共 File。"""
         stored = self._uploads.pop(upload_id)
-        self._files[file_id] = stored
+        self.bind_source(file_id, stored, owner_scope=owner_scope)
         self._bound_uploads.add(upload_id)
         return stored
+
+    def bind_source(self, file_id: str, stored: StoredSourceFile, *, owner_scope: str) -> None:
+        """为公共文件增加缓存引用，并建立调用方隔离的哈希索引。"""
+        previous = self._files.get(file_id)
+        if previous is not None:
+            previous_scope = self._file_scopes.get(file_id, "anonymous")
+            previous_key = (previous_scope, previous.sha256sum)
+            ids = self._hash_files.get(previous_key, set())
+            ids.discard(file_id)
+            if not ids:
+                self._hash_files.pop(previous_key, None)
+        self._files[file_id] = stored
+        self._file_scopes[file_id] = owner_scope
+        self._hash_files.setdefault((owner_scope, stored.sha256sum), set()).add(file_id)
+        if previous is not None:
+            self._release_path(previous.path)
+
+    def find_hash(self, owner_scope: str, sha256sum: str) -> StoredSourceFile | None:
+        """只查当前调用方仍持有的源字节，不使用 worker 的哈希声明。"""
+        for file_id in sorted(self._hash_files.get((owner_scope, sha256sum), set())):
+            stored = self._files.get(file_id)
+            if stored is not None and stored.path.is_file():
+                return stored
+        return None
+
+    @contextmanager
+    def pin(self, stored: StoredSourceFile) -> Iterator[None]:
+        """在跨 worker 传输期间保留字节，直到最后一个文件或传输引用退出。"""
+        self._pins[stored.path] = self._pins.get(stored.path, 0) + 1
+        try:
+            yield
+        finally:
+            self._pins[stored.path] -= 1
+            if not self._pins[stored.path]:
+                self._pins.pop(stored.path)
+            self._release_path(stored.path)
+
+    def _release_path(self, path: Path) -> None:
+        """仅删除没有上传、文件和传输引用的暂存路径。"""
+        if self._pins.get(path):
+            return
+        if any(stored.path == path for stored in (*self._uploads.values(), *self._files.values())):
+            return
+        path.unlink(missing_ok=True)
 
     def is_bound_upload(self, upload_id: str) -> bool:
         """判断 Upload 的暂存路径是否已经绑定到完成后的公共 File。"""
@@ -128,19 +184,28 @@ class SourceFileStore:
             return
         stored = self._uploads.pop(upload_id, None)
         if stored is not None:
-            stored.path.unlink(missing_ok=True)
+            self._release_path(stored.path)
 
     def delete_file(self, file_id: str) -> None:
         """删除公共 File 绑定的私有暂存输入。"""
         stored = self._files.pop(file_id, None)
         if stored is not None:
-            stored.path.unlink(missing_ok=True)
+            scope = self._file_scopes.pop(file_id, "anonymous")
+            key = (scope, stored.sha256sum)
+            files = self._hash_files.get(key, set())
+            files.discard(file_id)
+            if not files:
+                self._hash_files.pop(key, None)
+            self._release_path(stored.path)
 
     def close(self) -> None:
         """清理当前 Router 进程的全部暂存输入。"""
         self._uploads.clear()
         self._files.clear()
         self._bound_uploads.clear()
+        self._file_scopes.clear()
+        self._hash_files.clear()
+        self._pins.clear()
         self._temp_dir.cleanup()
 
 

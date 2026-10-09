@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 from collections.abc import AsyncIterator, Mapping
 from typing import Any, cast
@@ -11,8 +12,9 @@ import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from .resources import ResourceRegistry, ResourceRoute, SourceFileStore, stored_file_chunks
-from .workers import WorkerPool, WorkerState
+from ...utils.async_utils import drain_future
+from .resources import ResourceRegistry, ResourceRoute, SourceFileStore, StoredSourceFile, stored_file_chunks
+from .workers import JobReservation, WorkerPool, WorkerState
 
 _HOP_BY_HOP_HEADERS = frozenset(
     {
@@ -75,9 +77,13 @@ async def request_upstream(
     json_body: Any = None,
     content: bytes | AsyncIterator[bytes] | None = None,
     headers: Mapping[str, str] | None = None,
+    follow_redirects: bool = False,
 ) -> httpx.Response:
     """执行普通 upstream 请求，并把连接失败与超时转成稳定 Router 错误。"""
     outgoing_headers = forwarded_headers(request) if request is not None else {}
+    outgoing_headers.pop("expect", None)
+    if json_body is not None:
+        outgoing_headers["content-type"] = "application/json"
     outgoing_headers.update(headers or {})
     try:
         return await pool.client.request(
@@ -86,6 +92,7 @@ async def request_upstream(
             json=json_body,
             content=content,
             headers=outgoing_headers,
+            follow_redirects=follow_redirects,
         )
     except httpx.TimeoutException as exc:
         raise RouterProxyError(504, "upstream_timeout", f"Upstream {worker.worker_id} timed out") from exc
@@ -267,10 +274,88 @@ def rewrite_job_payload(
         if links.get("cancel") is not None:
             links["cancel"] = f"/v1/parse/jobs/{route.public_id}"
     status = str(rewritten.get("status") or "")
-    if status in _TERMINAL_JOB_STATUSES and route.metadata.pop("active_counted", False):
-        pool.mark_job_finished(worker.worker_id)
+    if status in _TERMINAL_JOB_STATUSES:
+        release_job_load(route, pool)
     route.metadata["payload"] = copy.deepcopy(rewritten)
     return rewritten
+
+
+def release_job_load(route: ResourceRoute, pool: WorkerPool) -> None:
+    """所有终态入口共用一次性释放，预占对象校验 worker generation。"""
+    if route.metadata.pop("active_counted", False):
+        reservation = route.metadata.pop("reservation", None)
+        if isinstance(reservation, JobReservation):
+            reservation.release()
+        else:
+            pool.mark_job_finished(route.worker_id)
+
+
+async def upload_stored_source(
+    stored: StoredSourceFile,
+    filename: str,
+    target: WorkerState,
+    *,
+    request: Request,
+    pool: WorkerPool,
+    declaration: dict[str, Any] | None = None,
+    generation: int | None = None,
+) -> dict[str, Any]:
+    """使用已经校验的缓存字节完成 worker 上传，失败和取消均清理中间资源。"""
+    generation = target.generation if generation is None else generation
+    require_worker_generation(target, generation)
+    body = dict(declaration or {})
+    body.update(
+        filename=filename, bytes=stored.bytes, mime_type=body.get("mime_type") or stored.mime_type, sha256sum=stored.sha256sum
+    )
+    body.setdefault("purpose", "parse")
+    response = await request_upstream(pool, target, "POST", "/v1/uploads", request=request, json_body=body)
+    payload = json_or_error(response)
+    require_worker_generation(target, generation)
+    if isinstance(payload.get("file"), dict):
+        return payload
+    upload_id = payload.get("id")
+    if not isinstance(upload_id, str):
+        raise RouterProxyError(502, "invalid_upstream_response", "Upload did not return an ID")
+    try:
+        response = await request_upstream(
+            pool,
+            target,
+            "PUT",
+            f"/v1/uploads/{upload_id}/content",
+            request=request,
+            content=stored_file_chunks(stored.path),
+            headers={"content-type": "application/octet-stream"},
+        )
+        if response.status_code >= 400:
+            json_or_error(response)
+        require_worker_generation(target, generation)
+        response = await request_upstream(
+            pool,
+            target,
+            "POST",
+            f"/v1/uploads/{upload_id}/complete",
+            request=request,
+            json_body={"sha256sum": stored.sha256sum},
+        )
+        payload = json_or_error(response)
+        require_worker_generation(target, generation)
+        if not isinstance(payload.get("file"), dict) or not isinstance(payload["file"].get("id"), str):
+            raise RouterProxyError(502, "invalid_upstream_response", "Completed upload did not return a file")
+        return payload
+    except (Exception, asyncio.CancelledError):
+        if target.generation == generation and target.base_url:
+            await drain_future(
+                asyncio.create_task(
+                    _cleanup_failed_target_transfer(target, upload_id, request=request, pool=pool, generation=generation)
+                )
+            )
+        raise
+
+
+def require_worker_generation(worker: WorkerState, generation: int) -> None:
+    """阻止 replacement 期间的迟到响应发布旧进程的资源标识。"""
+    if worker.generation != generation or not worker.base_url:
+        raise RouterProxyError(503, "upstream_unavailable", "Worker changed while the request was being submitted")
 
 
 async def _cleanup_failed_target_transfer(
@@ -279,8 +364,12 @@ async def _cleanup_failed_target_transfer(
     *,
     request: Request,
     pool: WorkerPool,
+    generation: int | None = None,
 ) -> None:
     """尽力取消失败 transfer 的 Upload，或删除已完成但响应丢失的 File。"""
+    generation = target.generation if generation is None else generation
+    if target.generation != generation or not target.base_url:
+        return
     try:
         lookup = await request_upstream(
             pool,
@@ -289,6 +378,8 @@ async def _cleanup_failed_target_transfer(
             f"/v1/uploads/{upload_id}",
             request=request,
         )
+        if target.generation != generation or not target.base_url:
+            return
         if lookup.status_code == 200:
             try:
                 payload = lookup.json()
@@ -306,6 +397,8 @@ async def _cleanup_failed_target_transfer(
                 return
     except RouterProxyError:
         pass
+    if target.generation != generation or not target.base_url:
+        return
     try:
         await request_upstream(
             pool,
@@ -328,6 +421,7 @@ async def copy_file_to_worker(
     source_store: SourceFileStore,
 ) -> str:
     """优先使用 Router 私有暂存输入，通过 Upload API 复制到目标 worker。"""
+    generation = target.generation
     source = pool.get(route.worker_id)
     metadata = route.metadata.get("payload")
     if not isinstance(metadata, dict):
@@ -341,10 +435,21 @@ async def copy_file_to_worker(
         metadata = json_or_error(metadata_response)
     stored = source_store.find_file(route.public_id)
     if stored is not None:
-        content: bytes | AsyncIterator[bytes] = stored_file_chunks(stored.path)
-        content_size = stored.bytes
-        content_sha256 = stored.sha256sum
-        content_type = stored.mime_type
+        with source_store.pin(stored):
+            payload = await upload_stored_source(
+                stored,
+                str(metadata.get("filename") or "input.bin"),
+                target,
+                request=request,
+                pool=pool,
+                generation=generation,
+                declaration={
+                    "purpose": metadata.get("purpose") if metadata.get("purpose") in {"parse", "input_image"} else "parse"
+                },
+            )
+        target_file_id = str(payload["file"]["id"])
+        registry.alias_upstream(route, worker_id=target.worker_id, upstream_id=target_file_id)
+        return target_file_id
     else:
         if metadata.get("purpose") != "parse_output":
             raise RouterProxyError(
@@ -373,6 +478,7 @@ async def copy_file_to_worker(
         "purpose": purpose,
         **({"sha256sum": content_sha256} if content_sha256 else {}),
     }
+    require_worker_generation(target, generation)
     upload_response = await request_upstream(
         pool,
         target,
@@ -382,6 +488,7 @@ async def copy_file_to_worker(
         json_body=create_payload,
     )
     upload_payload = json_or_error(upload_response)
+    require_worker_generation(target, generation)
     if isinstance(upload_payload.get("file"), dict):
         target_file_id = str(upload_payload["file"]["id"])
         registry.alias_upstream(route, worker_id=target.worker_id, upstream_id=target_file_id)
@@ -410,16 +517,18 @@ async def copy_file_to_worker(
             json_body={"sha256sum": content_sha256} if content_sha256 else {},
         )
         complete_payload = json_or_error(complete_response)
+        require_worker_generation(target, generation)
         file_payload = complete_payload.get("file")
         if not isinstance(file_payload, dict) or not isinstance(file_payload.get("id"), str):
             raise RouterProxyError(502, "invalid_upstream_response", "Completed upload did not return a file")
         target_file_id = file_payload["id"]
-    except Exception:
+    except (Exception, asyncio.CancelledError):
         await _cleanup_failed_target_transfer(
             target,
             upload_id,
             request=request,
             pool=pool,
+            generation=generation,
         )
         raise
     registry.alias_upstream(route, worker_id=target.worker_id, upstream_id=target_file_id)
@@ -433,6 +542,9 @@ __all__ = [
     "json_or_error",
     "passthrough_response",
     "request_upstream",
+    "require_worker_generation",
+    "release_job_load",
+    "upload_stored_source",
     "rewrite_file_payload",
     "rewrite_job_payload",
     "rewrite_upload_payload",

@@ -24,6 +24,8 @@ Job 状态:
 
 客户端应把 `completed`、`partial`、`failed`、`canceled` 都视为终态。
 
+一次上传并提交、内联结果与同步包装见 [V1 便捷解析](tasks.md)，它们共用本页的 Job 和任务 ID。
+
 ## POST `/v1/parse/jobs`
 
 创建解析任务。

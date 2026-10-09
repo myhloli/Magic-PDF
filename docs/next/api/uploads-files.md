@@ -367,3 +367,12 @@ Local Parse Server 保持相同 endpoint 和对象结构，但传输实现可以
 - 本地 server 支持 parse job 的 `local` source；只有启动时开启 `--allow-local-source` 并在 `features.sources` 返回 `local` 时，用户才可跳过 upload 直接引用 server 进程权限范围内的本地路径。
 - 官方 API 必须拒绝 `local` source，返回 `400 invalid_request`。
 - 本地文件默认可以不设置保留期，File 对象的 `expires_at` 可为 `null`。
+
+
+### 自部署 Router 的源字节复用
+
+Router 把完成上传的源字节缓存在私有临时存储，并按调用方 scope 与实际 SHA-256 建立索引。
+本地命中时，`POST /v1/uploads` 复用缓存完成选定 worker 的上传并返回 `completed`，客户端跳过 PUT/complete。
+本地未命中时，即使某个 worker 已保存该 blob，Router 仍接收客户端字节以保留跨 worker 转移能力。
+`/v1/tasks` 与 `/v1/file_parse` 的上传共用此缓存；只改变源文件名视图不需要再次发送字节。
+删除一个文件别名不会删除其他别名或正在传输的数据。完整行为见 [V1 便捷解析](tasks.md)。
