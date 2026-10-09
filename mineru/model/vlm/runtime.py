@@ -180,6 +180,9 @@ class ModelSingleton:
             llama_cpp_engine = Engine(model_gguf, mmproj_gguf, **engine_kwargs)
 
         elif backend == "transformers":
+            from ..runtime.cpu_threads import initialize_torch_threads
+
+            initialize_torch_threads()
             try:
                 from mineru_vl_utils.transformers_loading import (
                     load_transformers_model,

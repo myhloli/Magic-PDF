@@ -205,6 +205,10 @@ class AtomModelSingleton:
     def get_atom_model(self, atom_model_name: str, **kwargs: Any) -> Any:
         """根据模型名称和关键配置生成缓存键，并获取对应原子模型。"""
         small_backend = resolve_small_model_backend(kwargs.get("small_backend"))
+        if small_backend == "torch":
+            from .cpu_threads import initialize_torch_threads
+
+            initialize_torch_threads()
         device = "cpu" if small_backend == "onnx" else (kwargs.get("device") or get_device())
         kwargs = {**kwargs, "small_backend": small_backend, "device": device}
         lang = kwargs.get("lang", None)
@@ -239,6 +243,10 @@ class AtomModelSingleton:
 def atom_model_init(model_name: str, **kwargs: Any) -> Any:
     """将原子模型名称分派到具体初始化函数，并校验初始化结果。"""
     small_backend = resolve_small_model_backend(kwargs.get("small_backend"))
+    if small_backend == "torch":
+        from .cpu_threads import initialize_torch_threads
+
+        initialize_torch_threads()
     atom_model = None
     if model_name == AtomicModelName.Layout:
         if small_backend == "onnx":

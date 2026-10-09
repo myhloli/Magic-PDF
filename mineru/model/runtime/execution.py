@@ -30,6 +30,9 @@ def _device_execution(device: str) -> _DeviceExecution:
 @contextmanager
 def local_model_stage(device: str) -> Iterator[None]:
     """只保护同步本地模型阶段，不能跨越 VLM 等待持有该锁。"""
+    from .cpu_threads import prepare_torch_thread
+
+    prepare_torch_thread()
     with _device_execution(device).lock:
         yield
 
