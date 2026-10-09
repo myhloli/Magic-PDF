@@ -279,3 +279,37 @@ def test_router_expired_routes_remain_available_for_copy_cleanup(clock: list[int
     clock[0] += 11
     assert registry.list("job") == []
     assert registry.list("job", include_expired=True) == [route]
+
+
+def test_retention_keeps_cumulative_usage(tmp_path: Path, clock: list[int]) -> None:
+    """元数据回收后已完成的文件、页数与任务累计值不减少。"""
+    files = FileStore(tmp_path / "files", retention_seconds=10)
+    source, _ = _source(files, tmp_path)
+    jobs = JobStore(retention_seconds=10)
+    request = CreateJobRequest.model_validate({"tier": "flash", "files": [{"source": {"type": "file_id", "file_id": source}}]})
+    rec = jobs.create(request, files)
+    rec.status = rec.files[0].status = "completed"
+    rec.files[0].page_range = "1-3"
+    rec.finished_at = JobStore._now()
+    before = jobs.usage("anonymous").current
+    files.release_inputs(rec.input_blobs)
+    clock[0] += 11
+    jobs.collect_expired()
+    assert jobs.usage("anonymous").current == before
+    assert before.jobs_created == 1 and before.pages_processed == 3 and before.files_processed == 1
+
+
+def test_kit_cli_forwards_explicit_retention(monkeypatch: pytest.MonkeyPatch) -> None:
+    """正式 Typer 入口传递零值，覆盖环境变量，并供托管 worker 启动命令使用。"""
+    from unittest.mock import MagicMock
+    from typer.testing import CliRunner
+    from mineru.kit.main import app
+
+    forwarded = MagicMock()
+    monkeypatch.setattr(api_server.main, "main", forwarded)
+    response = CliRunner().invoke(
+        app, ["api-server", "--tier", "flash", "--retention-seconds", "0"], env={"MINERU_API_RETENTION_SECONDS": "7200"}
+    )
+    assert response.exit_code == 0, response.output
+    args = forwarded.call_args.kwargs["args"]
+    assert args[args.index("--retention-seconds") + 1] == "0"

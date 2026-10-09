@@ -1283,6 +1283,7 @@ class _JobRecord:
     links: JobLinks | None = None
     input_blobs: dict[str, str] = field(default_factory=dict)
     file_store: FileStore | None = None
+    usage_counted: bool = False
 
     def __post_init__(self) -> None:
         if self.files is None:
@@ -1296,6 +1297,9 @@ class _JobRecord:
 class JobStore:
     def __init__(self, concurrency: int = 1, retention_seconds: int = 86400) -> None:
         self.retention_seconds = retention_seconds
+        self._jobs_created = 0
+        self._files_processed = 0
+        self._pages_processed = 0
         self._jobs: dict[str, _JobRecord] = {}
         self._concurrency = max(1, concurrency)
         self._semaphore = asyncio.Semaphore(self._concurrency)
@@ -1364,6 +1368,7 @@ class JobStore:
                     logger.error("Parse job task failed: %s", rec.id, exc_info=(type(error), error, error.__traceback__))
                     if rec.status != "canceled":
                         rec.status = "failed"
+            self._record_usage(rec)
             self._completion_events[rec.id].set()
 
         task = asyncio.create_task(run_owned(), name=f"mineru-job-{rec.id}")
@@ -1439,6 +1444,7 @@ class JobStore:
         )
         rec.file_store = file_store
         self._jobs[job_id] = rec
+        self._jobs_created += 1
         return rec
 
     def collect_expired(self) -> None:
@@ -1451,6 +1457,7 @@ class JobStore:
                 continue
             finished = datetime.fromisoformat(rec.finished_at.replace("Z", "+00:00")).timestamp()
             if finished + self.retention_seconds <= now:
+                self._record_usage(rec)
                 self._jobs.pop(job_id)
                 self._completion_events.pop(job_id, None)
 
@@ -1536,10 +1543,20 @@ class JobStore:
             links=rec.links or JobLinks(self="", cancel=""),
         )
 
+    def _record_usage(self, rec: _JobRecord) -> None:
+        """完成计数只累计一次，元数据过期后服务总用量不倒退。"""
+        if not rec.usage_counted:
+            self._files_processed += sum(file.status == "completed" for file in rec.files)
+            self._pages_processed += sum(
+                _count_pages_in_range(file.page_range) for file in rec.files if file.status == "completed"
+            )
+            rec.usage_counted = True
+
     def usage(self, access_level: AccessLevel) -> UsageResponse:
-        files_processed = sum(1 for j in self._jobs.values() for fr in j.files if fr.status == "completed")
-        processed_page_count = sum(
-            sum(_count_pages_in_range(fr.page_range) for fr in j.files if fr.status == "completed") for j in self._jobs.values()
+        pending = [rec for rec in self._jobs.values() if not rec.usage_counted]
+        files_processed = self._files_processed + sum(1 for rec in pending for file in rec.files if file.status == "completed")
+        processed_page_count = self._pages_processed + sum(
+            _count_pages_in_range(file.page_range) for rec in pending for file in rec.files if file.status == "completed"
         )
         return UsageResponse(
             access_level=access_level,
@@ -1547,7 +1564,7 @@ class JobStore:
             current=UsageCurrent(
                 pages_processed=processed_page_count,
                 files_processed=files_processed,
-                jobs_created=len(self._jobs),
+                jobs_created=self._jobs_created,
             ),
             limits=UsageLimits(
                 max_concurrent_jobs=self._concurrency,
@@ -2248,6 +2265,7 @@ async def submit_parse_job(
     except BaseException:
         file_store.release_inputs(rec.input_blobs)
         job_store._jobs.pop(rec.id, None)
+        job_store._jobs_created -= 1
         raise
     return rec
 
