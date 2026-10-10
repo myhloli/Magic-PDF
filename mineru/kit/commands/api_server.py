@@ -46,7 +46,7 @@ def api_server_cmd(
         "--retention-seconds",
         min=0,
         envvar="MINERU_API_RETENTION_SECONDS",
-        help="Terminal retention seconds (default 86400; 0 disables collection)",
+        help=t("Terminal retention seconds (default 86400; 0 disables collection)"),
     ),
     concurrency: int = typer.Option(1, "--concurrency", help=t("Maximum concurrent parse jobs")),
     url_timeout: int = typer.Option(60, "--url-timeout", help=t("Timeout for URL source downloads")),

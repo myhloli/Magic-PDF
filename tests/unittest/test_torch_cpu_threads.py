@@ -76,6 +76,8 @@ assert "torch" not in sys.modules
 
 def test_real_torch_thread_pool_propagation() -> None:
     """用独立进程验证实际 PyTorch 的后续线程按首次选定上限执行算子。"""
+    # 基础 ONNX 安装不要求 Torch，真实算子验证仅在可选后端可用时执行。
+    pytest.importorskip("torch")
     code = """import os
 os.environ["MINERU_CPU_NUM_THREADS"]="2"
 os.environ.pop("OMP_NUM_THREADS",None)

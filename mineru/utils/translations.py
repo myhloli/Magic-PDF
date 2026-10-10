@@ -488,6 +488,7 @@ ZH_MESSAGES: dict[str, str] = {
     "Server capability tier: flash, basic, or standard": "服务能力档位: flash、basic 或 standard",
     "Disable Flash tier advertisement and execution": "禁用 Flash 档位的广播与执行",
     "Disable Advanced tier advertisement and execution": "禁用 Advanced 档位的广播与执行",
+    "Terminal retention seconds (default 86400; 0 disables collection)": "终态资源保留秒数（默认 86400；0 表示禁用回收）",
     "Maximum concurrent parse jobs": "最大并发解析任务数",
     "Timeout for URL source downloads": "URL 来源下载超时",
     "Allow local source paths": "允许本地来源路径",

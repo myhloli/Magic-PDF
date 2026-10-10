@@ -35,7 +35,7 @@ def router_cmd(
         "--retention-seconds",
         min=0,
         envvar="MINERU_API_RETENTION_SECONDS",
-        help="Terminal retention seconds (default 86400; 0 disables collection)",
+        help=t("Terminal retention seconds (default 86400; 0 disables collection)"),
     ),
     preload_models: bool = typer.Option(False, "--preload-models", help=t("Preload models in managed workers")),
 ) -> None:
