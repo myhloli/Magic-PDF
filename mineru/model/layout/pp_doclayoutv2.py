@@ -58,11 +58,10 @@ class PPDocLayoutV2LayoutModel(PPDocLayoutV2PostProcessor):
         weight: str,
         device: Optional[str] = "cuda",
         imgsz: Tuple[int, int] = DEFAULT_IMAGE_SIZE,
-        conf: float = 0.45,
         use_paddlex_filter_boxes: bool = True,
-    ):
+    ) -> None:
+        """加载官方模型配置，检测筛选与阅读顺序均使用模型分类阈值。"""
         self.device = device or "cpu"
-        self.conf = conf
         self.use_paddlex_filter_boxes = use_paddlex_filter_boxes
         self.model_dir = weight
         self.preprocess_config = load_preprocess_config(self.model_dir)
@@ -127,6 +126,7 @@ class PPDocLayoutV2LayoutModel(PPDocLayoutV2PostProcessor):
         outputs: PPDocLayoutV2ForObjectDetectionOutput,
         target_sizes: Sequence[Tuple[int, int]],
     ) -> List[Dict[str, torch.Tensor]]:
+        """按模型分类阈值筛选有效候选，防止排序时的无效框重新进入输出。"""
         boxes = outputs.pred_boxes
         logits = outputs.logits
         order_logits = outputs.order_logits
@@ -141,16 +141,22 @@ class PPDocLayoutV2LayoutModel(PPDocLayoutV2PostProcessor):
 
         num_top_queries = logits.shape[1]
         num_classes = logits.shape[2]
+        class_thresholds = torch.as_tensor(self.config.class_thresholds, dtype=torch.float32, device=logits.device)
+        # 与官方阅读顺序网络一致：用最高分所属类别判断候选框是否有效。
+        max_logits, class_ids = logits.max(dim=-1)
+        valid_queries = max_logits.sigmoid() >= class_thresholds[class_ids]
         scores = torch.sigmoid(logits)
         scores, index = torch.topk(scores.flatten(1), num_top_queries, dim=-1)
         labels = index % num_classes
         index = index // num_classes
         boxes = boxes.gather(dim=1, index=index.unsqueeze(-1).repeat(1, 1, boxes.shape[-1]))
         order_seqs = order_seqs.gather(dim=1, index=index)
+        valid_candidates = valid_queries.gather(dim=1, index=index)
 
         results = []
-        for score, label, box, order_seq in zip(scores, labels, boxes, order_seqs):
-            keep = score >= self.conf
+        for score, label, box, order_seq, valid_candidate in zip(scores, labels, boxes, order_seqs, valid_candidates):
+            # 次高分标签既要达到自身阈值，也不能重新放行排序阶段已排除的候选框。
+            keep = valid_candidate & (score >= class_thresholds[label])
             order_seq = order_seq[keep]
             order_seq, indices = torch.sort(order_seq)
             results.append(

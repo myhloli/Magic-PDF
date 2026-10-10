@@ -233,9 +233,7 @@ def test_layout_position_embedding_preserves_native_math(device: str) -> None:
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda", "cuda:1", "mps", "xpu", "xpu:1"])
-def test_layout_loader_adapts_position_embeddings_for_mps_and_xpu(
-    monkeypatch: pytest.MonkeyPatch, device: str
-) -> None:
+def test_layout_loader_adapts_position_embeddings_for_mps_and_xpu(monkeypatch: pytest.MonkeyPatch, device: str) -> None:
     """覆盖真实加载入口的设备分支，验证 XPU 编号设备也采用 CPU 正弦编码。"""
     from types import SimpleNamespace
     from unittest.mock import Mock
@@ -247,14 +245,16 @@ def test_layout_loader_adapts_position_embeddings_for_mps_and_xpu(
     layer = SimpleNamespace(position_embedding=native)
     model = Mock()
     model.model.encoder.aifi = [layer]
-    config = Mock()
+    config = SimpleNamespace(class_thresholds=list(layout.DEFAULT_CLASS_THRESHOLDS))
     load = Mock(return_value=model)
     monkeypatch.setattr(layout, "load_preprocess_config", lambda _path: {})
     monkeypatch.setattr(layout.PPDocLayoutV2Config, "from_pretrained", Mock(return_value=config))
     monkeypatch.setattr(layout.PPDocLayoutV2ForObjectDetection, "from_pretrained", load)
 
-    layout.PPDocLayoutV2LayoutModel("local-checkpoint", device=device)
+    loaded = layout.PPDocLayoutV2LayoutModel("local-checkpoint", device=device)
 
+    assert loaded.config.class_thresholds == layout.DEFAULT_CLASS_THRESHOLDS
+    assert not hasattr(loaded, "conf")
     assert load.call_args.kwargs["device_map"] == {"": device}
     model.to.assert_called_once_with(device)
     model.eval.assert_called_once_with()
