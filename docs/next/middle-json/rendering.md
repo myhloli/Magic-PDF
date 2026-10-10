@@ -485,6 +485,7 @@ Structured Content 与 Content List V1/V2 不使用展示型 planner。
 
 - 隐藏 `header/footer/page_number/aside_text`，保留独立 `page_footnote`。
 - 合并页内和跨页 `text/ref_text.continues_prev`；ref_text 可跨过页面脚注与辅助块查找前序 ref_text。
+- 正文续文也可接入前序正文列表的最后一个直属 text；连续片段保留行内公式、链接、样式和词界。
 - 合并页内和跨页 `list.continues_prev`；ref list 可跨过页面脚注与辅助块查找前序列表。
 - 只合并跨页 `table.continues_prev`。
 - 页面之间不输出分割线。
@@ -494,6 +495,7 @@ Structured Content 与 Content List V1/V2 不使用展示型 planner。
 - 展示全部顶层 block。
 - 带 anchor 的 `page_footnote` 在 DEFAULT/FULL 中由 Markdown 输出 span id，HTML 输出元素 id。
 - 只合并页内 `text/ref_text/list.continues_prev`。
+- 正文列表末项的续文遵循相同页边界：同页跨栏合并，跨页保留物理分段。
 - 不合并跨页 text/ref_text/list/table。
 - 每两个相邻 `PageInfo` 之间保留格式对应的页面边界：Markdown 输出分隔线，HTML 输出 page section 与分页线。
 

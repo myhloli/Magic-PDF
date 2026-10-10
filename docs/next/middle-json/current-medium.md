@@ -101,8 +101,12 @@ TextSpan 中保持原文。renderer 在目标格式边界执行转义，不反�
 - `image/table/chart/code` 的 caption 与 footnote；
 - `algorithm_body`。
 
-`continues_prev` 只属于顶层 `text/ref_text/list/table`。标题仍使用全局层级：
-`doc_title.level=1`，`paragraph_title.level=2..6`。
+`continues_prev` 只属于顶层 `text/ref_text/list/table`。
+
+顶层 `text.continues_prev=True` 还可表示前序 `sub_type="text"` 列表最后一个直属 `text` 成员的续文。
+续文保留原页、bbox、索引和顶层归属；列表子项不携带该字段。参考文献列表或嵌套末项不参与此类续接。
+
+标题仍使用全局层级：`doc_title.level=1`，`paragraph_title.level=2..6`。
 
 ## 保持专用字符串的 block
 
