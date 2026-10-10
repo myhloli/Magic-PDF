@@ -373,6 +373,46 @@ def test_medium_table_tasks_skip_native_html_and_keep_model_fallback() -> None:
     assert native_table["content"].startswith("<table>")
 
 
+@pytest.mark.parametrize("effort", ["medium", "high"])
+def test_rejected_native_structure_keeps_table_members_for_model_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    effort: Literal["medium", "high"],
+) -> None:
+    """同页混合接受与拒绝时，被拒绝表的正文和公式必须完整留给现有模型路径。"""
+    html = "<table><tbody><tr><td>accepted</td></tr></tbody></table>"
+    recover = MagicMock(side_effect=[SimpleNamespace(html=html, source="sparse_multiline", confidence=1.0), None])
+    monkeypatch.setattr(pdf_tables, "recover_table_region", recover)
+    accepted_table = {"type": BlockType.TABLE, "bbox": [0.05, 0.1, 0.45, 0.9], "angle": 0}
+    rejected_table = {"type": BlockType.TABLE, "bbox": [0.55, 0.1, 0.95, 0.9], "angle": 0}
+    internal_text = {"type": BlockType.TEXT, "bbox": [0.6, 0.2, 0.9, 0.3]}
+    internal_formula = {"type": BlockType.EQUATION, "bbox": [0.6, 0.4, 0.7, 0.5]}
+    layout = [{"label": "inline_formula", "bbox": [60, 40, 70, 50]}]
+    blocks = [[accepted_table, rejected_table, internal_text, internal_formula]]
+    with Image.new("RGB", (100, 100), "white") as image:
+        summary = pdf_tables._apply_native_txt_table_priority(
+            blocks,
+            [layout],
+            [_build_native_pdf_page()],
+            [{"img_pil": image, "scale": 1.0}],
+            effort=effort,
+        )
+
+    assert summary == pdf_tables._NativeTablePrioritySummary(total=2, accepted=1, rejected=1)
+    assert recover.call_count == 2
+    assert blocks == [[accepted_table, rejected_table, internal_text, internal_formula]]
+    assert layout == [{"label": "inline_formula", "bbox": [60, 40, 70, 50]}]
+    assert accepted_table["content"] == html
+    assert "content" not in rejected_table
+    if effort == "high":
+        vlm_blocks, accepted_tables = pdf_tables._split_native_high_table_blocks(blocks)
+        assert vlm_blocks == [[rejected_table, internal_text, internal_formula]]
+        assert accepted_tables == [[accepted_table]]
+    else:
+        tasks = pdf_tables._collect_medium_table_tasks(blocks, [layout], [np.zeros((100, 100, 3), dtype=np.uint8)])
+        assert len(tasks) == 1
+        assert tasks[0]["table_block"] is rejected_table
+
+
 def test_medium_formula_processing_skips_mfr_after_native_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
