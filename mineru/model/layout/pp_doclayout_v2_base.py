@@ -132,7 +132,7 @@ class PPDocLayoutV2PostProcessor:
     """PP-DocLayoutV2 检测结果的后处理逻辑。
 
     所有方法都是纯 numpy/Python 实现，不依赖 torch/transformers。
-    子类只需提供 ``conf`` / ``use_paddlex_filter_boxes`` 等实例属性，
+    子类只需提供 ``use_paddlex_filter_boxes`` 等实例属性，
     并实现 ``predict`` / ``batch_predict`` 即可。
     """
 

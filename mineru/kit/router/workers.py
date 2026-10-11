@@ -4,17 +4,17 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import os
 import socket
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import httpx
 from loguru import logger
@@ -23,6 +23,7 @@ from ...model.runtime.device import get_device
 from ...parser.process_control import ManagedProcessControl
 from ...types import SERVER_TIERS, ServerTier, Tier
 from ...utils.stdio import utf8_subprocess_env
+from ...utils.retention import resolve_retention_seconds
 
 DEFAULT_WORKER_REFRESH_INTERVAL_SECONDS = 2.0
 DEFAULT_WORKER_STARTUP_TIMEOUT_SECONDS = 300.0
@@ -134,10 +135,12 @@ class RouterSettings:
     worker_tier: ServerTier = "standard"
     worker_concurrency: int = 1
     preload_models: bool = False
+    retention_seconds: int | None = None
     worker_refresh_interval_seconds: float = DEFAULT_WORKER_REFRESH_INTERVAL_SECONDS
 
     def __post_init__(self) -> None:
         """校验 worker tier、并发数和刷新间隔。"""
+        object.__setattr__(self, "retention_seconds", resolve_retention_seconds(self.retention_seconds))
         if self.worker_tier not in SERVER_TIERS:
             raise ValueError(f"Unsupported worker tier: {self.worker_tier}")
         if self.worker_concurrency <= 0:
@@ -167,6 +170,7 @@ class RouterSettings:
 
     def apply_to_env(self) -> None:
         """把 Router 配置写入 reload 子进程可读取的环境变量。"""
+        os.environ["MINERU_API_RETENTION_SECONDS"] = str(self.retention_seconds)
         os.environ["MINERU_ROUTER_UPSTREAM_URLS_JSON"] = json.dumps(list(self.upstream_urls))
         os.environ["MINERU_ROUTER_LOCAL_GPUS"] = self.local_gpus
         os.environ["MINERU_ROUTER_WORKER_HOST"] = self.worker_host
@@ -205,6 +209,8 @@ class ManagedLocalWorker:
             self.settings.worker_tier,
             "--concurrency",
             str(self.settings.worker_concurrency),
+            "--retention-seconds",
+            str(self.settings.retention_seconds),
             "--log-level",
             "warning",
             *(["--preload-models"] if self.settings.preload_models else []),
@@ -312,6 +318,10 @@ class WorkerState:
     max_concurrent_jobs: int = 1
     last_error: str | None = None
     generation: int = 0
+    restart_requested: bool = False
+    restart_failures: int = 0
+    retry_at: float = 0.0
+    refresh_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     @property
     def tiers(self) -> set[Tier]:
@@ -319,8 +329,24 @@ class WorkerState:
         return set(self.tier_metadata)
 
 
+@dataclass
+class JobReservation:
+    """持有特定 worker generation 的一次提交预占，释放操作保持幂等。"""
+
+    worker: WorkerState
+    generation: int
+    released: bool = False
+
+    def release(self) -> None:
+        """仅归还所属 generation 的名额，避免迟到清理影响 replacement。"""
+        if not self.released:
+            self.released = True
+            if self.worker.generation == self.generation:
+                self.worker.active_jobs = max(0, self.worker.active_jobs - 1)
+
+
 class WorkerPool:
-    """维护 Router worker 集合并按能力、负载和 affinity 选择目标。"""
+    """维护 Router worker 集合，按能力、负载与独立轮询分配请求。"""
 
     def __init__(
         self,
@@ -336,6 +362,7 @@ class WorkerPool:
         self._workers: dict[str, WorkerState] = {}
         self._monitor_task: asyncio.Task[None] | None = None
         self._built = False
+        self._selection_cursors: dict[str, str] = {}
 
     def _build_workers(self) -> None:
         """在 lifespan 启动阶段解析设备并创建 remote/local worker 状态。"""
@@ -410,30 +437,48 @@ class WorkerPool:
         """并发刷新全部 worker 的 V1 health、tiers 与 models。"""
         await asyncio.gather(*(self.refresh(worker) for worker in self.workers))
 
+    def notify_engine_dead(self, worker: WorkerState) -> None:
+        """收到明确 engine_dead 后立即剔除；仅托管进程由 Router 负责恢复。"""
+        worker.healthy = False
+        worker.last_error = "engine_dead"
+        worker.restart_requested = worker.local_worker is not None
+
     async def refresh(self, worker: WorkerState) -> None:
-        """刷新单个 worker；本地进程退出时先尝试重启。"""
+        """序列化单 worker 的健康刷新，确保同一 generation 只替换一次。"""
+        async with worker.refresh_lock:
+            await self._refresh_worker(worker)
+
+    async def _refresh_worker(self, worker: WorkerState) -> None:
+        """复用启停超时重建死亡进程，启动失败按 5/10/20/30 秒退避。"""
         if worker.local_worker is not None:
             process = worker.local_worker.process
-            if process is None or process.poll() is not None:
+            if worker.restart_requested or process is None or process.poll() is not None:
+                worker.healthy = False
+                if time.monotonic() < worker.retry_at:
+                    return
                 try:
-                    replacing = worker.generation > 0 and process is not None
+                    replacing = worker.generation > 0 and (process is not None or worker.restart_requested)
                     if replacing:
-                        worker.healthy = False
                         worker.base_url = ""
-                        worker.active_jobs = 0
                         worker.tier_metadata.clear()
                         worker.models.clear()
                         worker.features.clear()
                         await worker.local_worker.stop()
                         if self._on_local_worker_replaced is not None:
                             await self._on_local_worker_replaced(worker)
+                        worker.active_jobs = 0
                         worker.generation += 1
+                        worker.restart_requested = False
                     await worker.local_worker.start(self.client)
                     worker.base_url = worker.local_worker.base_url
                     worker.generation = max(worker.generation, 1)
+                    worker.restart_failures = 0
+                    worker.retry_at = 0.0
                 except Exception as exc:
-                    worker.healthy = False
                     worker.last_error = str(exc)
+                    delay = (5, 10, 20, 30)[min(worker.restart_failures, 3)]
+                    worker.restart_failures += 1
+                    worker.retry_at = time.monotonic() + delay
                     return
         try:
             health, tiers, models = await asyncio.gather(
@@ -441,12 +486,13 @@ class WorkerPool:
                 self.client.get(f"{worker.base_url}/v1/tiers"),
                 self.client.get(f"{worker.base_url}/v1/models"),
             )
+            if health.status_code == 503 and (health.json().get("error") or {}).get("code") == "engine_dead":
+                self.notify_engine_dead(worker)
+                return
             health.raise_for_status()
             tiers.raise_for_status()
             models.raise_for_status()
-            health_payload = health.json()
-            tier_payload = tiers.json()
-            model_payload = models.json()
+            health_payload, tier_payload, model_payload = health.json(), tiers.json(), models.json()
             worker.features = dict(health_payload.get("features") or {})
             worker.tier_metadata = {
                 cast(Tier, item["id"]): dict(item) for item in tier_payload.get("data", []) if item.get("id")
@@ -471,34 +517,60 @@ class WorkerPool:
         *,
         tier: Tier | None,
         required_sources: set[str] | None = None,
-        affinity_key: str | None = None,
         preferred_worker_id: str | None = None,
+        required_outputs: set[str] | None = None,
+        require_flash: bool = False,
+        selection_kind: Literal["upload", "job"] = "job",
     ) -> WorkerState | None:
-        """按 tier、source、preferred worker、affinity 和活动任务数选择目标。"""
+        """按能力和负载选取目标，文件归属仅在最低负载候选中优先。"""
         required = required_sources or set()
         eligible = [
             worker
             for worker in self.healthy_workers()
-            if (tier is None or tier in worker.tiers) and required.issubset(set(worker.features.get("sources") or []))
+            if (tier is None or tier in worker.tiers)
+            and required.issubset(set(worker.features.get("sources") or []))
+            and (required_outputs or set()).issubset(set(worker.features.get("output_formats") or []))
+            and (not require_flash or "flash" in worker.tiers)
         ]
         if not eligible:
             return None
+        loads = {
+            worker.worker_id: (worker.active_jobs / max(worker.max_concurrent_jobs, 1), worker.active_jobs)
+            for worker in eligible
+        }
+        minimum = min(loads.values())
+        eligible = sorted((worker for worker in eligible if loads[worker.worker_id] == minimum), key=lambda w: w.worker_id)
         if preferred_worker_id is not None:
             preferred = next((worker for worker in eligible if worker.worker_id == preferred_worker_id), None)
             if preferred is not None:
+                self._selection_cursors[selection_kind] = preferred.worker_id
                 return preferred
-        if affinity_key:
-            ordered = sorted(eligible, key=lambda worker: worker.worker_id)
-            digest = hashlib.sha256(affinity_key.encode("utf-8")).digest()
-            return ordered[int.from_bytes(digest[:8], "big") % len(ordered)]
-        return min(
-            eligible,
-            key=lambda worker: (
-                worker.active_jobs / max(worker.max_concurrent_jobs, 1),
-                worker.active_jobs,
-                worker.worker_id,
-            ),
+        previous = self._selection_cursors.get(selection_kind, "")
+        selected = next((worker for worker in eligible if worker.worker_id > previous), eligible[0])
+        self._selection_cursors[selection_kind] = selected.worker_id
+        return selected
+
+    def reserve_job(
+        self,
+        *,
+        tier: Tier,
+        required_sources: set[str],
+        preferred_worker_id: str | None = None,
+        required_outputs: set[str] | None = None,
+        require_flash: bool = False,
+    ) -> JobReservation | None:
+        """在第一次网络等待前同步选择并预占解析 worker。"""
+        worker = self.select(
+            tier=tier,
+            required_sources=required_sources,
+            preferred_worker_id=preferred_worker_id,
+            required_outputs=required_outputs,
+            require_flash=require_flash,
         )
+        if worker is None:
+            return None
+        worker.active_jobs += 1
+        return JobReservation(worker, worker.generation)
 
     def mark_job_started(self, worker_id: str) -> None:
         """增加指定 worker 的活动任务计数。"""
@@ -511,6 +583,7 @@ class WorkerPool:
 
 
 __all__ = [
+    "JobReservation",
     "accelerator_device_count",
     "ManagedLocalWorker",
     "RouterSettings",

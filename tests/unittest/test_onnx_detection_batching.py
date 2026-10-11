@@ -14,7 +14,6 @@ def layout_model(counts: np.ndarray) -> PPDocLayoutV2LayoutModelONNX:
     """构造含零框页、低置信框和阅读顺序的受控版面模型。"""
     model = object.__new__(PPDocLayoutV2LayoutModelONNX)
     model.imgsz = (800, 800)
-    model.conf = 0.5
     model._input_names = ["image", "im_shape", "scale_factor"]
     rows = np.array(
         [[1, 0.9, 1, 2, 3, 4, 2, 0], [2, 0.8, 5, 6, 7, 8, 1, 0], [9, 0.1, 1, 1, 2, 2, 0, 0], [3, 0.7, 10, 11, 12, 13, 0, 0]],

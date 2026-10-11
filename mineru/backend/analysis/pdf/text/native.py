@@ -12,7 +12,7 @@ from typing import Any, Callable, cast
 
 import numpy as np
 from docvortex.analyzers.pdf import PDF_NATIVE_SCRIPT_MARKUP_KEY, ScriptRole, classify_char_script_roles
-from docvortex.analyzers.pdf import join_tight_text, needs_tight_space
+from docvortex.analyzers.pdf import is_generated_cjk_space, join_tight_text, needs_tight_space
 from docvortex.assets import calculate_contrast
 from docvortex.document.pdf import Char, PDFPage, get_lines_from_chars
 from docvortex.geometry import calculate_overlap_area_in_bbox1_area_ratio
@@ -566,6 +566,7 @@ def _owned_span_texts(owner: Any, spans: list[_AnalyzeSpan], median_height: floa
         return None
     functions = (
         needs_tight_space,
+        is_generated_cjk_space,
         chars_to_content,
         __replace_unicode,
         __replace_ligatures,
@@ -780,6 +781,11 @@ LINE_STOP_FLAG = (
     "}",
     ">",
     "》",
+    "」",
+    "』",
+    "〉",
+    "〕",
+    "〗",
     "、",
     ",",
     "，",
@@ -798,6 +804,9 @@ LINE_START_FLAG = (
     "<",
     "「",
     "『",
+    "〈",
+    "〔",
+    "〖",
     "【",
     "[",
 )
@@ -1088,6 +1097,13 @@ def chars_to_content(
         for idx, char1 in enumerate(chars):
             if char1["char"] in CONTROL_LINE_BREAK_CHARS:
                 continue
+            if (
+                span.metadata.get("_native_tight_spacing", True)
+                and 0 < idx < len(chars) - 1
+                and is_generated_cjk_space(chars[idx - 1], char1, chars[idx + 1], origins=origins)
+            ):
+                # 原始相邻项仍是空格，旧字距分支也不会重新插入被忽略的生成空格。
+                continue
             char2 = chars[idx + 1] if idx + 1 < len(chars) else None
             role1 = script_roles[idx]
             role2 = script_roles[idx + 1] if char2 else None
@@ -1123,6 +1139,7 @@ def chars_to_content(
 # 仅原有内置规则启用整段原生化，替换后的函数保留参考调用及异常语义。
 _STANDARD_CONTENT_FUNCTIONS = (
     needs_tight_space,
+    is_generated_cjk_space,
     chars_to_content,
     __replace_unicode,
     __replace_ligatures,

@@ -241,7 +241,7 @@ class _FakeV1Upstream:
             "object": "upload",
             "bytes": upload["bytes"],
             "created_at": 1,
-            "expires_at": 3601,
+            "expires_at": int(time.time()) + 3600,
             "filename": upload["filename"],
             "purpose": upload.get("purpose", "parse"),
             "mime_type": upload["mime_type"],
@@ -323,29 +323,11 @@ def _upload_files_on_distinct_workers(
     token: str,
 ) -> list[str]:
     """在同一 caller scope 下轮换 upload worker，获得跨 worker 文件。"""
-    pool = router_app.state.worker_pool
-    original_select = pool.select
-    healthy_workers = pool.healthy_workers()
-    upload_index = 0
-
-    def _alternating_select(**kwargs: Any) -> Any:
-        """仅对带 affinity 的 Upload 选择轮换 worker，其他选择保持生产逻辑。"""
-        nonlocal upload_index
-        if kwargs.get("tier") is None and kwargs.get("affinity_key"):
-            worker = healthy_workers[upload_index % len(healthy_workers)]
-            upload_index += 1
-            return worker
-        return original_select(**kwargs)
-
-    pool.select = _alternating_select
     files_by_worker: dict[str, str] = {}
-    try:
-        for index in range(2):
-            public_file_id = _upload_file(client, token=token, content=f"pdf-{index}".encode())
-            route = router_app.state.registry.get("file", public_file_id)
-            files_by_worker.setdefault(route.worker_id, public_file_id)
-    finally:
-        pool.select = original_select
+    for index in range(2):
+        public_file_id = _upload_file(client, token=token, content=f"pdf-{index}".encode())
+        route = router_app.state.registry.get("file", public_file_id)
+        files_by_worker.setdefault(route.worker_id, public_file_id)
     assert len(files_by_worker) == 2
     return list(files_by_worker.values())
 

@@ -220,8 +220,10 @@ def test_seal_uses_poly_crops_and_keeps_variable_vertex_counts(monkeypatch: pyte
 
 def test_atom_and_context_caches_are_isolated_by_stack(monkeypatch: pytest.MonkeyPatch) -> None:
     """同一 CPU 上的 full/light 原子模型与上下文必须分别缓存。"""
-    from mineru.model.runtime import hybrid
+    from mineru.model.runtime import cpu_threads, hybrid
 
+    # 缓存测试使用模型替身，同时隔离真实 Torch 的线程初始化依赖。
+    monkeypatch.setattr(cpu_threads, "initialize_torch_threads", Mock(return_value=2))
     monkeypatch.setattr(hybrid.AtomModelSingleton, "_models", {})
     monkeypatch.setattr(hybrid.HybridLocalModelContextSingleton, "_models", {})
     factory = Mock(side_effect=lambda **kwargs: object())

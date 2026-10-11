@@ -35,7 +35,8 @@ jobs:
           source .venv/bin/activate
           uv pip install .[test]
           cd $GITHUB_WORKSPACE && python tests/clean_coverage.py      
-          cd $GITHUB_WORKSPACE && coverage run
+          # 统一使用 pytest-cov 采集覆盖率，避免叠加启动 coverage 采集器。
+          cd $GITHUB_WORKSPACE && python -m pytest tests/unittest
           cd $GITHUB_WORKSPACE && python tests/get_coverage.py
 
 #  notify_to_feishu:

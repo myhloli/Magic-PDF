@@ -54,6 +54,11 @@ ID 使用 OpenAI 风格的前缀加随机串。官方 API 使用 24 字符 base6
 | `GET` | `/v1/files/{file_id}` | 查询文件元信息 |
 | `GET` | `/v1/files/{file_id}/content` | 下载解析产物 |
 | `DELETE` | `/v1/files/{file_id}` | 删除文件 |
+| `POST` | `/v1/tasks` | 自部署服务与 Router 的便捷异步提交 |
+| `GET` | `/v1/tasks/{task_id}` | 查询相同后台任务 |
+| `GET` | `/v1/tasks/{task_id}/result` | 获取内联 JSON 或 ZIP |
+| `DELETE` | `/v1/tasks/{task_id}` | 取消任务 |
+| `POST` | `/v1/file_parse` | 自部署同步包装，超时返回可查询任务 |
 | `POST` | `/v1/parse/jobs` | 创建解析任务 |
 | `GET` | `/v1/parse/jobs/{job_id}` | 查询任务 |
 | `GET` | `/v1/parse/jobs` | 列出任务 |
@@ -61,6 +66,8 @@ ID 使用 OpenAI 风格的前缀加随机串。官方 API 使用 24 字符 base6
 | `POST` | `/v1/chat/completions` | Chat Completions 文档对话 |
 | `POST` | `/v1/responses` | Responses 文档对话 |
 | `GET` | `/v1/usage` | 查询用量 |
+
+便捷路由的输入、结果与 Router 负载规则见 [V1 便捷解析](tasks.md)。这些路由是当前自部署接口，云端支持情况以具体部署为准。
 
 ## 认证
 

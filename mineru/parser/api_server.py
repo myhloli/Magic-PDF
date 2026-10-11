@@ -1,11 +1,5 @@
 # Copyright (c) Opendatalab. All rights reserved.
-"""MinerU v1 REST API — Pydantic models and FastAPI route definitions.
-
-The API surface defined here matches the NEW-API.md specification.
-All route handlers are stubs (raise 501 Not Implemented) — only the
-contract (models, path/query params, response schemas, status codes)
-is defined.  Business logic belongs in downstream integration modules.
-"""
+"""MinerU V1 解析服务：上传资源、统一后台任务与 HTTP 接口。"""
 
 from __future__ import annotations
 
@@ -14,9 +8,11 @@ import base64
 import hashlib
 import io
 import json
+from importlib.resources import files as package_resources
 import logging
 import os
 import pathlib
+import re
 import secrets
 import shutil
 import tempfile
@@ -25,7 +21,7 @@ import time
 import zipfile
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Annotated, Any, AsyncIterator, Awaitable, Callable, Literal, NoReturn, TypedDict
 from urllib.parse import urlparse
@@ -36,8 +32,13 @@ import uvicorn
 from docvortex.assets import validate_image_sidecar_path
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Path, Query, Request, Response, status
 from fastapi.exceptions import RequestValidationError
+from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html, get_swagger_ui_oauth2_redirect_html
+from fastapi_offline import FastAPIOffline
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBearer
+from filelock import FileLock, Timeout as FileLockTimeout
+from ..utils.retention import resolve_retention_seconds, RETENTION_SCAN_INTERVAL_SECONDS
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.datastructures import State
 
@@ -53,6 +54,7 @@ from ..filetypes import (
 from ..types import SERVER_TIERS, TIERS_BY_SERVER_TIER, DeploymentTier, PageInfo, ServerTier, Tier, select_default_quality_tier
 from ..utils.async_utils import drain_future, run_sync
 from ..model.vlm.async_runtime import RuntimeOwner, runtime_owner
+from ..model.vlm.errors import is_fatal_engine_error
 from ..utils.logger import configure_global_log_level
 from ..utils.stdio import configure_standard_streams
 from ..version import __version__
@@ -644,17 +646,125 @@ class _FileRecord:
     sha256sum: str | None = None
     expires_at: int | None = None
     upload_id: str | None = None
+    job_id: str | None = None
 
 
 class FileStore:
     """Content-addressed blob storage with in-memory metadata."""
 
-    def __init__(self, root: pathlib.Path) -> None:
+    def __init__(self, root: pathlib.Path, retention_seconds: int = 86400) -> None:
+        self._lock = threading.RLock()
+        self.retention_seconds = retention_seconds
+        self._pins: dict[str, int] = {}
+        self._job_output_pins: dict[str, set[str]] = {}
+        self._owner_lock = FileLock(str(root / ".mineru-service.lock"))
         self._root = root
         self._blobs = root / "blobs"
         self._blobs.mkdir(parents=True, exist_ok=True)
         self._uploads: dict[str, _UploadRecord] = {}
         self._files: dict[str, _FileRecord] = {}
+
+    def claim_directory(self) -> None:
+        """服务启动时独占上传目录，避免多个进程的内存元数据互相误删。"""
+        try:
+            self._owner_lock.acquire(timeout=0)
+        except FileLockTimeout as exc:
+            raise RuntimeError("Upload directory is already owned by another API service") from exc
+
+    def release_directory(self) -> None:
+        """关闭服务时释放目录占用，元数据仍只在本进程内维护。"""
+        self._owner_lock.release()
+
+    def acquire_inputs(self, file_ids: list[str]) -> dict[str, str]:
+        """提交时一次性校验输入并取得 blob 租约，文件视图到期不影响排队任务。"""
+        with self._lock:
+            records = {file_id: self.get_file(file_id) for file_id in file_ids}
+            values = {file_id: rec.sha256sum for file_id, rec in records.items() if rec.sha256sum is not None}
+            for sha in values.values():
+                self._pins[sha] = self._pins.get(sha, 0) + 1
+            return values
+
+    def release_inputs(self, values: dict[str, str]) -> None:
+        """最后一个排队或运行任务退出后才释放共享输入引用。"""
+        with self._lock:
+            for sha in values.values():
+                self._pins[sha] -= 1
+                if not self._pins[sha]:
+                    self._pins.pop(sha)
+            values.clear()
+
+    def pin_cached_blob(self, sha: str) -> pathlib.Path | None:
+        """哈希复用检查和取得传输引用保持原子性，过期视图不能被新请求复用。"""
+        with self._lock:
+            now = int(time.time())
+            if not any(
+                rec.sha256sum == sha and (rec.expires_at is None or rec.expires_at > now) for rec in self._files.values()
+            ):
+                return None
+            path = self._blob_abs(sha)
+            if not path.is_file():
+                return None
+            self._pins[sha] = self._pins.get(sha, 0) + 1
+            return path
+
+    def unpin_cached_blob(self, sha: str) -> None:
+        """请求提交或校验失败后释放哈希预检的引用。"""
+        with self._lock:
+            self._pins[sha] -= 1
+            if not self._pins[sha]:
+                self._pins.pop(sha)
+
+    def finalize_outputs(self, job_id: str, finished: int) -> None:
+        """产物从任务清理完成时计时，部分失败和取消产生的产物采用相同期限。"""
+        with self._lock:
+            for rec in self._files.values():
+                if rec.job_id == job_id:
+                    rec.expires_at = finished + self.retention_seconds if self.retention_seconds else None
+            for sha in self._job_output_pins.pop(job_id, set()):
+                self._pins[sha] -= 1
+                if not self._pins[sha]:
+                    self._pins.pop(sha)
+
+    def collect_expired(self) -> None:
+        """回收过期视图和无引用受管 blob，启动时也可清理上次遗留的旧文件。"""
+        if not self.retention_seconds:
+            return
+        with self._lock:
+            now = int(time.time())
+            for file_id, rec in tuple(self._files.items()):
+                if rec.expires_at is not None and rec.expires_at <= now:
+                    self._files.pop(file_id)
+            for upload_id, rec in tuple(self._uploads.items()):
+                if rec.expires_at <= now:
+                    self._uploads.pop(upload_id)
+                    (self._blobs / "_uploads" / upload_id).unlink(missing_ok=True)
+            referenced = {rec.sha256sum for rec in self._files.values()} | set(self._pins)
+            for prefix in self._blobs.iterdir():
+                if prefix.is_symlink() or not prefix.is_dir() or not re.fullmatch(r"[0-9a-f]{2}", prefix.name):
+                    continue
+                for blob in prefix.iterdir():
+                    sha = prefix.name + blob.name
+                    if (
+                        blob.is_symlink()
+                        or not blob.is_file()
+                        or not re.fullmatch(r"[0-9a-f]{62}(?:\.[0-9a-f]{16})?", blob.name)
+                    ):
+                        continue
+                    if sha in referenced:
+                        continue
+                    # 刚写入但尚未注册的文件及当前扫描期间的写入受锁和年龄门槛保护。
+                    if blob.stat().st_mtime + self.retention_seconds <= now:
+                        blob.unlink(missing_ok=True)
+            pending = self._blobs / "_uploads"
+            if pending.is_dir():
+                for blob in pending.iterdir():
+                    if (
+                        blob.is_file()
+                        and re.fullmatch(r"upload_[0-9a-f]{24}", blob.name)
+                        and blob.name not in self._uploads
+                        and blob.stat().st_mtime + self.retention_seconds <= now
+                    ):
+                        blob.unlink(missing_ok=True)
 
     # ── ID generation ────────────────────────────────────────────────
 
@@ -676,38 +786,96 @@ class FileStore:
         return self._blobs / self._blob_path(sha256hex)
 
     def blob_exists(self, sha256hex: str) -> bool:
-        return self._blob_abs(sha256hex).is_file()
+        with self._lock:
+            return self._blob_abs(sha256hex).is_file()
 
     def store_blob(self, data: bytes, *, sha256hex: str) -> None:
-        p = self._blob_abs(sha256hex)
-        if not p.is_file():
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_bytes(data)
+        """原子写入已校验的内容，避免并发读取尚未写完的 blob。"""
+        with self._lock:
+            p = self._blob_abs(sha256hex)
+            if not p.is_file():
+                p.parent.mkdir(parents=True, exist_ok=True)
+                temporary = p.with_name(p.name + "." + secrets.token_hex(8))
+                try:
+                    temporary.write_bytes(data)
+                    os.replace(temporary, p)
+                finally:
+                    temporary.unlink(missing_ok=True)
+
+    def register_source_file(self, filename: str, path: pathlib.Path, sha256sum: str, file_id: str | None = None) -> str:
+        """从已校验的暂存文件原子注册源字节及独立的文件名视图。"""
+        with self._lock:
+            target = self._blob_abs(sha256sum)
+            if not target.is_file():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                temporary = target.with_name(target.name + "." + secrets.token_hex(8))
+                try:
+                    shutil.copyfile(path, temporary)
+                    os.replace(temporary, target)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            now = int(time.time())
+            file_id = file_id or self._new_file_id()
+            self._files[file_id] = _FileRecord(
+                id=file_id,
+                filename=filename,
+                bytes=target.stat().st_size,
+                created_at=now,
+                purpose="parse",
+                sha256sum=sha256sum,
+                expires_at=now + self.retention_seconds if self.retention_seconds else None,
+            )
+            return file_id
 
     def read_blob(self, sha256hex: str) -> bytes:
-        p = self._blob_abs(sha256hex)
-        if not p.is_file():
-            raise FileNotFoundError(sha256hex)
-        return p.read_bytes()
+        with self._lock:
+            p = self._blob_abs(sha256hex)
+            if not p.is_file():
+                raise FileNotFoundError(sha256hex)
+            return p.read_bytes()
 
     # ── uploads ──────────────────────────────────────────────────────
 
     def create_upload(self, req: CreateUploadRequest, *, base_url: str = "") -> UploadResponse:
-        now = int(time.time())
-        expires_seconds = req.expires_after.seconds if req.expires_after else 3600
+        with self._lock:
+            now = int(time.time())
+            expires_seconds = req.expires_after.seconds if req.expires_after else 3600
 
-        # sha256sum dedup
-        if req.sha256sum and self.blob_exists(req.sha256sum):
-            file_id = self._new_file_id()
-            self._files[file_id] = _FileRecord(
-                id=file_id,
-                filename=req.filename,
-                bytes=req.bytes,
-                created_at=now,
-                purpose=req.purpose,
-                sha256sum=req.sha256sum,
-                expires_at=now + expires_seconds,
-            )
+            # sha256sum dedup
+            if req.sha256sum and self.blob_exists(req.sha256sum):
+                if self._blob_abs(req.sha256sum).stat().st_size != req.bytes:
+                    _raise_api_error(
+                        400,
+                        error_type="invalid_request_error",
+                        code="upload_size_mismatch",
+                        message="Declared size does not match the cached file",
+                        param="bytes",
+                    )
+                file_id = self._new_file_id()
+                self._files[file_id] = _FileRecord(
+                    id=file_id,
+                    filename=req.filename,
+                    bytes=req.bytes,
+                    created_at=now,
+                    purpose=req.purpose,
+                    sha256sum=req.sha256sum,
+                    expires_at=now + expires_seconds,
+                )
+                upload_id = self._new_upload_id()
+                self._uploads[upload_id] = _UploadRecord(
+                    id=upload_id,
+                    filename=req.filename,
+                    bytes=req.bytes,
+                    mime_type=req.mime_type,
+                    created_at=now,
+                    expires_at=now + expires_seconds,
+                    purpose=req.purpose,
+                    sha256sum=req.sha256sum,
+                    status="completed",
+                    file_id=file_id,
+                )
+                return self._make_upload_response(self._uploads[upload_id], base_url=base_url, expose_upload_url=True)
+
             upload_id = self._new_upload_id()
             self._uploads[upload_id] = _UploadRecord(
                 id=upload_id,
@@ -718,201 +886,205 @@ class FileStore:
                 expires_at=now + expires_seconds,
                 purpose=req.purpose,
                 sha256sum=req.sha256sum,
-                status="completed",
-                file_id=file_id,
             )
             return self._make_upload_response(self._uploads[upload_id], base_url=base_url, expose_upload_url=True)
 
-        upload_id = self._new_upload_id()
-        self._uploads[upload_id] = _UploadRecord(
-            id=upload_id,
-            filename=req.filename,
-            bytes=req.bytes,
-            mime_type=req.mime_type,
-            created_at=now,
-            expires_at=now + expires_seconds,
-            purpose=req.purpose,
-            sha256sum=req.sha256sum,
-        )
-        return self._make_upload_response(self._uploads[upload_id], base_url=base_url, expose_upload_url=True)
-
     def get_upload(self, upload_id: str) -> _UploadRecord:
-        rec = self._uploads.get(upload_id)
-        if rec is None:
-            _raise_api_error(
-                404,
-                error_type="invalid_request_error",
-                code="upload_not_found",
-                message=f"Upload {upload_id} not found",
-            )
-        if rec.status == "pending" and int(time.time()) >= rec.expires_at:
-            # 惰性过期：过期后 pending 记录转为终态并丢弃暂存数据，PUT/complete/cancel 均收到 409。
-            rec.status = "expired"
-            (self._blobs / "_uploads" / upload_id).unlink(missing_ok=True)
-        return rec
+        with self._lock:
+            rec = self._uploads.get(upload_id)
+            if rec is None:
+                _raise_api_error(
+                    404,
+                    error_type="invalid_request_error",
+                    code="upload_not_found",
+                    message=f"Upload {upload_id} not found",
+                )
+            if int(time.time()) >= rec.expires_at:
+                rec.status = "expired"
+                (self._blobs / "_uploads" / upload_id).unlink(missing_ok=True)
+                _raise_api_error(
+                    404, error_type="invalid_request_error", code="upload_not_found", message=f"Upload {upload_id} expired"
+                )
+            return rec
 
     def _read_upload_data(self, upload_id: str) -> bytes:
-        p = self._blobs / "_uploads" / upload_id
-        if not p.is_file():
-            _raise_api_error(
-                409,
-                error_type="invalid_request_error",
-                code="upload_not_ready",
-                message="Upload bytes not yet received",
-            )
-        return p.read_bytes()
+        with self._lock:
+            p = self._blobs / "_uploads" / upload_id
+            if not p.is_file():
+                _raise_api_error(
+                    409,
+                    error_type="invalid_request_error",
+                    code="upload_not_ready",
+                    message="Upload bytes not yet received",
+                )
+            return p.read_bytes()
 
     def complete_upload(self, upload_id: str, sha256hex: str | None) -> UploadResponse:
-        rec = self.get_upload(upload_id)
-        if rec.status == "completed":
-            _raise_api_error(
-                409,
-                error_type="invalid_request_error",
-                code="upload_already_terminal",
-                message="Upload is already completed",
-            )
-        if rec.status in ("cancelled", "expired"):
-            _raise_api_error(
-                409,
-                error_type="invalid_request_error",
-                code="upload_already_terminal",
-                message=f"Upload is {rec.status}",
-            )
+        with self._lock:
+            rec = self.get_upload(upload_id)
+            if rec.status == "completed":
+                _raise_api_error(
+                    409,
+                    error_type="invalid_request_error",
+                    code="upload_already_terminal",
+                    message="Upload is already completed",
+                )
+            if rec.status in ("cancelled", "expired"):
+                _raise_api_error(
+                    409,
+                    error_type="invalid_request_error",
+                    code="upload_already_terminal",
+                    message=f"Upload is {rec.status}",
+                )
 
-        # compute sha256 from uploaded data if not provided
-        data = self._read_upload_data(upload_id)
-        if len(data) != rec.bytes:
-            _raise_api_error(
-                413,
-                error_type="invalid_request_error",
-                code="upload_size_mismatch",
-                message=f"Upload expects {rec.bytes} bytes, received {len(data)}",
-            )
-        actual_sha = hashlib.sha256(data).hexdigest()
+            # compute sha256 from uploaded data if not provided
+            data = self._read_upload_data(upload_id)
+            if len(data) != rec.bytes:
+                _raise_api_error(
+                    413,
+                    error_type="invalid_request_error",
+                    code="upload_size_mismatch",
+                    message=f"Upload expects {rec.bytes} bytes, received {len(data)}",
+                )
+            actual_sha = hashlib.sha256(data).hexdigest()
 
-        if sha256hex and sha256hex != actual_sha:
-            _raise_api_error(
-                400,
-                error_type="invalid_request_error",
-                code="file_hash_mismatch",
-                message="SHA-256 mismatch",
-            )
-        if rec.sha256sum and rec.sha256sum != actual_sha:
-            _raise_api_error(
-                400,
-                error_type="invalid_request_error",
-                code="file_hash_mismatch",
-                message="SHA-256 mismatch",
-            )
+            if sha256hex and sha256hex != actual_sha:
+                _raise_api_error(
+                    400,
+                    error_type="invalid_request_error",
+                    code="file_hash_mismatch",
+                    message="SHA-256 mismatch",
+                )
+            if rec.sha256sum and rec.sha256sum != actual_sha:
+                _raise_api_error(
+                    400,
+                    error_type="invalid_request_error",
+                    code="file_hash_mismatch",
+                    message="SHA-256 mismatch",
+                )
 
-        # move from upload blob to content-addressed blob
-        sha = sha256hex or actual_sha
-        if not self.blob_exists(sha):
-            self.store_blob(data, sha256hex=sha)
-        # remove temp upload blob
-        (self._blobs / "_uploads" / upload_id).unlink(missing_ok=True)
+            # move from upload blob to content-addressed blob
+            sha = sha256hex or actual_sha
+            if not self.blob_exists(sha):
+                self.store_blob(data, sha256hex=sha)
+            # remove temp upload blob
+            (self._blobs / "_uploads" / upload_id).unlink(missing_ok=True)
 
-        now = int(time.time())
-        file_id = self._new_file_id()
-        self._files[file_id] = _FileRecord(
-            id=file_id,
-            filename=rec.filename,
-            bytes=rec.bytes,
-            created_at=now,
-            purpose=rec.purpose,
-            sha256sum=sha,
-            expires_at=rec.expires_at,
-            upload_id=upload_id,
-        )
-        rec.status = "completed"
-        rec.file_id = file_id
-        rec.sha256sum = sha
-        return self._make_upload_response(rec)
+            now = int(time.time())
+            file_id = self._new_file_id()
+            self._files[file_id] = _FileRecord(
+                id=file_id,
+                filename=rec.filename,
+                bytes=rec.bytes,
+                created_at=now,
+                purpose=rec.purpose,
+                sha256sum=sha,
+                expires_at=rec.expires_at,
+                upload_id=upload_id,
+            )
+            rec.status = "completed"
+            rec.file_id = file_id
+            rec.sha256sum = sha
+            return self._make_upload_response(rec)
 
     def cancel_upload(self, upload_id: str) -> UploadResponse:
-        rec = self.get_upload(upload_id)
-        if rec.status in ("completed", "cancelled", "expired"):
-            _raise_api_error(
-                409,
-                error_type="invalid_request_error",
-                code="upload_already_terminal",
-                message=f"Upload is {rec.status}",
-            )
-        rec.status = "cancelled"
-        return self._make_upload_response(rec)
+        with self._lock:
+            rec = self.get_upload(upload_id)
+            if rec.status in ("completed", "cancelled", "expired"):
+                _raise_api_error(
+                    409,
+                    error_type="invalid_request_error",
+                    code="upload_already_terminal",
+                    message=f"Upload is {rec.status}",
+                )
+            rec.status = "cancelled"
+            return self._make_upload_response(rec)
 
     def store_upload_data(self, upload_id: str, data: bytes) -> None:
         """Store raw bytes for an upload (before complete)."""
-        rec = self.get_upload(upload_id)
-        if rec.status != "pending":
-            _raise_api_error(
-                409,
-                error_type="invalid_request_error",
-                code="upload_already_terminal",
-                message=f"Upload is {rec.status}",
-            )
-        if len(data) != rec.bytes:
-            _raise_api_error(
-                413,
-                error_type="invalid_request_error",
-                code="upload_size_mismatch",
-                message=f"Upload expects {rec.bytes} bytes, received {len(data)}",
-            )
-        # store temporarily under upload_id in blobs dir
-        p = self._blobs / "_uploads" / upload_id
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(data)
+        with self._lock:
+            rec = self.get_upload(upload_id)
+            if rec.status != "pending":
+                _raise_api_error(
+                    409,
+                    error_type="invalid_request_error",
+                    code="upload_already_terminal",
+                    message=f"Upload is {rec.status}",
+                )
+            if len(data) != rec.bytes:
+                _raise_api_error(
+                    413,
+                    error_type="invalid_request_error",
+                    code="upload_size_mismatch",
+                    message=f"Upload expects {rec.bytes} bytes, received {len(data)}",
+                )
+            # store temporarily under upload_id in blobs dir
+            p = self._blobs / "_uploads" / upload_id
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(data)
 
     def _make_upload_response(
         self, rec: _UploadRecord, *, base_url: str = "", expose_upload_url: bool = False
     ) -> UploadResponse:
-        resp = UploadResponse(
-            id=rec.id,
-            bytes=rec.bytes,
-            created_at=rec.created_at,
-            expires_at=rec.expires_at,
-            filename=rec.filename,
-            mime_type=rec.mime_type,
-            purpose=rec.purpose,
-            sha256sum=rec.sha256sum,
-            status=rec.status,
-        )
-        if expose_upload_url and rec.status == "pending":
-            resp.upload_url = f"{base_url}/v1/uploads/{rec.id}/content"
-            resp.upload_method = "PUT"
-            resp.upload_headers = {"Content-Type": rec.mime_type}
-        elif rec.status == "completed" and rec.file_id and rec.file_id in self._files:
-            resp.file = self._make_file_object(self._files[rec.file_id])
-        return resp
+        with self._lock:
+            resp = UploadResponse(
+                id=rec.id,
+                bytes=rec.bytes,
+                created_at=rec.created_at,
+                expires_at=rec.expires_at,
+                filename=rec.filename,
+                mime_type=rec.mime_type,
+                purpose=rec.purpose,
+                sha256sum=rec.sha256sum,
+                status=rec.status,
+            )
+            if expose_upload_url and rec.status == "pending":
+                resp.upload_url = f"{base_url}/v1/uploads/{rec.id}/content"
+                resp.upload_method = "PUT"
+                resp.upload_headers = {"Content-Type": rec.mime_type}
+            elif rec.status == "completed" and rec.file_id and rec.file_id in self._files:
+                resp.file = self._make_file_object(self._files[rec.file_id])
+            return resp
 
     # ── files ────────────────────────────────────────────────────────
 
-    def create_file_for_output(self, filename: str, data: bytes, *, sha256hex: str | None = None) -> str:
+    def create_file_for_output(
+        self, filename: str, data: bytes, *, sha256hex: str | None = None, job_id: str | None = None
+    ) -> str:
         """Store parse-output data and return a file_id."""
-        sha = sha256hex or hashlib.sha256(data).hexdigest()
-        self.store_blob(data, sha256hex=sha)
-        now = int(time.time())
-        file_id = self._new_file_id()
-        self._files[file_id] = _FileRecord(
-            id=file_id,
-            filename=filename,
-            bytes=len(data),
-            created_at=now,
-            purpose="parse_output",
-            sha256sum=sha,
-        )
-        return file_id
+        with self._lock:
+            sha = sha256hex or hashlib.sha256(data).hexdigest()
+            self.store_blob(data, sha256hex=sha)
+            now = int(time.time())
+            file_id = self._new_file_id()
+            self._files[file_id] = _FileRecord(
+                id=file_id,
+                filename=filename,
+                bytes=len(data),
+                created_at=now,
+                purpose="parse_output",
+                sha256sum=sha,
+                job_id=job_id,
+                expires_at=(now + self.retention_seconds) if self.retention_seconds and job_id is None else None,
+            )
+            if job_id is not None:
+                pins = self._job_output_pins.setdefault(job_id, set())
+                if sha not in pins:
+                    pins.add(sha)
+                    self._pins[sha] = self._pins.get(sha, 0) + 1
+            return file_id
 
     def get_file(self, file_id: str) -> _FileRecord:
-        rec = self._files.get(file_id)
-        if rec is None:
-            _raise_api_error(
-                404,
-                error_type="invalid_request_error",
-                code="file_not_found",
-                message=f"File {file_id} not found",
-            )
-        return rec
+        with self._lock:
+            rec = self._files.get(file_id)
+            if rec is None or (rec.expires_at is not None and rec.expires_at <= int(time.time())):
+                _raise_api_error(
+                    404,
+                    error_type="invalid_request_error",
+                    code="file_not_found",
+                    message=f"File {file_id} not found",
+                )
+            return rec
 
     @staticmethod
     def _make_file_object(rec: _FileRecord) -> FileObjectModel:
@@ -927,32 +1099,34 @@ class FileStore:
         )
 
     def read_file_data(self, file_id: str) -> bytes:
-        rec = self.get_file(file_id)
-        if rec.purpose != "parse_output":
-            _raise_api_error(
-                403,
-                error_type="permission_error",
-                code="feature_requires_api_key",
-                message="Source files cannot be downloaded",
-            )
-        if rec.sha256sum is None:
-            _raise_api_error(
-                500,
-                error_type="api_error",
-                code="internal_error",
-                message="File has no sha256sum",
-            )
-        return self.read_blob(rec.sha256sum)
+        with self._lock:
+            rec = self.get_file(file_id)
+            if rec.purpose != "parse_output":
+                _raise_api_error(
+                    403,
+                    error_type="permission_error",
+                    code="feature_requires_api_key",
+                    message="Source files cannot be downloaded",
+                )
+            if rec.sha256sum is None:
+                _raise_api_error(
+                    500,
+                    error_type="api_error",
+                    code="internal_error",
+                    message="File has no sha256sum",
+                )
+            return self.read_blob(rec.sha256sum)
 
     def delete_file(self, file_id: str) -> None:
-        if file_id not in self._files:
-            _raise_api_error(
-                404,
-                error_type="invalid_request_error",
-                code="file_not_found",
-                message=f"File {file_id} not found",
-            )
-        del self._files[file_id]
+        with self._lock:
+            if file_id not in self._files:
+                _raise_api_error(
+                    404,
+                    error_type="invalid_request_error",
+                    code="file_not_found",
+                    message=f"File {file_id} not found",
+                )
+            del self._files[file_id]
 
     def list_files(
         self,
@@ -962,27 +1136,29 @@ class FileStore:
         order: str,
         purpose: FilePurpose | None,
     ) -> FileListResponse:
-        recs = list(self._files.values())
-        # filter
-        if purpose is not None:
-            recs = [r for r in recs if r.purpose == purpose]
-        # sort by created_at
-        reverse = order == "desc"
-        recs.sort(key=lambda r: r.created_at, reverse=reverse)
-        # cursor
-        start = 0
-        if after is not None:
-            for i, r in enumerate(recs):
-                if r.id == after:
-                    start = i + 1
-                    break
-        page = recs[start : start + limit]
-        return FileListResponse(
-            data=[self._make_file_object(r) for r in page],
-            first_id=page[0].id if page else None,
-            last_id=page[-1].id if page else None,
-            has_more=(start + limit) < len(recs),
-        )
+        with self._lock:
+            now = int(time.time())
+            recs = [rec for rec in self._files.values() if rec.expires_at is None or rec.expires_at > now]
+            # filter
+            if purpose is not None:
+                recs = [r for r in recs if r.purpose == purpose]
+            # sort by created_at
+            reverse = order == "desc"
+            recs.sort(key=lambda r: r.created_at, reverse=reverse)
+            # cursor
+            start = 0
+            if after is not None:
+                for i, r in enumerate(recs):
+                    if r.id == after:
+                        start = i + 1
+                        break
+            page = recs[start : start + limit]
+            return FileListResponse(
+                data=[self._make_file_object(r) for r in page],
+                first_id=page[0].id if page else None,
+                last_id=page[-1].id if page else None,
+                has_more=(start + limit) < len(recs),
+            )
 
     # ── defaults → app state ─────────────────────────────────────────
 
@@ -1105,6 +1281,9 @@ class _JobRecord:
     progress: JobProgress | None = None
     files: list[JobFileResult] = None  # type: ignore[assignment]
     links: JobLinks | None = None
+    input_blobs: dict[str, str] = field(default_factory=dict)
+    file_store: FileStore | None = None
+    usage_counted: bool = False
 
     def __post_init__(self) -> None:
         if self.files is None:
@@ -1116,29 +1295,62 @@ class _JobRecord:
 
 
 class JobStore:
-    def __init__(self, concurrency: int = 1) -> None:
+    def __init__(self, concurrency: int = 1, retention_seconds: int = 86400) -> None:
+        self.retention_seconds = retention_seconds
+        self._jobs_created = 0
+        self._files_processed = 0
+        self._pages_processed = 0
         self._jobs: dict[str, _JobRecord] = {}
         self._concurrency = max(1, concurrency)
         self._semaphore = asyncio.Semaphore(self._concurrency)
         self._started_at = JobStore._now()
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._completion_events: dict[str, asyncio.Event] = {}
         self._closing = False
         self.runtime_owner = RuntimeOwner()
 
+    def fail_engine(self, message: str) -> None:
+        """锁定失败状态并取消未结束任务，用户取消的任务保持原终态。"""
+        if self.runtime_owner.engine_error is None:
+            self.runtime_owner.engine_error = message
+        current = asyncio.current_task()
+        for job_id, task in tuple(self._tasks.items()):
+            rec = self._jobs[job_id]
+            if task.done() or rec.status == "canceled":
+                continue
+            rec.status = "failed"
+            for file in rec.files:
+                if file.status != "completed":
+                    file.status = "failed"
+                    file.error = ErrorDetail(type="engine_error", code="engine_dead", message=message)
+            rec.progress.failed = rec.progress.total - rec.progress.completed
+            if task is not current and not task.cancelling():
+                task.cancel()
+
+    def require_ready(self) -> None:
+        """健康和提交入口共用引擎死亡状态及现有错误封装。"""
+        message = self.runtime_owner.engine_error
+        if message is not None:
+            self.fail_engine(message)
+            _raise_api_error(503, error_type="engine_error", code="engine_dead", message=message)
+
     def start_task(self, rec: _JobRecord, operation: Callable[[], Awaitable[None]]) -> None:
         """保存真实后台任务及所属应用租约，排队取消也不会开始解析。"""
+        self.require_ready()
         if self._closing:
             _raise_api_error(503, error_type="engine_error", code="server_shutting_down", message="Server is shutting down")
+        self._completion_events[rec.id] = asyncio.Event()
 
         async def run_owned() -> None:
             """在整个任务期间传播应用租约，并直到清理完成才释放 job 名额。"""
             token = runtime_owner.set(self.runtime_owner)
             try:
                 async with self._semaphore:
-                    if rec.status != "canceled":
+                    if rec.status == "queued":
                         await operation()
             except asyncio.CancelledError:
-                rec.status = "canceled"
+                if rec.status != "failed":
+                    rec.status = "canceled"
                 raise
             finally:
                 runtime_owner.reset(token)
@@ -1147,16 +1359,32 @@ class JobStore:
             """回收句柄并读取异常，覆盖任务首次执行前就被取消的路径。"""
             self._tasks.pop(rec.id, None)
             rec.finished_at = self._now()
+            if rec.file_store is not None:
+                rec.file_store.finalize_outputs(rec.id, int(time.time()))
+                rec.file_store.release_inputs(rec.input_blobs)
             if not task.cancelled():
                 error = task.exception()
                 if error is not None:
                     logger.error("Parse job task failed: %s", rec.id, exc_info=(type(error), error, error.__traceback__))
                     if rec.status != "canceled":
                         rec.status = "failed"
+            self._record_usage(rec)
+            self._completion_events[rec.id].set()
 
         task = asyncio.create_task(run_owned(), name=f"mineru-job-{rec.id}")
         self._tasks[rec.id] = task
         task.add_done_callback(finished)
+
+    async def wait_for_terminal(self, job_id: str, timeout: float) -> _JobRecord:
+        """只等待完成通知，超时或等待方取消不会传播到后台解析任务。"""
+        rec = self.get(job_id)
+        event = self._completion_events.get(job_id)
+        if event is not None:
+            try:
+                await asyncio.wait_for(event.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                pass
+        return rec
 
     async def shutdown(self) -> None:
         """停止接单并等待所有任务清理，再释放应用持有的推理运行时。"""
@@ -1165,8 +1393,9 @@ class JobStore:
         for job_id, task in tasks:
             if not task.done():
                 rec = self._jobs[job_id]
-                if rec.status != "canceled":
+                if rec.status not in {"canceled", "failed"}:
                     rec.status = "canceled"
+                if not task.cancelling():
                     task.cancel()
         try:
             await drain_future(asyncio.gather(*(task for _, task in tasks), return_exceptions=True))
@@ -1210,10 +1439,30 @@ class JobStore:
                 )
             )
         rec.progress.total = len(rec.files)
+        rec.input_blobs = file_store.acquire_inputs(
+            [entry.source.file_id for entry in req.files if isinstance(entry.source, FileIdSource)]
+        )
+        rec.file_store = file_store
         self._jobs[job_id] = rec
+        self._jobs_created += 1
         return rec
 
+    def collect_expired(self) -> None:
+        """按清理完成时间删除终态任务、事件及其文件视图，运行任务不受 TTL 影响。"""
+        if not self.retention_seconds:
+            return
+        now = time.time()
+        for job_id, rec in tuple(self._jobs.items()):
+            if job_id in self._tasks or rec.finished_at is None:
+                continue
+            finished = datetime.fromisoformat(rec.finished_at.replace("Z", "+00:00")).timestamp()
+            if finished + self.retention_seconds <= now:
+                self._record_usage(rec)
+                self._jobs.pop(job_id)
+                self._completion_events.pop(job_id, None)
+
     def get(self, job_id: str) -> _JobRecord:
+        self.collect_expired()
         rec = self._jobs.get(job_id)
         if rec is None:
             _raise_api_error(
@@ -1248,6 +1497,7 @@ class JobStore:
         created_after: str | None,
         order: str = "desc",
     ) -> JobListResponse:
+        self.collect_expired()
         recs = list(self._jobs.values())
         if status_filter:
             allowed = set(status_filter.split(","))
@@ -1293,10 +1543,20 @@ class JobStore:
             links=rec.links or JobLinks(self="", cancel=""),
         )
 
+    def _record_usage(self, rec: _JobRecord) -> None:
+        """完成计数只累计一次，元数据过期后服务总用量不倒退。"""
+        if not rec.usage_counted:
+            self._files_processed += sum(file.status == "completed" for file in rec.files)
+            self._pages_processed += sum(
+                _count_pages_in_range(file.page_range) for file in rec.files if file.status == "completed"
+            )
+            rec.usage_counted = True
+
     def usage(self, access_level: AccessLevel) -> UsageResponse:
-        files_processed = sum(1 for j in self._jobs.values() for fr in j.files if fr.status == "completed")
-        processed_page_count = sum(
-            sum(_count_pages_in_range(fr.page_range) for fr in j.files if fr.status == "completed") for j in self._jobs.values()
+        pending = [rec for rec in self._jobs.values() if not rec.usage_counted]
+        files_processed = self._files_processed + sum(1 for rec in pending for file in rec.files if file.status == "completed")
+        processed_page_count = self._pages_processed + sum(
+            _count_pages_in_range(file.page_range) for rec in pending for file in rec.files if file.status == "completed"
         )
         return UsageResponse(
             access_level=access_level,
@@ -1304,10 +1564,11 @@ class JobStore:
             current=UsageCurrent(
                 pages_processed=processed_page_count,
                 files_processed=files_processed,
-                jobs_created=len(self._jobs),
+                jobs_created=self._jobs_created,
             ),
             limits=UsageLimits(
                 max_concurrent_jobs=self._concurrency,
+                max_file_retention_days=(self.retention_seconds + 86399) // 86400 if self.retention_seconds else None,
             ),
         )
 
@@ -1376,6 +1637,7 @@ async def _extract_bytes(
     max_inline_bytes: int = _MAX_INLINE_BYTES_DEFAULT,
     allow_http_source: bool = False,
     max_url_bytes: int = _MAX_FILE_SIZE_BYTES_DEFAULT,
+    input_blobs: dict[str, str] | None = None,
 ) -> _ExtractedSource:
     """按既有来源策略读取字节，并保留不会由临时文件替代的来源上下文。"""
     _validate_source_policy(
@@ -1385,10 +1647,12 @@ async def _extract_bytes(
         allow_http_source=allow_http_source,
     )
     if isinstance(source, FileIdSource):
-        rec = file_store.get_file(source.file_id)
-        if rec.sha256sum is None:
+        sha = (input_blobs or {}).get(source.file_id)
+        if sha is None:
+            sha = file_store.get_file(source.file_id).sha256sum
+        if sha is None:
             raise ValueError("File has no content")
-        return _ExtractedSource(file_store.read_blob(rec.sha256sum))
+        return _ExtractedSource(file_store.read_blob(sha))
     if isinstance(source, UrlSource):
         async with httpx.AsyncClient(timeout=url_timeout) as cli:
             # 流式读取并在超过 max_url_bytes 时中止，避免无上限响应被整包缓冲进内存。
@@ -1436,6 +1700,7 @@ async def _run_job(
     max_url_bytes: int = _MAX_FILE_SIZE_BYTES_DEFAULT,
     flash_enabled: bool = True,
     vlm_config: VlmConfig | None = None,
+    job_store: JobStore | None = None,
 ) -> None:
     """执行解析任务，使用所属服务的 VLM 配置并记录每个文件的成功或失败。"""
     if rec.status == "canceled":
@@ -1445,7 +1710,7 @@ async def _run_job(
 
     with tempfile.TemporaryDirectory(prefix="mineru_job_") as tmpdir:
         for i, entry in enumerate(req.files):
-            if rec.status == "canceled":
+            if rec.status in {"canceled", "failed"}:
                 break
             fr = rec.files[i]
             try:
@@ -1458,6 +1723,7 @@ async def _run_job(
                     max_inline_bytes=max_inline_bytes,
                     allow_http_source=allow_http_source,
                     max_url_bytes=max_url_bytes,
+                    input_blobs=rec.input_blobs,
                 )
                 data = extracted.data
                 suffix = pathlib.Path(fr.name).suffix
@@ -1497,7 +1763,7 @@ async def _run_job(
                     vlm_config=vlm_config,
                 )
 
-                if rec.status == "canceled":
+                if rec.status in {"canceled", "failed"}:
                     break
                 # collect outputs
                 out_formats = set(rec.output_formats)
@@ -1515,19 +1781,21 @@ async def _run_job(
                         content_bytes = _text_utf8_bytes(md or "")
                         sha = hashlib.sha256(content_bytes).hexdigest()
                         file_store.store_blob(content_bytes, sha256hex=sha)
-                        fid = file_store.create_file_for_output(f"{fr.name}.md", content_bytes, sha256hex=sha)
+                        fid = file_store.create_file_for_output(f"{fr.name}.md", content_bytes, sha256hex=sha, job_id=rec.id)
                         output_files.markdown = OutputFileRef(file_id=fid, bytes=len(content_bytes))
                     elif fmt == "middle_json":
                         mj = _json_utf8_bytes(result.to_dict(skip_defaults=True))
                         sha = hashlib.sha256(mj).hexdigest()
                         file_store.store_blob(mj, sha256hex=sha)
-                        fid = file_store.create_file_for_output(f"{fr.name}.middle.json", mj, sha256hex=sha)
+                        fid = file_store.create_file_for_output(f"{fr.name}.middle.json", mj, sha256hex=sha, job_id=rec.id)
                         output_files.middle_json = OutputFileRef(file_id=fid, bytes=len(mj))
                     elif fmt == "structured_content":
                         cl2 = _json_utf8_bytes(await run_sync(result.structured_content))
                         sha = hashlib.sha256(cl2).hexdigest()
                         file_store.store_blob(cl2, sha256hex=sha)
-                        fid = file_store.create_file_for_output(f"{fr.name}.structured_content.json", cl2, sha256hex=sha)
+                        fid = file_store.create_file_for_output(
+                            f"{fr.name}.structured_content.json", cl2, sha256hex=sha, job_id=rec.id
+                        )
                         output_files.structured_content = OutputFileRef(file_id=fid, bytes=len(cl2))
 
                 # zip
@@ -1535,7 +1803,7 @@ async def _run_job(
                     zip_bytes = await run_sync(_build_self_contained_zip_output, result)
                     zip_sha = hashlib.sha256(zip_bytes).hexdigest()
                     file_store.store_blob(zip_bytes, sha256hex=zip_sha)
-                    zip_fid = file_store.create_file_for_output(f"{fr.name}.zip", zip_bytes, sha256hex=zip_sha)
+                    zip_fid = file_store.create_file_for_output(f"{fr.name}.zip", zip_bytes, sha256hex=zip_sha, job_id=rec.id)
                     output_files.zip = OutputFileRef(file_id=zip_fid, bytes=len(zip_bytes))
 
                 fr.status = "completed"
@@ -1550,7 +1818,10 @@ async def _run_job(
                 rec.progress.completed += 1
 
             except Exception as exc:
-                if rec.status == "canceled":
+                if job_store is not None and is_fatal_engine_error(exc):
+                    job_store.fail_engine(str(exc))
+                    raise
+                if rec.status in {"canceled", "failed"}:
                     break
                 logger.exception(
                     "Parse-server job file failed: job_id=%s file=%r tier=%s page_range=%r",
@@ -1566,7 +1837,7 @@ async def _run_job(
                     fr.error = ErrorDetail(type="engine_error", code="parse_failed", message=str(exc))
                 rec.progress.failed += 1
 
-    if rec.status != "canceled":
+    if rec.status not in {"canceled", "failed"}:
         if rec.progress.failed == rec.progress.total:
             rec.status = "failed"
         elif rec.progress.failed > 0:
@@ -1584,6 +1855,7 @@ _router = APIRouter(prefix="/v1")
 
 # OpenAPI tag metadata: drives the group order and descriptions on /docs.
 _OPENAPI_TAGS: list[dict[str, str]] = [
+    {"name": "Tasks", "description": "One-request parsing, asynchronous tasks and inline or ZIP results."},
     {"name": "Health", "description": "Liveness and server readiness."},
     {"name": "Tiers", "description": "Parsing tiers and runtime capability advertised by this server."},
     {"name": "Models", "description": "VLM models available for parsing."},
@@ -1596,7 +1868,9 @@ _OPENAPI_TAGS: list[dict[str, str]] = [
 _FASTAPI_DESCRIPTION = """\
 Parse documents into structured Middle JSON via self-hosted or remote capacity.
 
-The workflow is: create an upload, complete it, submit a parse job for the
+Use `/v1/file_parse` for a synchronous result or `/v1/tasks` for a one-request
+asynchronous submission. Both share the existing parse job lifecycle.
+The resource workflow remains: create an upload, complete it, submit a parse job for the
 resulting file, then poll the job and fetch its outputs. Health and usage
 endpoints report server readiness and quota state. Tiers (`flash`, `basic`,
 `standard`, `advanced`) select the quality/speed trade-off; the set advertised
@@ -1619,6 +1893,7 @@ _ERR_503: _ErrorResponseMap = {503: {"model": ErrorResponse}}
 
 
 def _require_model_preload_ready(request: Request) -> None:
+    request.app.state.job_store.require_ready()
     preload_error: _ModelPreloadError | None = request.app.state.model_preload_error
     if preload_error is None:
         return
@@ -1870,27 +2145,14 @@ async def delete_file(
 # ── Parse Jobs ───────────────────────────────────────────────────────
 
 
-@_router.post(
-    "/parse/jobs",
-    response_model=None,
-    status_code=status.HTTP_202_ACCEPTED,
-    responses={
-        202: {"model": JobAsyncResponse},
-        **_ERR_400,
-        **_ERR_403,
-        **_ERR_429,
-        **_ERR_503,
-    },
-    tags=["Jobs"],
-)
-async def create_job(
+async def submit_parse_job(
     body: CreateJobRequest,
     request: Request,
-    file_store: FileStore = Depends(_get_store),
-    job_store: JobStore = Depends(_get_job_store),
-    access_level: AccessLevel = Depends(_resolve_access_level),
-) -> Response:
-    """Create a parse job."""
+    file_store: FileStore,
+    job_store: JobStore,
+    access_level: AccessLevel,
+) -> _JobRecord:
+    """统一校验并提交后台解析任务，供 V1 Job 与便捷入口共同调用。"""
     for index, entry in enumerate(body.files):
         try:
             entry.page_range = normalize_page_range_input(entry.page_range) or None
@@ -1995,9 +2257,41 @@ async def create_job(
             max_url_bytes=max_url_bytes_val,
             flash_enabled=flash_enabled_val,
             vlm_config=vlm_config_val,
+            job_store=job_store,
         )
 
-    job_store.start_task(rec, _bg_run)
+    try:
+        job_store.start_task(rec, _bg_run)
+    except BaseException:
+        file_store.release_inputs(rec.input_blobs)
+        job_store._jobs.pop(rec.id, None)
+        job_store._jobs_created -= 1
+        raise
+    return rec
+
+
+@_router.post(
+    "/parse/jobs",
+    response_model=None,
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={
+        202: {"model": JobAsyncResponse},
+        **_ERR_400,
+        **_ERR_403,
+        **_ERR_429,
+        **_ERR_503,
+    },
+    tags=["Jobs"],
+)
+async def create_job(
+    body: CreateJobRequest,
+    request: Request,
+    file_store: FileStore = Depends(_get_store),
+    job_store: JobStore = Depends(_get_job_store),
+    access_level: AccessLevel = Depends(_resolve_access_level),
+) -> Response:
+    """通过共享任务服务创建 V1 Job，保持既有响应结构。"""
+    rec = await submit_parse_job(body, request, file_store, job_store, access_level)
     return JSONResponse(
         content=job_store.build_response(rec, access_level=access_level).model_dump(by_alias=True), status_code=202
     )
@@ -2193,6 +2487,8 @@ _MODEL_PRELOAD_DEVICE_ERROR_PATTERNS = (
 
 def _classify_model_preload_error(exc: Exception) -> tuple[str, str]:
     message = str(exc).strip() or type(exc).__name__
+    if is_fatal_engine_error(exc):
+        return "engine_dead", message
     if isinstance(exc, (ModuleNotFoundError, ImportError)):
         return "model_preload_dependency_missing", message
     if isinstance(exc, FileNotFoundError):
@@ -2268,6 +2564,7 @@ def create_app(
     image_analysis: bool = True,
     preload_models: bool = False,
     vlm_config: VlmConfig | None = None,
+    retention_seconds: int | None = None,
 ) -> FastAPI:
     """Create a FastAPI application implementing the MinerU v1 REST API.
 
@@ -2305,6 +2602,7 @@ def create_app(
     vlm_config:
         Complete VLM connection configuration override; defaults to global model.vlm settings.
     """
+    retention_seconds = resolve_retention_seconds(retention_seconds)
     upload_dir = upload_dir or ""
     tier = _normalize_server_tier(tier)
     server_tiers = _request_tiers_for_server_tier(tier, no_flash=no_flash, no_advanced=no_advanced)
@@ -2350,8 +2648,22 @@ def create_app(
         application.state.vlm_config = vlm_config
         application.state.model_preload_error = None
         job_store: JobStore = application.state.job_store
+        file_store: FileStore = application.state.file_store
+        file_store.claim_directory()
+        collection_task: asyncio.Task[None] | None = None
+
+        async def collect_loop() -> None:
+            """每五分钟扫描，先清理终态元数据，再释放无引用文件。"""
+            while True:
+                await asyncio.sleep(RETENTION_SCAN_INTERVAL_SECONDS)
+                job_store.collect_expired()
+                await run_sync(file_store.collect_expired)
+
+        if retention_seconds:
+            collection_task = asyncio.create_task(collect_loop(), name="mineru-api-retention")
         token = runtime_owner.set(job_store.runtime_owner)
         try:
+            file_store.collect_expired()
             if _preload_tier is not None:
                 logger.info("Initializing VLM client and local models for startup tier %s", _preload_tier)
                 try:
@@ -2362,6 +2674,8 @@ def create_app(
                     )
                 except Exception as exc:
                     error_code, error_msg = _classify_model_preload_error(exc)
+                    if error_code == "engine_dead":
+                        job_store.fail_engine(error_msg)
                     application.state.model_preload_error = _ModelPreloadError(
                         code=error_code,
                         message=error_msg,
@@ -2376,24 +2690,72 @@ def create_app(
             yield
         finally:
             runtime_owner.reset(token)
+            if collection_task is not None:
+                collection_task.cancel()
+                await asyncio.gather(collection_task, return_exceptions=True)
             try:
                 await job_store.shutdown()
             finally:
+                file_store.release_directory()
                 if not upload_dir and _upload_dir.exists():
                     shutil.rmtree(_upload_dir, ignore_errors=True)
 
     enable_docs = _env_flag("MINERU_API_ENABLE_FASTAPI_DOCS", default=True)
 
-    application = FastAPI(
+    app_factory = FastAPIOffline if enable_docs else FastAPI
+    application = app_factory(
+        **({"static_url": "/docs/assets/vendor"} if enable_docs else {}),
         title="MinerU API",
         description=_FASTAPI_DESCRIPTION,
         version="1.0.0",
         openapi_tags=_OPENAPI_TAGS,
+        dependencies=[Depends(HTTPBearer(auto_error=False, description="Bearer API key when configured"))],
         openapi_url="/openapi.json" if enable_docs else None,
-        docs_url="/docs" if enable_docs else None,
-        redoc_url="/redoc" if enable_docs else None,
+        docs_url=None,
+        redoc_url=None,
         lifespan=_lifespan,
     )
+    if enable_docs:
+
+        @application.get("/docs", include_in_schema=False)
+        async def _offline_swagger(request: Request) -> Response:
+            """使用安装包内资源，并为反向代理补全 OAuth 回调的路径前缀。"""
+            root = request.scope.get("root_path", "").rstrip("/")
+            return get_swagger_ui_html(
+                openapi_url=f"{root}/openapi.json",
+                title="MinerU API - Swagger UI",
+                swagger_js_url=f"{root}/docs/assets/vendor/swagger-ui-bundle.js",
+                swagger_css_url=f"{root}/docs/assets/vendor/swagger-ui.css",
+                swagger_favicon_url=f"{root}/docs/assets/vendor/favicon.png",
+                oauth2_redirect_url=f"{root}/docs/oauth2-redirect",
+            )
+
+        @application.get("/redoc", include_in_schema=False)
+        async def _offline_redoc(request: Request) -> Response:
+            """ReDoc 使用本地脚本、图标和字体，不请求远程品牌素材。"""
+            root = request.scope.get("root_path", "").rstrip("/")
+            return get_redoc_html(
+                openapi_url=f"{root}/openapi.json",
+                title="MinerU API - ReDoc",
+                redoc_js_url=f"{root}/docs/assets/redoc.standalone.js",
+                redoc_favicon_url=f"{root}/docs/assets/vendor/favicon.png",
+                with_google_fonts=False,
+            )
+
+        @application.get("/docs/assets/redoc.standalone.js", include_in_schema=False)
+        async def _offline_redoc_script() -> Response:
+            """沿用安装包内 ReDoc，替换其硬编码 CDN 图标为同包内嵌图标。"""
+            resources = package_resources("fastapi_offline").joinpath("static")
+            script = resources.joinpath("redoc.standalone.js").read_text(encoding="utf-8")
+            icon = base64.b64encode(resources.joinpath("favicon.png").read_bytes()).decode("ascii")
+            script = script.replace("https://cdn.redoc.ly/redoc/logo-mini.svg", f"data:image/png;base64,{icon}")
+            return Response(script, media_type="application/javascript")
+
+        @application.get("/docs/oauth2-redirect", include_in_schema=False)
+        async def _offline_oauth_redirect() -> Response:
+            """保留 Swagger 的本地 OAuth 授权回调页。"""
+            return get_swagger_ui_oauth2_redirect_html()
+
     application.state.upload_dir = _upload_dir
     application.state.tier = tier
     application.state.default_tier = default_tier
@@ -2414,8 +2776,8 @@ def create_app(
     application.state.preload_models = preload_models
     application.state.vlm_config = vlm_config
     application.state.model_preload_error = None
-    FileStore(_upload_dir).install(application.state)
-    JobStore(concurrency=concurrency).install(application.state)
+    FileStore(_upload_dir, retention_seconds=retention_seconds).install(application.state)
+    JobStore(concurrency=concurrency, retention_seconds=retention_seconds).install(application.state)
     application.add_middleware(GZipMiddleware, minimum_size=1000)
 
     @application.exception_handler(ApiServerError)
@@ -2455,6 +2817,9 @@ def create_app(
 
     async def _auth_middleware(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
         path = request.url.path
+        root = request.scope.get("root_path", "").rstrip("/")
+        if root and path.startswith(root + "/"):
+            path = path[len(root) :]
         if path in _PUBLIC_PATHS or any(path.startswith(p) for p in _PUBLIC_PREFIXES) or path.startswith("/v1/models/"):
             return await call_next(request)
         api_key = (request.app.state.api_key or "").strip()
@@ -2474,6 +2839,9 @@ def create_app(
 
     application.middleware("http")(_auth_middleware)
     application.include_router(_build_v1_router())
+    from .task_api import ApiTaskBackend, build_task_router
+
+    application.include_router(build_task_router(ApiTaskBackend))
     return application
 
 
@@ -2494,6 +2862,13 @@ def _build_server_log_config(log_level: str) -> dict[str, Any]:
 
 
 @click.command()
+@click.option(
+    "--retention-seconds",
+    default=None,
+    type=click.IntRange(min=0),
+    envvar="MINERU_API_RETENTION_SECONDS",
+    help="Terminal resource retention in seconds (default: 86400; 0 disables collection)",
+)
 @click.option("--host", default="127.0.0.1", help="Server host")
 @click.option("--port", default=8000, type=int, help="Server port")
 @click.option(
@@ -2612,6 +2987,7 @@ def main(
     vlm_http_timeout: int | None,
     vlm_max_concurrency: int | None,
     log_level: str | None,
+    retention_seconds: int | None = None,
 ) -> None:
     """合并显式 VLM 参数后启动 MinerU v1 REST API 服务，不修改全局配置。"""
     configure_standard_streams()
@@ -2664,6 +3040,7 @@ def main(
             image_analysis=not disable_image_analysis,
             preload_models=preload_models,
             vlm_config=vlm_settings,
+            retention_seconds=retention_seconds,
         )
     except ParseServerStartupError as exc:
         if control_watcher is not None:

@@ -174,6 +174,7 @@ Python 可使用 `create_app(vlm_config=VlmConfig(...))` 完整覆盖全局配�
 - disable-image-analysis
 - concurrency
 - upload-dir
+- retention-seconds（默认 86400 秒，0 关闭自动回收）
 - url-timeout
 - allow-local-source
 - max-inline-bytes
@@ -203,3 +204,40 @@ Python 可使用 `create_app(vlm_config=VlmConfig(...))` 完整覆盖全局配�
 - `/invalidate`
 
 完整设计背景见 [ADR-0017](../decisions/0017-mineru-kit-api-server-command.md)。
+
+## 资源保留、引擎状态与离线文档
+
+API 创建参数 `create_app(retention_seconds=...)`、API/Router 的 `--retention-seconds`
+及环境变量 `MINERU_API_RETENTION_SECONDS` 使用同一设置，显式参数优先，默认 86400 秒。
+零关闭自动回收；上传的显式 `expires_after` 期限继续生效。每 300 秒扫描一次，已到期资源
+立即对新的读取/提交返回 404，磁盘删除可延迟至下一次扫描。任务和产物的保留时间从任务
+取消或推理结束后的实际清理完成时计算，排队和运行时间不计入。长时间运行任务已产生的
+产物在清理完成前不会到期。
+
+```bash
+mineru-kit api-server --retention-seconds 172800
+mineru-kit router --retention-seconds 172800
+# 持久保留：
+mineru-kit api-server --retention-seconds 0
+```
+
+源文件的多个名字视图和多个任务共享内容寻址字节。排队、运行、哈希预检、下载、写入
+及跨 worker 传输期间保护字节，最后一个引用释放后才允许回收。元数据保持内存模式；
+服务重启后旧资源 ID 不恢复，启动扫描只清理超过保留时间的受管无引用文件。一个上传目录
+只能由一个 API 服务实例占用；多实例应分别配置目录。Router 同步回收过期路由及源缓存，
+等待重试的输入副本清理仍由后台处理，过期资源不重新向用户开放。
+
+明确的本地引擎死亡（例如 vLLM `EngineDeadError`）使健康检查和后续提交返回现有错误
+封装及 HTTP 503，错误码为 `engine_dead`。当前任务取消后等清理完成，排队任务失败，
+用户主动取消仍为 `canceled`。普通解析错误或远程超时不会判定本地引擎死亡。Router
+立即剔除故障 worker；托管进程按现有启停超时重建，失败按 5/10/20/30 秒退避；外部
+worker 由其管理方恢复。旧 generation 的未完成任务保留失败快照供查询至到期。
+
+`/docs`、`/redoc`、`/openapi.json` 默认启用，JS/CSS/图标位于 `/docs/assets` 下并来自
+安装包。Swagger 的 Bearer 授权和 OAuth 回调支持代理 `root_path`；ReDoc 的品牌图标也
+使用本地资源。`MINERU_API_ENABLE_FASTAPI_DOCS=false` 同时关闭文档入口及资源挂载。
+
+Torch 小模型首次初始化时限制 CPU 线程，并传播到后续工作线程。有效 OMP/MKL 显式
+配置优先，否则依次使用 `MINERU_CPU_NUM_THREADS`、`MINERU_INTRA_OP_NUM_THREADS`、8。
+按 CPU 亲和性及 cgroup 配额裁剪，且不调高已有更低值。单独设置 OpenBLAS 不视为 Torch
+线程限制。纯 ONNX/Flash 的启动路径保持惰性加载。
