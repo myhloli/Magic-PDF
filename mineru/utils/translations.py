@@ -69,6 +69,9 @@ ZH_MESSAGES: dict[str, str] = {
     "{label}: {ids}": "{label}: {ids}",
     # ------------------------------------------------------------------ read
     "Document library locator, e.g. doc:ab12cd3/tier:basic/page:4": "文档库定位符,如 doc:ab12cd3/tier:basic/page:4",
+    "Document library locator; page selection supports numbers, rN, ranges, comma-separated pages and all": (
+        "文档库定位符；页选择支持数字、rN、区间、逗号组合和 all"
+    ),
     "Read N pages/blocks before and after the locator": "在定位符前后各读取 N 页/块",
     "Output format: markdown, image": "输出格式: markdown、image",
     "Omit continuation marker from output": "输出中省略续读标记",

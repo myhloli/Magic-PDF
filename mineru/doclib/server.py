@@ -10,7 +10,7 @@ import signal
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlparse
@@ -23,6 +23,7 @@ from ..config import config
 from ..errors import InvalidRequestError, MineruError, NotFoundError, error_response, http_status_for
 from ..filetypes import IMAGE_EXTENSIONS, TEXT_EXTENSIONS, TEXT_FILE_TYPES
 from ..parser.page_range import (
+    count_pages_in_range,
     expand_page_range as _expand_page_range,
     format_page_range as _page_numbers_to_range_str,
     normalize_page_range_input,
@@ -224,6 +225,8 @@ class _LocatorParts:
     page_no: int | None = None
     block_no: int | None = None
     char_offset: int | None = None
+    page_range: str | None = None
+    range_selection: bool = False
 
 
 class DoclibServer(AsyncDoclibInterface):
@@ -631,12 +634,14 @@ class DoclibServer(AsyncDoclibInterface):
         self,
         locator: str,
         *,
+        after: str | None = None,
         context: int = 0,
         limit: int = 30000,
         format: ContentFormat = "markdown",
         image_format: ImageFormat = "jpeg",
         no_marker: bool = False,
     ) -> DocContentResponse:
+        """读取共享语法的页选择；范围续读只访问选择中的未完成内容。"""
         start_ms = _now_ms()
         dims = {"content_mode": "read", "output_format": _telemetry_output_format(format), "tier": "unknown"}
         await _record_telemetry_count(self.state, "content.request.count", dimensions=dims)
@@ -644,6 +649,7 @@ class DoclibServer(AsyncDoclibInterface):
             response = await self._execute_read_plan(
                 await self._build_read_plan_from_locator(
                     locator,
+                    after=after,
                     context=context,
                     limit=limit,
                     format=format,
@@ -705,7 +711,9 @@ class DoclibServer(AsyncDoclibInterface):
         format: ContentFormat,
         image_format: ImageFormat,
         no_marker: bool,
+        after: str | None = None,
     ) -> _ReadPlan:
+        """将页选择解析为实际页范围，同时保持单点块和图片的定位约束。"""
         limit = max(1, limit)
         context = max(0, context)
         cursor = _parse_doc_locator(locator)
@@ -718,6 +726,7 @@ class DoclibServer(AsyncDoclibInterface):
                 "Text files do not require MinerU parsing. Read the file directly.",
                 "locator",
             )
+        cursor = _resolve_locator_pages(cursor, doc)
 
         tier = cursor.tier or await self._default_read_tier(doc["sha256"])
         if tier is None:
@@ -728,16 +737,32 @@ class DoclibServer(AsyncDoclibInterface):
             )
         if format == "image" and context:
             raise InvalidRequestError("context_not_applicable", "context is not supported for image reads.", "context")
+        if cursor.page_range and count_pages_in_range(cursor.page_range) > 1:
+            if cursor.block_no is not None:
+                raise InvalidRequestError("invalid_locator", "Block and char locators require a single page.", "locator")
+            if format == "image":
+                raise InvalidRequestError("multi_page_image_not_supported", "image format supports only one page.", "locator")
+            if context:
+                raise InvalidRequestError("context_not_applicable", "context requires a single page.", "context")
         if cursor.page_no is None and context:
             raise InvalidRequestError("context_not_applicable", "context requires a page, block, or char locator.", "context")
 
         page_range = _locator_page_range(cursor, doc, context)
+        if after is not None:
+            if cursor.page_range is None or cursor.block_no is not None or context or format != "markdown":
+                raise InvalidRequestError(
+                    "invalid_request", "after requires a Markdown page selection without context.", "after"
+                )
+            after_cursor = _parse_after_cursor(after)
+            if after_cursor is None:
+                raise InvalidRequestError("invalid_locator", "after must be a non-empty content cursor.", "after")
+            _validate_cursor_for_doc(after_cursor, doc, tier, page_range)
         return _ReadPlan(
             sha256=doc["sha256"],
             short_id=doc["short_id"],
             tier=tier,
             page_range=page_range,
-            after=_locator_after(cursor, tier),
+            after=after if after is not None else _locator_after(cursor, tier),
             locator=_canonical_locator(doc["short_id"], tier, cursor),
             context=context,
             limit=limit,
@@ -753,7 +778,9 @@ class DoclibServer(AsyncDoclibInterface):
             )
             if cursor.page_no is not None
             else None,
-            next_mode="read",
+            next_mode="range"
+            if (cursor.range_selection and cursor.block_no is None and not context) or after is not None
+            else "read",
         )
 
     @route("POST", "/docs/{doc_ref}/exports", tags=("docs",))
@@ -823,7 +850,8 @@ class DoclibServer(AsyncDoclibInterface):
             raise
 
     @route("GET", "/find", tags=("search",))
-    async def find(self, query: str, *, ext: str | None = None, limit: int = 50) -> FindResponse:
+    async def find(self, query: str, *, ext: str | None = None, limit: int = 50, offset: int = 0) -> FindResponse:
+        """返回完整有效匹配数，并按调用方指定的偏移量分页。"""
         start_ms = _now_ms()
         await _record_telemetry_count(self.state, "find.request.count")
         try:
@@ -831,6 +859,7 @@ class DoclibServer(AsyncDoclibInterface):
                 query=query,
                 ext=ext,
                 limit=limit,
+                offset=offset,
                 refresh_file=self.state.parse_svc.refresh_file,
             )
             response = FindResponse(results=[_find_result(row) for row in results], total=total, query=query)
@@ -1306,17 +1335,18 @@ class DoclibServer(AsyncDoclibInterface):
 
         page_count = doc["page_count"] if doc else None
         paginated = _is_paginated_doc(doc) if doc else True
-        next_request = (
-            _next_read_request(rendered, plan.short_id, plan.tier, page_count)
-            if plan.next_mode == "read"
-            else _next_content_request(
+        if plan.next_mode == "range":
+            next_request = _next_range_read_request(rendered, plan.locator)
+        elif plan.next_mode == "read":
+            next_request = _next_read_request(rendered, plan.short_id, plan.tier, page_count)
+        else:
+            next_request = _next_content_request(
                 rendered=rendered,
                 request_page_range=plan.page_range,
                 after=plan.after,
                 page_count=page_count,
                 paginated=paginated,
             )
-        )
         return DocContentResponse(
             sha256=plan.sha256,
             short_id=plan.short_id,
@@ -1509,28 +1539,56 @@ class DoclibServer(AsyncDoclibInterface):
 _READ_LOCATOR_RE = re.compile(
     r"^doc:(?P<short_id>[0-9a-fA-F]+)"
     r"(?:/tier:(?P<tier>flash|basic|standard|advanced)"
-    r"(?:/page:(?P<page_no>[1-9][0-9]*)"
+    r"(?:/page:(?P<page_range>[^/]+)"
     r"(?:/block:(?P<block_no>[1-9][0-9]*)(?:/char:(?P<char_offset>0|[1-9][0-9]*))?)?)?)?$"
 )
 
 
 def _parse_doc_locator(locator: str) -> _LocatorParts:
+    """只解析输入语法，倒数页和范围在获取文档页数后统一求值。"""
     match = _READ_LOCATOR_RE.match(locator)
     if match is None:
         raise InvalidRequestError("invalid_locator", f"Invalid doclib locator: {locator}", "locator")
-    page_no = match.group("page_no")
+    page_range = match.group("page_range")
+    if page_range is not None:
+        if not page_range.strip():
+            raise InvalidRequestError("invalid_locator", "Page selection cannot be empty.", "locator")
+        try:
+            normalized_range = normalize_page_range_input(page_range)
+        except InvalidRequestError as error:
+            raise InvalidRequestError("invalid_locator", error.message, "locator") from error
+    else:
+        normalized_range = None
     block_no = match.group("block_no")
     char_offset = match.group("char_offset")
     return _LocatorParts(
         short_id=match.group("short_id"),
         tier=cast(Tier | None, match.group("tier")),
-        page_no=int(page_no) if page_no is not None else None,
+        page_no=int(normalized_range) if normalized_range and normalized_range.isdecimal() else None,
         block_no=int(block_no) if block_no is not None else None,
         char_offset=int(char_offset) if char_offset is not None else None,
+        page_range=normalized_range,
+        range_selection=page_range is not None and (page_range.strip() == "all" or "," in page_range or "-" in page_range),
     )
 
 
+def _resolve_locator_pages(locator: _LocatorParts, doc: DocRow) -> _LocatorParts:
+    """复用公共页范围算法求值；倒数页和 all 禁止用部分缓存猜测总页数。"""
+    if locator.page_range is None:
+        return locator
+    page_count = doc.get("page_count")
+    if (page_count is None or page_count < 1) and ("r" in locator.page_range or locator.page_range == "all"):
+        raise InvalidRequestError(
+            "invalid_locator", "Cannot resolve all/rN because the document page count is unavailable.", "locator"
+        )
+    resolved_range = _expand_page_range(locator.page_range, page_count or 1)
+    single_page = count_pages_in_range(resolved_range) == 1
+    return replace(locator, page_range=resolved_range, page_no=int(resolved_range) if single_page else None)
+
+
 def _canonical_locator(short_id: str, tier: Tier, locator: _LocatorParts) -> str:
+    if locator.range_selection and locator.page_range is not None and locator.block_no is None:
+        return f"doc:{short_id}/tier:{tier}/page:{locator.page_range}"
     if locator.page_no is None:
         return f"doc:{short_id}/tier:{tier}"
     if locator.block_no is None:
@@ -1550,6 +1608,8 @@ def _locator_after(locator: _LocatorParts, tier: Tier) -> str | None:
 
 def _locator_page_range(locator: _LocatorParts, doc: DocRow, context: int) -> str | None:
     page_count = doc.get("page_count") or 1
+    if locator.page_range is not None and not context:
+        return locator.page_range
     if locator.page_no is None:
         return _normalize_content_page_range(None, None, doc)
     if locator.page_no > page_count:
@@ -2104,6 +2164,13 @@ def _next_read_request(
     if next_page_no > total_page_count:
         return None
     return ContentNextRequest(locator=page_ref(short_id, tier, next_page_no))
+
+
+def _next_range_read_request(rendered: _RenderedContent, locator: str | None) -> ContentNextRequest | None:
+    """保留范围定位器并推进实际页码游标，避免续读扩入未选择的页面。"""
+    if not rendered.truncated or not rendered.content_ranges or locator is None:
+        return None
+    return ContentNextRequest(locator=locator, after=rendered.content_ranges[-1].end)
 
 
 def _last_requested_page(page_range: str | None) -> int | None:
