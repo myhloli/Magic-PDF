@@ -14,7 +14,9 @@ from ...parser.execution_limits import DEFAULT_TASK_TIMEOUT_SECONDS
 from ...utils.i18n import t
 from ...utils.logger import configure_global_log_level
 from ...utils.stdio import configure_standard_streams
+from ...utils.update_check import cli_update_check
 from ..errors import exit_with_message
+from ._base import RuntimeCommand
 
 
 def _require_gradio_dependencies() -> None:
@@ -131,8 +133,9 @@ def main() -> None:
     configure_standard_streams()
     configure_global_log_level()
     app = typer.Typer(add_completion=False)
-    app.command(help=t("Start the Gradio document parsing web UI backed by the MinerU V1 API."))(webui_cmd)
-    app()
+    app.command(cls=RuntimeCommand, help=t("Start the Gradio document parsing web UI backed by the MinerU V1 API."))(webui_cmd)
+    with cli_update_check():
+        app()
 
 
 __all__ = ["webui_cmd", "main"]

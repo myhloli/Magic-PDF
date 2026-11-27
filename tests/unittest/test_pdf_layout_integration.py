@@ -30,7 +30,7 @@ def _source() -> bytes:
     """生成不同尺寸及空白页的真实 PDF，用于检查几何生命周期。"""
     output = BytesIO()
     canvas = Canvas(output)
-    for width, height in [(400, 600), (320, 480), (600, 400)]:
+    for width, height in [(342.72, 468), (320.25, 480.5), (600, 400)]:
         canvas.setPageSize((width, height))
         canvas.showPage()
     canvas.save()
@@ -114,13 +114,18 @@ def test_all_tiers_preserve_geometry_to_pdf(
         asyncio.run(analyze.aio_doc_analyze(_source(), **kwargs)) if asynchronous else analyze.doc_analyze(_source(), **kwargs)
     )
     assert model.extensions["mineru"] == {"tier": tier, "parse_mode": parse_mode}
+    expected_sizes = [(343, 468), (481, 320), (600, 400)]
     expected = [
         {"page_idx": idx, "width_pt": width, "height_pt": height}
-        for idx, (width, height) in zip([1, 4, 5], [(400, 600), (480, 320), (600, 400)], strict=True)
+        for idx, (width, height) in zip([1, 4, 5], expected_sizes, strict=True)
     ]
     equation_index = 1 if leading_text_content else 0
     expected[0]["image_rotations"] = {str(equation_index): 90}
-    assert middle.extensions["docvortex_layout"]["pages"] == model.extensions["docvortex_layout"]["pages"] == expected
+    structured = render(middle, RenderFormat.STRUCTURED_CONTENT)
+    for document in (json.loads(model.to_json()), json.loads(middle.to_json()), structured):
+        geometry = document["extensions"]["docvortex_layout"]["pages"]
+        assert geometry == expected
+        assert all(type(page[key]) is int for page in geometry for key in ("width_pt", "height_pt"))
     assert len(model.pages[0]) == equation_index + 1
     if leading_text_content:
         assert model.pages[0][0]["content"] == [{"type": "text", "content": leading_text_content}]
@@ -134,7 +139,7 @@ def test_all_tiers_preserve_geometry_to_pdf(
     assert [page.extract_text() for page in PdfReader(BytesIO(payload)).pages] == [
         page.extract_text() for page in PdfReader(BytesIO(direct)).pages
     ]
-    assert [tuple(page.mediabox)[2:] for page in PdfReader(BytesIO(payload)).pages] == [(400, 600), (480, 320), (600, 400)]
+    assert [tuple(page.mediabox)[2:] for page in PdfReader(BytesIO(payload)).pages] == expected_sizes
     assert "last page" in PdfReader(BytesIO(payload)).pages[2].extract_text()
     if asynchronous and effort in {"high", "xhigh"}:
         assert events == ["native_async"]
@@ -167,7 +172,12 @@ def test_compaction_merges_page_geometry_with_latest_content(tmp_path: Path) -> 
         middle = postprocess.build_middle_json(model)
         path = Path(parse_batch_json_path(str(tmp_path), sha, "standard", page_range, done_at))
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(middle.to_json())
+        cached = json.loads(middle.to_json())
+        if done_at == 1:
+            # 模拟旧批次留下的小数页宽，覆盖与新批次混合合并的实际路径。
+            for page in cached["extensions"]["docvortex_layout"]["pages"]:
+                page["width_pt"] = 400.5
+        path.write_text(json.dumps(cached))
     compaction = Compaction(db=None, interval_sec=600, data_dir=str(tmp_path))
     rows = [{"page_range": "2-3", "done_at": 2}, {"page_range": "1-2", "done_at": 1}]
     loaded = compaction._load_batch_payloads(sha, "standard", rows)
@@ -176,6 +186,8 @@ def test_compaction_merges_page_geometry_with_latest_content(tmp_path: Path) -> 
     pages = envelope["extensions"]["docvortex_layout"]["pages"]
     assert [page["page_idx"] for page in pages] == [0, 1, 2]
     assert [page["image_rotations"]["0"] for page in pages] == [90, 270, 270]
+    assert [page["width_pt"] for page in pages] == [401, 400, 400]
+    assert all(type(page["width_pt"]) is int for page in pages)
     assert len(list(tmp_path.rglob("*.json"))) == 2
     before = deepcopy(envelope)
     written = compaction._write_compacted_json_files(sha, "standard", ["1-3"], 2, pages_by_index, envelope)

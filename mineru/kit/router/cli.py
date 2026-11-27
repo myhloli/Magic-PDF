@@ -12,7 +12,9 @@ from ...utils.i18n import t
 from ...utils.logger import configure_global_log_level
 from ...utils.server import run_server
 from ...utils.stdio import configure_standard_streams
+from ...utils.update_check import cli_update_check
 from ...parser.execution_limits import DEFAULT_TASK_TIMEOUT_SECONDS
+from ..commands._base import RuntimeCommand
 from ..errors import exit_with_message
 from .app import create_app
 from .workers import RouterSettings
@@ -94,8 +96,9 @@ def main() -> None:
     configure_standard_streams()
     configure_global_log_level()
     app = typer.Typer(add_completion=False)
-    app.command(help=t("Start a standalone Router service exposing only the MinerU V1 API."))(router_cmd)
-    app()
+    app.command(cls=RuntimeCommand, help=t("Start a standalone Router service exposing only the MinerU V1 API."))(router_cmd)
+    with cli_update_check():
+        app()
 
 
 __all__ = ["main", "router_cmd"]

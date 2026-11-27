@@ -25,6 +25,7 @@ from ...types import DEPLOYMENT_TIERS
 from ...utils.i18n import t
 from ...utils.logger import configure_global_log_level
 from ...utils.stdio import configure_standard_streams
+from ...utils.update_check import cli_update_check
 from ..errors import exit_with_message
 from ..output import print_info, print_success
 from ._base import RuntimeCommand
@@ -219,10 +220,12 @@ def download_main() -> None:
     configure_standard_streams()
     configure_global_log_level()
     app = typer.Typer(add_completion=False)
-    app.command(help=t("Download an explicit repo or the tier resources required by the current backend combination."))(
-        download_cmd
-    )
-    app()
+    app.command(
+        cls=RuntimeCommand,
+        help=t("Download an explicit repo or the tier resources required by the current backend combination."),
+    )(download_cmd)
+    with cli_update_check():
+        app()
 
 
 __all__ = ["app", "download_cmd", "download_main", "show_cmd", "verify_cmd", "model_repo_names"]

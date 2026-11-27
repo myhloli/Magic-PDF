@@ -1711,7 +1711,7 @@ def test_doc_analyze_flash_returns_complete_model_json_and_typed_middle_json(mon
         events.append("document_close")
 
     fake_pdf_doc.close.side_effect = fake_document_close
-    fake_pdf_model = MagicMock()
+    fake_pdf_model = MagicMock(spec=["predict"])
 
     def fake_pdf_predict(_document: MagicMock) -> list[list[dict[str, object]]]:
         """记录 PdfModel 推理顺序并返回完整模型结果。"""

@@ -57,6 +57,49 @@ assert not hasattr(module, "config")
     assert completed.returncode == 0, completed.stderr
 
 
+def test_flash_layout_threshold_uses_mineru_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """验证逐页回落的默认值、YAML 配置和环境变量的覆盖顺序。"""
+    assert config_module.load_config().config.flash.layout_confidence_threshold == 0.80
+    (tmp_path / "config.yaml").write_text("flash:\n  layout_confidence_threshold: 0.43\n", encoding="utf-8")
+    assert config_module.load_config().config.flash.layout_confidence_threshold == 0.43
+    monkeypatch.setenv("MINERU_FLASH_LAYOUT_CONFIDENCE_THRESHOLD", "0.6999")
+    loaded = config_module.load_config()
+    assert loaded.config.flash.layout_confidence_threshold == 0.6999
+    assert loaded.sources[("flash", "layout_confidence_threshold")] == "env"
+
+
+@pytest.mark.parametrize("value", ["", "bad", "-0.01", "1.01", "70", "nan", "inf", "-inf"])
+def test_invalid_flash_layout_threshold_is_rejected(value: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """拒绝超出闭区间、非有限及无法解析的阈值。"""
+    monkeypatch.setenv("MINERU_FLASH_LAYOUT_CONFIDENCE_THRESHOLD", value)
+    with pytest.raises(ValueError, match="layout_confidence_threshold"):
+        config_module.load_config()
+
+
+def test_update_check_defaults_and_environment_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """更新检查默认自动启用，YAML 可配置且环境变量优先。"""
+    assert Config().update_check.enabled == "auto"
+    assert Config().update_check.source == "auto"
+    (tmp_path / "config.yaml").write_text("update_check:\n  enabled: false\n  source: tuna\n", encoding="utf-8")
+    loaded = config_module.load_config()
+    assert loaded.config.update_check.enabled is False
+    assert loaded.config.update_check.source == "tuna"
+    monkeypatch.setenv("MINERU_UPDATE_CHECK_ENABLED", "true")
+    monkeypatch.setenv("MINERU_UPDATE_CHECK_SOURCE", "pypi")
+    loaded = config_module.load_config()
+    assert loaded.config.update_check.enabled is True
+    assert loaded.config.update_check.source == "pypi"
+    assert loaded.sources[("update_check", "enabled")] == "env"
+    assert loaded.sources[("update_check", "source")] == "env"
+
+
+@pytest.mark.parametrize("field, value", [("enabled", "sometimes"), ("source", "unknown")])
+def test_update_check_rejects_invalid_configuration(field: str, value: str) -> None:
+    """更新检查字段维持现有配置系统的严格枚举校验。"""
+    with pytest.raises(ValueError):
+        Config(update_check={field: value})
+
+
 @pytest.mark.parametrize("accessor", ["get_config", "get_config_file_path", "get_config_file_exists", "get_config_source"])
 def test_first_configuration_access_validates_missing_file(
     accessor: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

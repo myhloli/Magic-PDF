@@ -22,6 +22,7 @@ from docvortex.document.pdf.visuals import attach_visual_block_images as _attach
 from docvortex.document.pdf.visuals import attach_visual_block_images_from_pdf
 from loguru import logger
 
+from ....config import get_config
 from ....utils.timing import stage_timer
 
 from ....model.runtime.execution import local_model_stage
@@ -803,22 +804,43 @@ def process_pdf_windows(
     page_count = document.page_count
     model_list: list[list[dict[str, Any]]] = []
     if flash_txt_mode:
-        # Flash 原生结果只按视觉块需求补图，不再进入供推理使用的全页渲染窗口。
         from docvortex.analyzers.native import PdfModel
         from docvortex.document.pdf.constants import MODEL_JSON_VISUAL_BLOCK_TYPES
 
-        model_list = PdfModel().predict(document)
+        window_size = _configured_window_size(default=64)
+        model = PdfModel()
+        indices = []
+        if hasattr(model, "layout_page_confidences"):
+            model_list = model.predict(document, collect_layout_diagnostics=True)
+            threshold = get_config().flash.layout_confidence_threshold
+            for index, confidence in enumerate(model.layout_page_confidences):
+                if confidence < 1.0 and confidence <= threshold:
+                    indices.append(index)
+                    logger.debug("Flash layout page {}: confidence {} <= {}", index + 1, confidence, threshold)
+        else:
+            # 已发布的 DocVortex 0.6.26 仅提供原生版面。
+            model_list = model.predict(document)
+        crop_pages = model_list
+        if indices:
+            from .flash_layout import replace_flash_layout_pages
+
+            completed = replace_flash_layout_pages(
+                document, model_list, indices, min(window_size, 8, BATCH_RATIO * LAYOUT_BASE_BATCH_SIZE)
+            )
+            logger.info("Flash TXT used PP layout on {}/{} flagged pages", len(completed), len(indices))
+            # 已成功回填的页直接利用推理页图完成了裁图，保留稀疏物理页的位置。
+            crop_pages = [([] if i in completed else page) for i, page in enumerate(model_list)]
         # 纯文本不创建会话输入文件；视觉容器会在引擎补图前折叠为 image。
         needs_images = any(
             block.get("type") in MODEL_JSON_VISUAL_BLOCK_TYPES or block.get("type") == "image_block"
-            for page in model_list
+            for page in crop_pages
             for block in page
         )
         render_session = get_document_render_session(document) if needs_images else None
         attach_visual_block_images_from_pdf(
             document,
-            model_list,
-            window_size=_configured_window_size(default=64),
+            crop_pages,
+            window_size=window_size,
             timeout=get_load_images_timeout(),
             threads=get_load_images_threads(),
             **({"session": render_session} if render_session is not None else {}),

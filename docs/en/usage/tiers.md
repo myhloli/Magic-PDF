@@ -11,6 +11,8 @@ This page includes 4.1 device-selection and service-tier behavior. Existing depl
 | `standard` | Complex layouts and high-quality parsing | Small models + VLM |
 | `advanced` | More demanding quality requirements | Standard models and runtime, with more inference computation |
 
+Flash TXT reads a native layout confidence score per page from DocVortex. MinerU runs PP-DocLayoutV2 when the score is below 1 and at or below `flash.layout_confidence_threshold`. The default is `0.80`. Set `MINERU_FLASH_LAYOUT_CONFIDENCE_THRESHOLD` in the parsing process to override it with a value from 0 to 1. Selected pages use PP regions, types, and reading order filled with native PDF content. Pages with failed inference keep their native layout. Documents with no selected pages and DocVortex versions without confidence scores use native layout throughout.
+
 PDF and images support all four tiers. Office, OpenDocument, RTF, EPUB, OFD, HTML/MHTML, and CSV/TSV use local Flash and whole-document parsing. Pass `tier="flash"` explicitly for these formats in the local Python SDK. MHTML web archives (`.mhtml`, `.mht`) are parsed as whole documents. Plain text is not parsed, but can be indexed and read by the document library.
 
 For a saved web page archive:

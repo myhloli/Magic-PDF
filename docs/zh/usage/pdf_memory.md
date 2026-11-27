@@ -20,7 +20,7 @@ python scripts/benchmark_pdf_memory.py --pdf demo/pdfs/demo1.pdf demo/pdfs/demo2
 - 交替不同文档：传两个或更多输入。
 - 多窗口文档：使用页数大于 `--window-size` 的文件。窗口大小只影响本次实验，不改变产品默认配置。
 - 推理路径分别运行 `basic/standard/advanced` 与 `txt/ocr`，以及 `flash --mode ocr`；需要对应模型和 VLM 配置。
-- 没有神经模型时可以先用 `flash --mode txt` 验证脚本、文档级清理和按需补图，但不能据此验证推理窗口的大数组生命周期或推理性能。
+- 用所有页均保留原生版面的 PDF 运行 `flash --mode txt`，测量原生文档清理和按需补图。测量按页布局推理时，使用有页命中 MinerU 置信度阈值的 PDF，并记录 PP-DocLayoutV2 实际处理的页数。
 
 ## 输出与判断
 

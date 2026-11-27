@@ -607,6 +607,14 @@ ZH_MESSAGES: dict[str, str] = {
     "Concurrency per managed worker": "每个托管 worker 的并发数",
     "Preload models in managed workers": "在托管 worker 中预加载模型",
     # -------------------------------------------------------- kit common
+    "A new MinerU stable release is available: {current} -> {latest}. "
+    "Upgrade mineru using the package manager for this environment.": (
+        "发现 MinerU 新稳定版：{current} -> {latest}。请使用当前环境对应的包管理器升级 mineru。"
+    ),
+    "A new MinerU stable release is available: {current} -> {latest}. "
+    "It requires Python {requires}; this environment uses Python {python}.": (
+        "发现 MinerU 新稳定版：{current} -> {latest}。该版本需要 Python {requires}；当前环境使用 Python {python}。"
+    ),
     "No input files found.": "未找到输入文件。",
     "Directory input must be expanded before validation: {path}": "目录输入必须先展开再校验: {path}",
     "Unsupported file type: {path}": "不支持的文件类型: {path}",

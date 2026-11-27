@@ -46,4 +46,4 @@ def version_cmd(json_mode: bool = typer.Option(False, "--json", help=t("JSON out
     from .runtime import run_cli
 
     ctx = CliContext(json_mode=json_mode)
-    run_cli(ctx, version_info, render=render_version)
+    run_cli(ctx, version_info, render=render_version, check_updates=False)

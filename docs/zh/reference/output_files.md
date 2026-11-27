@@ -80,7 +80,7 @@ Path("report.html").write_text(html, encoding="utf-8")
 
 `metadata` 包含文件类型、生产者和文档属性；`extensions["mineru"]` 记录实际执行的 `tier` 与最终 `parse_mode`。版本来自 `metadata.producer.version`，不重复放在产品扩展中。页面包含 `page_idx` 与 `blocks`，`page_idx` 从 0 开始，区别于 CLI 中从 1 开始的 PDF 页码。
 
-所有 PDF tier 的同步/异步分析同时写入 `extensions.docvortex_layout`：`version=1`，`pages` 包含源 `page_idx`、`width_pt`、`height_pt` 及需要时的 `image_rotations`。尺寸方向与 bbox 一致；选页、空白页、多窗口和分页缓存汇总按源页号保留几何。ModelJson → MiddleJson → 序列化结果不丢失扩展，主协议仍为 2.0。导出只需要 MiddleJson 和图片素材，无需重新打开源 PDF。
+所有 PDF tier 的同步和异步分析都会写入 `extensions.docvortex_layout`。扩展版本为 1，`pages` 包含源 `page_idx`、`width_pt`、`height_pt` 及可选的 `image_rotations`。宽高按 bbox 的可见方向，以 pt 为单位四舍五入为正整数，例如 `342.5` 保存为 `343`。旧版 Model JSON 和 Middle JSON 中的浮点宽高在读取时按同一规则转换。选页、空白页、多窗口和分页缓存汇总按源页号保留几何。主协议版本为 2.0，导出只需要 MiddleJson 和图片素材。
 
 以下示例由当前公开类型序列化生成，`4.0.0` 是正式版文档的示意生产者版本；可选字段可被省略，实际输出为准：
 

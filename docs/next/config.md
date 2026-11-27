@@ -53,6 +53,17 @@ token 以 `SecretStr` 保存，repr/JSON 完全脱敏；不得放入运行时 `/
 显式 `create_app(cfg)` 需要宿主提供 token。轮换前先停止服务，修改或删除该字段后再启动。
 文件权限、SDK 自动读取及直接 TCP 调用见 [Doclib SDK 本机认证](sdk/doclib-client.md#local-authentication)。
 
+### Flash PDF 原生版面回落
+
+在运行解析的 MinerU 进程中配置 Flash TXT 的逐页回落阈值。可在 `config.yaml` 中设置：
+
+```yaml
+flash:
+  layout_confidence_threshold: 0.80
+```
+
+环境变量 `MINERU_FLASH_LAYOUT_CONFIDENCE_THRESHOLD` 优先于 YAML，取值为 0 到 1。DocVortex 按页提供版面伪置信度，MinerU 在分数小于 1 且小于或等于阈值时运行 PP-DocLayoutV2。调高阈值会纳入更多有结构冲突的页；满分 1 始终保留原生版面。
+
 ### 远程 VLM {#remote-vlm}
 
 `model.vlm` 是所有本地解析入口的 VLM 默认配置，适用于 API server、Python
@@ -170,6 +181,9 @@ MinerU VLM 的跨页单元格检测保持关闭。任一功能启用时，`api_k
 | 分组 | 字段 | 默认值 | 说明 |
 |------|------|--------|------|
 | 全局日志 | `log.level` | `info` | Loguru 默认 stderr sink 级别；可用 `MINERU_LOG_LEVEL` 覆盖 |
+| CLI 更新检查 | `update_check.enabled` | `auto` | `auto` / `true` / `false`；自动模式仅交互式、非 CI 命令启用；环境变量 `MINERU_UPDATE_CHECK_ENABLED` |
+| CLI 更新来源 | `update_check.source` | `auto` | `auto` 并发查询 PyPI 和清华镜像，也可限定 `pypi` / `tuna`；环境变量 `MINERU_UPDATE_CHECK_SOURCE` |
+| Flash PDF | `flash.layout_confidence_threshold` | `0.80` | 原生版面回落阈值，范围 0–1；环境变量 `MINERU_FLASH_LAYOUT_CONFIDENCE_THRESHOLD` |
 | UDS | `doclib.uds.enabled` | `auto` | `auto` / `true` / `false`；`auto` 时当前 Python runtime 支持 UDS 则启用，否则关闭 |
 | UDS | `doclib.uds.path` | `~/.mineru/doclib.sock` | CLI / doclib 通信 socket，默认取 `$MINERU_HOME/doclib.sock` |
 | UDS | `doclib.uds.permission` | `0o600` | socket 权限 |

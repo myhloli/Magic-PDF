@@ -2,6 +2,32 @@
 
 MinerU exposes two primary command trees. `mineru` is the document-library client for interactive and agent workflows; `mineru-kit` contains stateless parsing, service, model, router, and WebUI tools.
 
+## Stable release notifications
+
+Interactive CLI commands check for new stable releases in the background and report updates through a warning on stderr,
+respecting `log.level`. Checks query both official PyPI and the Tsinghua mirror. A successful official response takes
+precedence; the mirror is used when PyPI is unavailable. Mirror synchronization may lag. Prereleases, development releases,
+and yanked files are excluded. If the latest release requires a different Python version, the warning explains that requirement.
+
+Successful results are cached for 24 hours, with at most one notification per installed environment and target version each day.
+Failed attempts back off for 1, 2, 4, then 6 hours without reporting network errors or changing the command's exit code.
+The cache is stored at `$MINERU_HOME/cache/update-check.json` (default: `~/.mineru/cache/update-check.json`).
+Expired results are not reported when a refresh fails. Startup, execution, and exit never wait for the check, so a short command
+may finish before its first check can complete or report an update.
+
+Configure `~/.mineru/config.yaml` (or the file selected by `MINERU_CONFIG`):
+
+```yaml
+update_check:
+  enabled: auto  # auto / true / false
+  source: auto   # auto / pypi / tuna
+```
+
+`auto` checks only when stdin and stderr are terminals and CI is not detected. Set `MINERU_UPDATE_CHECK_ENABLED=false`
+to disable both checks and notifications, or `true` to enable checks in scripts and CI. Set `MINERU_UPDATE_CHECK_SOURCE`
+to `pypi` or `tuna` to select one source. Environment variables override YAML. Help, completion, version queries, `--json`,
+Python SDK calls, and internal child processes always skip checks. Long-running services check once at CLI startup, without periodic polling.
+
 ## Document-library CLI
 
 Use `mineru --help` to list all document-library commands. The most common parsing flow is:

@@ -8,6 +8,8 @@ from typing import Any
 from typer import Context
 from typer.core import TyperCommand
 
+from ...utils.update_check import start_update_check
+
 
 @dataclass(frozen=True)
 class KitContext:
@@ -26,6 +28,7 @@ class RuntimeCommand(TyperCommand):
             from ...utils.logger import configure_global_log_level
 
             configure_global_log_level()
+        start_update_check(command_name=ctx.command.name, json_mode=bool(ctx.params.get("json_mode", False)))
         return super().invoke(ctx)
 
 

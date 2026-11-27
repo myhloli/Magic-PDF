@@ -3,6 +3,9 @@
 
 import argparse
 import json
+import sys
+from pathlib import Path
+from threading import Lock
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -30,6 +33,36 @@ from .pp_doclayout_v2_base import (
     label_to_color,
     load_preprocess_config,
 )
+
+_MPS_SAFETENSORS_INIT_LOCK = Lock()
+
+
+def _warm_mps_safetensors(model_dir: str) -> None:
+    """在并行加载前只读取一个权重元素，初始化 safetensors 首次访问 MPS 所需的状态。"""
+    if sys.platform != "darwin" or sys.version_info[:2] != (3, 14):
+        return
+
+    import safetensors
+
+    # CPython 3.14 与 safetensors 0.8 的 MPS DLPack 首次探测不能在线程池内并发进行。
+    if not safetensors.__version__.startswith("0.8."):
+        return
+    directory = Path(model_dir)
+    checkpoint = directory / "model.safetensors"
+    if not checkpoint.is_file():
+        checkpoint = next(iter(sorted(directory.glob("model-*-of-*.safetensors"))), None)
+        if checkpoint is None:
+            return
+    with (
+        _MPS_SAFETENSORS_INIT_LOCK,
+        safetensors.safe_open(checkpoint, framework="pt", device="mps", backend="pread") as weights,
+    ):
+        for key in weights.keys():
+            view = weights.get_slice(key)
+            shape = view.get_shape()
+            if view.get_dtype() == "F32" and shape and all(shape):
+                view[tuple(slice(0, 1) for _ in shape)]
+                break
 
 
 class _CpuSinePositionEmbedding(nn.Module):
@@ -74,15 +107,18 @@ class PPDocLayoutV2LayoutModel(PPDocLayoutV2PostProcessor):
         # 仅提高行内公式阈值，让模型阅读顺序与最终检测筛选使用同一门槛。
         inline_formula_id = PP_DOCLAYOUT_V2_LABEL_TO_ID["inline_formula"]
         self.config.class_thresholds[inline_formula_id] = DEFAULT_CLASS_THRESHOLDS[inline_formula_id]
+        device_type = torch.device(self.device).type
+        if device_type == "mps":
+            _warm_mps_safetensors(self.model_dir)
         # 保留原有 FP32 推理精度，直接加载到目标设备以减少 CPU 权重中转。
         self.model = PPDocLayoutV2ForObjectDetection.from_pretrained(
             self.model_dir,
             config=self.config,
             device_map={"": self.device},
             dtype=torch.float32,
-            attn_implementation="eager" if torch.device(self.device).type == "mps" else None,
+            attn_implementation="eager" if device_type == "mps" else None,
         )
-        if torch.device(self.device).type in {"mps", "xpu"}:
+        if device_type in {"mps", "xpu"}:
             # 官方正弦编码内部使用 float64，Arc 等 XPU 不支持；统一在 CPU 缓存这个无参数模块的结果。
             for layer in self.model.model.encoder.aifi:
                 layer.position_embedding = _CpuSinePositionEmbedding(layer.position_embedding)

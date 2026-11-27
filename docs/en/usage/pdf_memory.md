@@ -19,7 +19,7 @@ Each group starts a fresh parser process, warms up for three rounds, and measure
 - For repeated-document checks, pass one PDF. For alternating documents, pass two or more.
 - For multiple windows, use a document longer than `--window-size`. This affects only the experiment, not product defaults.
 - Exercise `basic/standard/advanced` with `txt/ocr`, plus `flash --mode ocr`, using the required models and VLM configuration.
-- Without neural models, `flash --mode txt` can validate the harness, document cleanup, and selective rendering. It cannot validate inference-window allocation lifetimes or inference performance.
+- To measure native document cleanup and selective cropping, run `flash --mode txt` on a PDF with no flagged pages. To measure selective layout inference, use a PDF with pages selected by the MinerU layout confidence threshold and record the number of pages processed by PP-DocLayoutV2.
 
 ## Outputs and interpretation
 

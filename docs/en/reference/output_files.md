@@ -86,7 +86,9 @@ Path("report.html").write_text(html, encoding="utf-8")
 
 All PDF tiers also emit `extensions.docvortex_layout` through sync and async
 analysis: `version=1` and `pages` with source `page_idx`, `width_pt`, `height_pt`
-and optional `image_rotations`. Sizes share the bbox orientation. Selected and
+and optional `image_rotations`. Sizes share the bbox orientation and are rounded
+to the nearest whole PDF point, with half points rounded up (342.5 becomes 343).
+Loading older Model or Middle JSON applies the same rule. Selected and
 blank pages, multiple windows and cached batch compaction retain geometry by
 source page. Both ModelJson and MiddleJson serialization preserve the extension;
 the main protocol remains 2.0. PDF export requires only MiddleJson and image assets.

@@ -13,6 +13,7 @@ from typer.main import get_command
 from ..cli.version_command import show_version
 from ..utils.i18n import t
 from ..utils.stdio import configure_standard_streams
+from ..utils.update_check import cli_update_check
 from .commands._base import KitContext, RuntimeCommand
 
 
@@ -109,7 +110,8 @@ def root(
 def main() -> None:
     """先配置输出编码，再由实际执行的叶子命令初始化日志。"""
     configure_standard_streams()
-    app(obj=KitContext(configure_logging=True))
+    with cli_update_check():
+        app(obj=KitContext(configure_logging=True))
 
 
 __all__ = ["app", "main"]

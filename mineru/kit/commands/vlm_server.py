@@ -15,7 +15,9 @@ from ...model.runtime.platform import is_mac_os_version_supported
 from ...utils.i18n import t
 from ...utils.logger import configure_global_log_level
 from ...utils.stdio import configure_standard_streams
+from ...utils.update_check import cli_update_check
 from ..errors import exit_with_message
+from ._base import RuntimeCommand
 
 FORWARD_CONTEXT_SETTINGS = {
     "ignore_unknown_options": True,
@@ -79,9 +81,7 @@ def _resolve_auto_engine() -> Literal["llama-cpp", "lmdeploy", "vllm"]:
     if _module_available("mineru_llama_cpp"):
         logger.info(t("Using llama.cpp as the inference engine for VLM server."))
         return "llama-cpp"
-    logger.info(
-        t("No VLM server engine is available. Install vLLM/LMDeploy/mineru-llama-cpp, or pass --engine explicitly.")
-    )
+    logger.info(t("No VLM server engine is available. Install vLLM/LMDeploy/mineru-llama-cpp, or pass --engine explicitly."))
     raise typer.Exit(1) from None
 
 
@@ -140,10 +140,12 @@ def main() -> None:
     configure_global_log_level()
     app = typer.Typer(add_completion=False)
     app.command(
+        cls=RuntimeCommand,
         context_settings=FORWARD_CONTEXT_SETTINGS,
         help=t("Start the local VLM server with OpenAI-compatible chat completions."),
     )(vlm_server_cmd)
-    app()
+    with cli_update_check():
+        app()
 
 
 __all__ = ["FORWARD_CONTEXT_SETTINGS", "main", "vlm_server_cmd"]

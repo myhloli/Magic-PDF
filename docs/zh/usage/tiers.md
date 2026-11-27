@@ -11,6 +11,8 @@
 | `standard` | 复杂版面与高质量解析 | 小模型 + VLM |
 | `advanced` | 更高质量需求 | 与 Standard 共用模型与运行环境，投入更多推理计算 |
 
+Flash TXT 读取 DocVortex 提供的逐页版面伪置信度。MinerU 在分数小于 1 且小于或等于 `flash.layout_confidence_threshold` 时调用 PP-DocLayoutV2。默认阈值为 `0.80`，可通过解析进程的 `MINERU_FLASH_LAYOUT_CONFIDENCE_THRESHOLD` 覆盖，取值范围为 0–1。命中页采用 PP 的区域、类型和阅读顺序，再回填 PDF 原生内容。推理失败的页保留原生结果。整份文档无命中页，或安装的 DocVortex 未提供分数时，均使用原生版面。
+
 PDF 和图片可选四档。Office、OpenDocument、RTF、EPUB、OFD、HTML/MHTML、CSV/TSV 固定走本地 Flash，整本解析；Python 本地 SDK 调用这些格式时显式传 `tier="flash"`。MHTML 网页归档支持 `.mhtml`、`.mht`，按整份文档解析。纯文本不进入解析，但可由文档库索引和读取。
 
 解析保存的网页归档：

@@ -9,6 +9,7 @@ from typer.core import TyperGroup
 from ..utils.i18n import t
 from ..utils.logger import configure_global_log_level
 from ..utils.stdio import configure_standard_streams
+from ..utils.update_check import cli_update_check
 from .commands import cleanup, config, list_resources, server, show, telemetry, usage, watch
 from .commands.forget import forget_cmd
 from .commands.invalidate import invalidate_cmd
@@ -96,7 +97,8 @@ app.command("version", help=t("Print MinerU and Python versions."))(version_cmd)
 def main() -> None:
     configure_standard_streams()
     configure_global_log_level()
-    app()
+    with cli_update_check():
+        app()
 
 
 if __name__ == "__main__":

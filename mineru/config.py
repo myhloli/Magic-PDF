@@ -465,6 +465,12 @@ class ManagedParseServerConfig(BaseModel):
     port_probe_count: int = Field(default=100, ge=1)
 
 
+class FlashConfig(BaseModel):
+    """配置 Flash TXT 根据原生版面伪置信度进行整页回落的门槛。"""
+
+    layout_confidence_threshold: float = Field(default=0.80, ge=0.0, le=1.0, allow_inf_nan=False)
+
+
 class RenderConfig(BaseModel):
     """MiddleJson 输出渲染配置。"""
 
@@ -646,10 +652,19 @@ class DoclibConfig(BaseModel):
         return self.tcp.enabled
 
 
+class UpdateCheckConfig(BaseModel):
+    """命令行稳定版检查策略；auto 仅在交互式、非 CI 环境启用。"""
+
+    enabled: AutoBool = "auto"
+    source: Literal["auto", "pypi", "tuna"] = "auto"
+
+
 class Config(BaseModel):
     """Top-level MinerU startup configuration."""
 
     log: GlobalLogConfig = Field(default_factory=GlobalLogConfig)
+    update_check: UpdateCheckConfig = Field(default_factory=UpdateCheckConfig)
+    flash: FlashConfig = Field(default_factory=FlashConfig)
     doclib: DoclibConfig = Field(default_factory=DoclibConfig)
     render: RenderConfig = Field(default_factory=RenderConfig)
     llm_aided: LLMAidedConfig = Field(default_factory=LLMAidedConfig)
@@ -677,6 +692,8 @@ __all__ = [
     "LoadedConfig",
     "LogLevel",
     "GlobalLogConfig",
+    "UpdateCheckConfig",
+    "FlashConfig",
     "ModelConfig",
     "VlmConfig",
     "ModelSource",

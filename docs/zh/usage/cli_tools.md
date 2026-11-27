@@ -2,6 +2,31 @@
 
 MinerU 提供两个主要命令树：`mineru` 是面向交互和 Agent 工作流的文档库客户端，`mineru-kit` 提供无状态解析、服务、模型、Router 和 WebUI 工具。
 
+## 稳定版更新提示
+
+交互式 CLI 业务命令会在后台检查新稳定版，发现更新后通过 stderr 输出 warning，遵守全局
+`log.level`。检查同时访问官方 PyPI 和清华镜像，官方成功时采用官方结果，官方不可用时采用镜像；
+镜像同步可能延迟。预发布、开发版及撤回版本不参与提示，新版不支持当前 Python 时会说明版本要求。
+
+成功结果缓存 24 小时，同一安装环境和目标版本每天最多提示一次。失败后按 1、2、4、6 小时退避，
+不会输出网络错误，也不会改变业务退出码。缓存位于 `$MINERU_HOME/cache/update-check.json`
+（默认 `~/.mineru/cache/update-check.json`）。缓存失效且联网失败时不提示更新。
+命令启动、执行和退出都不等待检查完成，因此首次运行短命令可能来不及完成检查或提示。
+
+在 `~/.mineru/config.yaml`（或 `MINERU_CONFIG` 指定的文件）中配置：
+
+```yaml
+update_check:
+  enabled: auto  # auto / true / false
+  source: auto   # auto / pypi / tuna
+```
+
+`auto` 仅在 stdin 和 stderr 均连接终端且不是 CI 时启用。设置
+`MINERU_UPDATE_CHECK_ENABLED=false` 完全关闭检查和提示，设置为 `true` 允许非交互脚本或 CI 使用；
+`MINERU_UPDATE_CHECK_SOURCE=pypi` 或 `tuna` 可限定来源。环境变量优先于 YAML。
+帮助、补全、版本查询、`--json`、Python SDK 和内部子进程始终跳过检查；
+长驻服务只在 CLI 启动时检查一次，不定时轮询。
+
 ## 文档库 CLI
 
 使用 `mineru --help` 查看全部文档库命令。最常见的解析方式是：

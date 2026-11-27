@@ -46,7 +46,7 @@ def test_flash_sparse_render_keeps_page_mapping_and_title_gate(
     rendered: list[int] = []
     created: list[Image.Image] = []
 
-    def predict(_model: PdfModel, document: PDFDocument) -> list[list[dict[str, Any]]]:
+    def predict(_model: PdfModel, document: PDFDocument, **options: Any) -> list[list[dict[str, Any]]]:
         """替换原生语义分析，每个物理页含标题，奇数物理页额外含图片。"""
         document_sizes.append(document.page_count)
         pages: list[list[dict[str, Any]]] = []

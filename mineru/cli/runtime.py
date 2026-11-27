@@ -10,6 +10,7 @@ import httpx
 import typer
 
 from ..errors import MineruError, ServerNotRunningError, error_response
+from ..utils.update_check import start_update_check
 from . import output
 from .contracts import (
     CliContext,
@@ -71,7 +72,10 @@ def run_cli(
     warnings: Callable[[T], list[str]] | None = None,
     notices: Callable[[T], list[str]] | None = None,
     exit_code: int | Callable[[T], int] = 0,
+    check_updates: bool = True,
 ) -> None:
+    if check_updates:
+        start_update_check(json_mode=ctx.json_mode)
     try:
         value = action()
     except typer.Exit:
