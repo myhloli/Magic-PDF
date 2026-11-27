@@ -810,24 +810,75 @@ def process_pdf_windows(
         window_size = _configured_window_size(default=64)
         model = PdfModel()
         indices = []
+        flagged_domains: dict[str, int] = {}
         if hasattr(model, "layout_page_confidences"):
             model_list = model.predict(document, collect_layout_diagnostics=True)
             threshold = get_config().flash.layout_confidence_threshold
+            assessments = getattr(model, "layout_page_assessments", ())
+            has_assessments = len(assessments) == len(model.layout_page_confidences)
             for index, confidence in enumerate(model.layout_page_confidences):
                 if confidence < 1.0 and confidence <= threshold:
                     indices.append(index)
-                    logger.debug("Flash layout page {}: confidence {} <= {}", index + 1, confidence, threshold)
+                    if has_assessments:
+                        assessment = assessments[index]
+                        domain = getattr(assessment, "primary_domain", None) or "unknown"
+                        flagged_domains[domain] = flagged_domains.get(domain, 0) + 1
+                        reasons = "; ".join(getattr(assessment, "reasons", ()))
+                        logger.debug(
+                            "Flash layout page {}: confidence {} <= {} (domain={}, reasons={})",
+                            index + 1,
+                            confidence,
+                            threshold,
+                            domain,
+                            reasons,
+                        )
+                    else:
+                        logger.debug("Flash layout page {}: confidence {} <= {}", index + 1, confidence, threshold)
         else:
             # 已发布的 DocVortex 0.6.26 仅提供原生版面。
             model_list = model.predict(document)
+        extensions = getattr(model, "extensions", None)
+        structure_ext = extensions.get("docvortex_pdf_structure") if isinstance(extensions, dict) else None
+        order_repairs = structure_ext.get("order_repairs") if isinstance(structure_ext, dict) else None
+        if order_repairs:
+            repair_counts: dict[str, int] = {}
+            repaired_pages: set[int] = set()
+            for entry in order_repairs:
+                if not isinstance(entry, dict):
+                    continue
+                action = str(entry.get("action") or "unknown")
+                repair_counts[action] = repair_counts.get(action, 0) + 1
+                page_idx = entry.get("page_idx")
+                if isinstance(page_idx, int) and not isinstance(page_idx, bool):
+                    repaired_pages.add(page_idx)
+            if repair_counts:
+                summary = ", ".join(f"{name}={count}" for name, count in sorted(repair_counts.items()))
+                logger.info(
+                    "Flash TXT applied tagged reading-order repairs on {} pages ({})",
+                    len(repaired_pages) or len(order_repairs),
+                    summary,
+                )
         crop_pages = model_list
         if indices:
             from .flash_layout import replace_flash_layout_pages
 
             completed = replace_flash_layout_pages(
-                document, model_list, indices, min(window_size, 8, BATCH_RATIO * LAYOUT_BASE_BATCH_SIZE)
+                document,
+                model_list,
+                indices,
+                min(window_size, 8, BATCH_RATIO * LAYOUT_BASE_BATCH_SIZE),
+                native_confidences={index: model.layout_page_confidences[index] for index in indices},
             )
-            logger.info("Flash TXT used PP layout on {}/{} flagged pages", len(completed), len(indices))
+            if flagged_domains:
+                domain_summary = ", ".join(f"{name}={count}" for name, count in sorted(flagged_domains.items()))
+                logger.info(
+                    "Flash TXT used PP layout on {}/{} flagged pages ({})",
+                    len(completed),
+                    len(indices),
+                    domain_summary,
+                )
+            else:
+                logger.info("Flash TXT used PP layout on {}/{} flagged pages", len(completed), len(indices))
             # 已成功回填的页直接利用推理页图完成了裁图，保留稀疏物理页的位置。
             crop_pages = [([] if i in completed else page) for i, page in enumerate(model_list)]
         # 纯文本不创建会话输入文件；视觉容器会在引擎补图前折叠为 image。
